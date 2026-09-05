@@ -1,7 +1,7 @@
 'use client';
 
-import { SyntheticEvent, useEffect, useRef, useState } from 'react';
-import { ArrowLeft, ArrowRight, Bot, FileText, LoaderCircle, MessageSquareText, Plus, Send, Settings2, Sparkles, Upload } from 'lucide-react';
+import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowDown, ArrowUp, Bot, FileText, LoaderCircle, MessageSquareText, Plus, Send, Settings2, Sparkles, Upload } from 'lucide-react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 // oxlint-disable-next-line import/default -- Vite's ?url loader provides this synthetic default export.
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
@@ -39,9 +39,79 @@ function readSavedSettings(): ModelSettings {
   catch { return DEFAULT_SETTINGS; }
 }
 
+type PdfPageCanvasProps = {
+  pdf: PDFDocumentProxy;
+  pageNumber: number;
+  onText: (pageNumber: number, text: string) => void;
+  onError: (message: string) => void;
+};
+
+function PdfPageCanvas({ pdf, pageNumber, onText, onError }: PdfPageCanvasProps) {
+  const shellRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [shouldRender, setShouldRender] = useState(false);
+  const [availableWidth, setAvailableWidth] = useState(760);
+
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) return;
+    const root = shell.closest('.canvas-wrap');
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) setShouldRender(true);
+    }, { root, rootMargin: '1200px 0px' });
+    observer.observe(shell);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) return;
+    const updateWidth = () => setAvailableWidth(shell.clientWidth);
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(shell);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!shouldRender || !canvasRef.current) return;
+    let cancelled = false;
+    let renderTask: { cancel: () => void; promise: Promise<void> } | undefined;
+    async function renderPage() {
+      const pdfPage = await pdf.getPage(pageNumber);
+      if (cancelled || !canvasRef.current) return;
+      const baseViewport = pdfPage.getViewport({ scale: 1 });
+      const scale = Math.min(2, Math.max(0.5, (availableWidth - 32) / baseViewport.width));
+      const viewport = pdfPage.getViewport({ scale });
+      const canvas = canvasRef.current;
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.floor(viewport.width * pixelRatio);
+      canvas.height = Math.floor(viewport.height * pixelRatio);
+      canvas.style.width = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+      renderTask = pdfPage.render({ canvas, canvasContext: context, viewport, transform: pixelRatio === 1 ? undefined : [pixelRatio, 0, 0, pixelRatio, 0, 0] });
+      await renderTask.promise;
+      const content = await pdfPage.getTextContent();
+      if (!cancelled) onText(pageNumber, content.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim());
+    }
+    renderPage().catch((reason) => {
+      if (reason?.name !== 'RenderingCancelledException') onError(`第 ${pageNumber} 页渲染失败。`);
+    });
+    return () => { cancelled = true; renderTask?.cancel(); };
+  }, [availableWidth, onError, onText, pageNumber, pdf, shouldRender]);
+
+  return <div ref={shellRef} className="pdf-page" data-page={pageNumber} aria-label={`PDF 第 ${pageNumber} 页`}>
+    <canvas ref={canvasRef} />
+    <span className="pdf-page-number">{pageNumber}</span>
+  </div>;
+}
+
 export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const readerScrollRef = useRef<HTMLDivElement>(null);
+  const pageTextsRef = useRef(new Map<number, string>());
   const vectorIndexRef = useRef(new MemoryVectorIndex());
   const embeddingProviderRef = useRef<EmbeddingProvider | null>(null);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
@@ -57,6 +127,20 @@ export default function Home() {
   const [indexStatus, setIndexStatus] = useState<'idle' | 'indexing' | 'ready'>('idle');
   const [indexProgress, setIndexProgress] = useState(0);
   const [settings, setSettings] = useState<ModelSettings>(readSavedSettings);
+
+  const scrollToPage = useCallback((target: number, behavior: ScrollBehavior = 'smooth') => {
+    const container = readerScrollRef.current;
+    const pageElement = container?.querySelector<HTMLElement>(`.pdf-page[data-page="${target}"]`);
+    if (!container || !pageElement) return;
+    container.scrollTo({ top: Math.max(0, pageElement.offsetTop - 18), behavior });
+    setPage(target);
+  }, []);
+
+  const handlePageText = useCallback((pageNumber: number, text: string) => {
+    pageTextsRef.current.set(pageNumber, text);
+  }, []);
+
+  const handleRenderError = useCallback((message: string) => setError(message), []);
 
   useEffect(() => {
     const modelContext = (document as Document & {
@@ -80,41 +164,46 @@ export default function Home() {
       execute(input: unknown) {
         const target = (input as { page?: unknown })?.page;
         if (!Number.isInteger(target) || (target as number) < 1 || (target as number) > pageCount) throw new Error(`页码必须在 1 到 ${pageCount} 之间。`);
-        setPage(target as number);
+        scrollToPage(target as number);
         return { page: target, pageCount, status: 'navigated' };
       },
     }, { signal: lifecycle.signal })).catch(() => undefined);
     return () => lifecycle.abort();
-  }, [pdf, pageCount]);
+  }, [pdf, pageCount, scrollToPage]);
 
   useEffect(() => {
-    if (!pdf || !canvasRef.current) return;
+    if (!pdf) return;
     let cancelled = false;
-    let renderTask: { cancel: () => void } | undefined;
-    async function renderPage() {
+    async function updatePageText() {
+      const cached = pageTextsRef.current.get(page);
+      if (cached !== undefined) { setPageText(cached); return; }
       const pdfPage = await pdf!.getPage(page);
-      if (cancelled || !canvasRef.current) return;
-      const baseViewport = pdfPage.getViewport({ scale: 1 });
-      const containerWidth = canvasRef.current.parentElement?.clientWidth ?? 760;
-      const scale = Math.min(2, Math.max(0.7, (containerWidth - 48) / baseViewport.width));
-      const viewport = pdfPage.getViewport({ scale });
-      const canvas = canvasRef.current;
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-      canvas.width = Math.floor(viewport.width * pixelRatio);
-      canvas.height = Math.floor(viewport.height * pixelRatio);
-      canvas.style.width = `${viewport.width}px`;
-      canvas.style.height = `${viewport.height}px`;
-      const context = canvas.getContext('2d');
-      if (!context) return;
-      const task = pdfPage.render({ canvas, canvasContext: context, viewport, transform: pixelRatio === 1 ? undefined : [pixelRatio, 0, 0, pixelRatio, 0, 0] });
-      renderTask = task;
-      await task.promise;
       const text = await pdfPage.getTextContent();
-      if (!cancelled) setPageText(text.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim());
+      const normalized = text.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim();
+      pageTextsRef.current.set(page, normalized);
+      if (!cancelled) setPageText(normalized);
     }
-    renderPage().catch((reason) => { if (reason?.name !== 'RenderingCancelledException') setError('这一页渲染失败，请尝试切换页码。'); });
-    return () => { cancelled = true; renderTask?.cancel(); };
+    updatePageText().catch(() => { if (!cancelled) setPageText(''); });
+    return () => { cancelled = true; };
   }, [pdf, page]);
+
+  function syncPageFromScroll() {
+    const container = readerScrollRef.current;
+    if (!container) return;
+    const viewport = container.getBoundingClientRect();
+    const focusLine = viewport.top + Math.min(180, viewport.height * 0.35);
+    let closestPage = page;
+    let closestDistance = Number.POSITIVE_INFINITY;
+    for (const element of container.querySelectorAll<HTMLElement>('.pdf-page')) {
+      const rect = element.getBoundingClientRect();
+      const distance = Math.abs(rect.top - focusLine);
+      if (distance < closestDistance) {
+        closestDistance = distance;
+        closestPage = Number(element.dataset.page);
+      }
+    }
+    if (closestPage !== page) setPage(closestPage);
+  }
 
   async function openPdf(file?: File) {
     if (!file) return;
@@ -124,6 +213,7 @@ export default function Home() {
       pdfJs.GlobalWorkerOptions.workerSrc = new URL(pdfWorkerUrl, window.location.href).toString();
       const document = await pdfJs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
+      pageTextsRef.current.clear();
       setIndexStatus('idle'); setIndexProgress(0);
       setPdf(document); setFileName(file.name); setPageCount(document.numPages); setPage(1);
     } catch (reason) {
@@ -248,12 +338,14 @@ export default function Home() {
             <div className="reader-toolbar">
               <span className="page-label">正在阅读 <strong>{page}</strong> / {pageCount}</span>
               <div className="page-controls">
-                <Button variant="ghost" size="icon" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))} aria-label="上一页"><ArrowLeft /></Button>
-                <label className="page-jump">第 <input type="number" min={1} max={pageCount} value={page} onChange={(event) => setPage(Math.min(pageCount, Math.max(1, Number(event.target.value))))} /> 页</label>
-                <Button variant="ghost" size="icon" disabled={page >= pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))} aria-label="下一页"><ArrowRight /></Button>
+                <Button variant="ghost" size="icon" disabled={page <= 1} onClick={() => scrollToPage(Math.max(1, page - 1))} aria-label="上一页"><ArrowUp /></Button>
+                <label className="page-jump">第 <input type="number" min={1} max={pageCount} value={page} onChange={(event) => scrollToPage(Math.min(pageCount, Math.max(1, Number(event.target.value))))} /> 页</label>
+                <Button variant="ghost" size="icon" disabled={page >= pageCount} onClick={() => scrollToPage(Math.min(pageCount, page + 1))} aria-label="下一页"><ArrowDown /></Button>
               </div>
             </div>
-            <div className="canvas-wrap"><canvas ref={canvasRef} /></div>
+            <div ref={readerScrollRef} className="canvas-wrap" onScroll={syncPageFromScroll}><div className="pdf-pages">
+              {Array.from({ length: pageCount }, (_, index) => <PdfPageCanvas key={index + 1} pdf={pdf} pageNumber={index + 1} onText={handlePageText} onError={handleRenderError} />)}
+            </div></div>
           </> : <div className="empty-state">
             <div className="empty-icon"><Upload /></div><p className="eyebrow">私密 · 本地阅读</p>
             <h1>打开一本 PDF，<br />开始深度阅读。</h1>
