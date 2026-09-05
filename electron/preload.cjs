@@ -5,6 +5,15 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   isDesktop: true,
   embed: (texts) => ipcRenderer.invoke('embedding:embed', texts),
   modelStatus: () => ipcRenderer.invoke('embedding:status'),
+  modelInstall: () => ipcRenderer.invoke('model:install'),
+  modelPause: () => ipcRenderer.invoke('model:pause'),
+  modelOpenFolder: () => ipcRenderer.invoke('model:open-folder'),
+  modelRemove: () => ipcRenderer.invoke('model:remove'),
+  onModelProgress: (listener) => {
+    const handler = (_event, progress) => listener(progress);
+    ipcRenderer.on('model:progress', handler);
+    return () => ipcRenderer.removeListener('model:progress', handler);
+  },
   libraryList: () => ipcRenderer.invoke('library:list'),
   libraryImport: (name, data) => ipcRenderer.invoke('library:import', { name, data }),
   libraryRead: (id) => ipcRenderer.invoke('library:read', id),

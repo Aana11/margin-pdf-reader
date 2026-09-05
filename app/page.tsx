@@ -15,7 +15,7 @@ import { chunkPage } from '@/lib/rag/chunk';
 import { MemoryVectorIndex } from '@/lib/rag/memory-index';
 import { createEmbeddingProvider } from '@/lib/rag/providers';
 import type { EmbeddingProvider, EmbeddingProviderKind, RagChunk, StoredIndexEntry } from '@/lib/rag/types';
-import type { LibraryEntry } from '@/types/electron';
+import type { LibraryEntry, ModelInstallStatus } from '@/types/electron';
 
 type Message = { role: 'user' | 'assistant'; content: string; page: number };
 type ModelSettings = {
@@ -130,6 +130,8 @@ export default function Home() {
   const [settings, setSettings] = useState<ModelSettings>(readSavedSettings);
   const [library, setLibrary] = useState<LibraryEntry[]>([]);
   const [activeBookId, setActiveBookId] = useState<string | null>(null);
+  const [modelStatus, setModelStatus] = useState<ModelInstallStatus | null>(null);
+  const [scanWarning, setScanWarning] = useState('');
 
   const scrollToPage = useCallback((target: number, behavior: ScrollBehavior = 'smooth') => {
     const container = readerScrollRef.current;
@@ -153,6 +155,15 @@ export default function Home() {
   useEffect(() => {
     window.queueMicrotask(() => void refreshLibrary());
   }, [refreshLibrary]);
+
+  useEffect(() => {
+    const bridge = window.marginDesktop;
+    if (!bridge?.modelStatus) return;
+    window.queueMicrotask(() => void bridge.modelStatus?.().then(setModelStatus));
+    return bridge.onModelProgress?.((progress) => {
+      setModelStatus((current) => current ? { ...current, ...progress } : current);
+    });
+  }, []);
 
   useEffect(() => {
     if (!activeBookId || !page || !window.marginDesktop?.libraryUpdate) return;
@@ -245,6 +256,7 @@ export default function Home() {
       const document = await pdfJs.getDocument({ data: bytes }).promise;
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       pageTextsRef.current.clear();
+      setScanWarning('');
       setIndexStatus('idle'); setIndexProgress(0);
       const initialPage = Math.min(document.numPages, Math.max(1, book?.lastPage || 1));
       setPdf(document); setFileName(name); setPageCount(document.numPages); setPage(initialPage); setActiveBookId(book?.id || null);
@@ -305,6 +317,23 @@ export default function Home() {
     setIndexStatus('idle'); setIndexProgress(0);
   }
 
+  async function installLocalModel() {
+    if (!window.marginDesktop?.modelInstall) return;
+    setError('');
+    try {
+      await window.marginDesktop.modelInstall();
+      setModelStatus(await window.marginDesktop.modelStatus?.() ?? null);
+    } catch (reason) {
+      setError(`模型安装失败：${reason instanceof Error ? reason.message.slice(0, 180) : '未知错误'}`);
+    }
+  }
+
+  async function removeLocalModel() {
+    if (!window.marginDesktop?.modelRemove || !window.confirm('确认卸载本地向量模型？已保存的索引仍会保留，但无法检索，直到重新安装模型。')) return;
+    setModelStatus(await window.marginDesktop.modelRemove());
+    vectorIndexRef.current.clear(); embeddingProviderRef.current = null; setIndexStatus('idle');
+  }
+
   async function buildIndex() {
     if (!pdf || indexStatus === 'indexing') return;
     setError(''); setIndexStatus('indexing'); setIndexProgress(0);
@@ -313,18 +342,22 @@ export default function Home() {
       embeddingProviderRef.current = provider;
       vectorIndexRef.current.clear();
       const allChunks: RagChunk[] = [];
+      let emptyPages = 0;
       for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
         const pdfPage = await pdf.getPage(pageNumber);
         const content = await pdfPage.getTextContent();
         const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ');
+        if (!text.trim()) emptyPages += 1;
         allChunks.push(...chunkPage(text, pageNumber));
         setIndexProgress(Math.round((pageNumber / pdf.numPages) * 35));
       }
+      if (allChunks.length === 0) throw new Error('这个 PDF 没有可提取文本，可能是扫描件；需要 OCR 后才能建立索引。');
       const batchSize = settings.embeddingKind === 'local-qwen3-embedding-4b' ? 1 : 16;
       for (let start = 0; start < allChunks.length; start += batchSize) {
         await vectorIndexRef.current.add(allChunks.slice(start, start + batchSize), provider);
         setIndexProgress(35 + Math.round((Math.min(start + batchSize, allChunks.length) / Math.max(allChunks.length, 1)) * 65));
       }
+      setScanWarning(emptyPages > 0 ? `检测到 ${emptyPages} 页没有可提取文本；这些扫描页暂未进入索引。` : '');
       if (activeBookId && window.marginDesktop?.libraryIndexSave) {
         await window.marginDesktop.libraryIndexSave(activeBookId, provider.id, vectorIndexRef.current.snapshot());
         await refreshLibrary();
@@ -392,6 +425,15 @@ export default function Home() {
                   <NativeSelectOption value="local-qwen3-embedding-4b">本地 Qwen3-Embedding-4B（Q4_K_M）</NativeSelectOption>
                   <NativeSelectOption value="openai-compatible">OpenAI 兼容提供商</NativeSelectOption>
                 </NativeSelect>
+                {settings.embeddingKind === 'local-qwen3-embedding-4b' && <div className="model-manager">
+                  <div className="model-manager-status"><span className={modelStatus?.installed ? 'status-dot online' : 'status-dot'} /><div><strong>{modelStatus?.installed ? '本地模型已就绪' : modelStatus?.state === 'paused' ? '下载已暂停' : '尚未安装本地模型'}</strong><small>{modelStatus?.message || 'Qwen3-Embedding-4B · Q4_K_M · 约 2.50 GB'}</small></div></div>
+                  {modelStatus && ['checking', 'downloading', 'installing'].includes(modelStatus.state) && <div className="model-progress"><i style={{ width: `${modelStatus.progress}%` }} /></div>}
+                  <div className="model-manager-actions">
+                    {!modelStatus?.installed && modelStatus?.state !== 'downloading' && <Button size="sm" variant="outline" onClick={() => void installLocalModel()}>{modelStatus?.state === 'paused' ? '继续下载' : '下载并安装'}</Button>}
+                    {modelStatus?.state === 'downloading' && <Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.modelPause?.()}>暂停</Button>}
+                    {modelStatus?.installed && <><Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.modelOpenFolder?.()}>打开目录</Button><Button size="sm" variant="ghost" onClick={() => void removeLocalModel()}>卸载</Button></>}
+                  </div>
+                </div>}
                 {settings.embeddingKind === 'openai-compatible' && <>
                   <Label htmlFor="embedding-endpoint">向量端点</Label><Input id="embedding-endpoint" value={settings.embeddingEndpoint} onChange={(e) => setSettings({ ...settings, embeddingEndpoint: e.target.value })} placeholder="https://api.openai.com/v1" />
                   <Label htmlFor="embedding-model">向量模型名</Label><Input id="embedding-model" value={settings.embeddingModel} onChange={(e) => setSettings({ ...settings, embeddingModel: e.target.value })} placeholder="text-embedding-3-small" />
@@ -446,6 +488,7 @@ export default function Home() {
             <div><strong>{indexStatus === 'ready' ? '全文索引已就绪' : indexStatus === 'indexing' ? `正在建立索引 ${indexProgress}%` : '尚未建立全文索引'}</strong><span>{settings.embeddingKind === 'local-qwen3-embedding-4b' ? '本地 Qwen3-Embedding-4B · Q4_K_M' : settings.embeddingModel}</span></div>
             <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" disabled={indexStatus === 'indexing'} onClick={() => void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? <LoaderCircle className="spin" /> : '建立索引'}</Button>
           </div>}
+          {scanWarning && <p className="scan-warning">{scanWarning}</p>}
           <div className="chat-area">
             {messages.length === 0 ? <div className="chat-welcome"><MessageSquareText /><h3>我会跟着你的页码</h3><p>{pdf ? '直接提问，我会优先根据当前页原文解释。' : '打开 PDF 后，这里会自动获取你当前阅读的页面。'}</p></div> :
               <div className="messages" aria-live="polite">{messages.map((message, index) => <div className={`message ${message.role}`} key={`${message.page}-${index}`}><span>{message.role === 'assistant' ? <Bot /> : `P.${message.page}`}</span><p>{message.content}</p></div>)}{asking && <div className="message assistant"><span><Bot /></span><p className="thinking"><i /><i /><i /></p></div>}</div>}

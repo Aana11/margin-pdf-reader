@@ -1,19 +1,27 @@
 const { app, BrowserWindow, ipcMain, net, protocol, shell } = require('electron');
 const { spawn } = require('node:child_process');
-const { randomUUID } = require('node:crypto');
-const { access, mkdir, readFile, rename, rm, writeFile } = require('node:fs/promises');
+const { createHash, randomUUID } = require('node:crypto');
+const { createReadStream, createWriteStream } = require('node:fs');
+const { access, mkdir, readFile, rename, rm, stat, statfs, writeFile } = require('node:fs/promises');
 const nodeNet = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
+const { Readable, Transform } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 
 const isDevelopment = !app.isPackaged;
 const embeddingModel = 'Qwen/Qwen3-Embedding-4B';
 const modelDirectory = 'Qwen3-Embedding-4B-GGUF';
 const modelName = 'Qwen3-Embedding-4B-Q4_K_M.gguf';
+const modelRevision = 'f4602530db1d980e16da9d7d3a70294cf5c190be';
+const runtimeVersion = 'b10516';
 let sidecarPromise;
 let sidecarProcess;
 let catalogQueue = Promise.resolve();
+let modelInstallPromise;
+let modelDownloadController;
+let modelInstallState = { state: 'idle', progress: 0, message: '' };
 
 app.setName('Margin');
 
@@ -29,6 +37,131 @@ function modelFile() {
 
 function runtimeFile() {
   return path.join(dataRoot(), 'runtime', 'llama', 'llama-server.exe');
+}
+
+function runtimeArchive() {
+  return path.join(dataRoot(), 'downloads', `llama-${runtimeVersion}-win-cpu-x64.zip`);
+}
+
+function modelResources() {
+  return [
+    {
+      name: 'Qwen3-Embedding-4B Q4_K_M',
+      output: modelFile(),
+      size: 2496703776,
+      sha256: '2b0cf8f17b4c723c27303015383c27ec4bf2d8314bb677d05e920dd70bb0f16b',
+      urls: [
+        `https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/resolve/${modelRevision}/${modelName}`,
+        `https://www.modelscope.cn/models/Qwen/Qwen3-Embedding-4B-GGUF/resolve/master/${modelName}`,
+        `https://hf-mirror.com/Qwen/Qwen3-Embedding-4B-GGUF/resolve/${modelRevision}/${modelName}`,
+      ],
+    },
+    {
+      name: `llama.cpp ${runtimeVersion}`,
+      output: runtimeArchive(),
+      size: 33400000,
+      sha256: 'fbbbc55e0eb2e1b07f9dcb9488616c98ed47d9003b90e15e7c8c7812c4307cd3',
+      urls: [`https://github.com/ggml-org/llama.cpp/releases/download/${runtimeVersion}/llama-${runtimeVersion}-bin-win-cpu-x64.zip`],
+    },
+  ];
+}
+
+async function hashFile(file) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+function publishModelState(sender, changes) {
+  modelInstallState = { ...modelInstallState, ...changes };
+  if (sender && !sender.isDestroyed()) sender.send('model:progress', modelInstallState);
+}
+
+async function downloadResource(resource, sender, resourceIndex, signal) {
+  const temporary = `${resource.output}.download`;
+  await mkdir(path.dirname(resource.output), { recursive: true });
+  for (const url of resource.urls) {
+    try {
+      const existing = await stat(temporary).then((value) => value.size).catch(() => 0);
+      const response = await fetch(url, { redirect: 'follow', headers: existing ? { Range: `bytes=${existing}-` } : {}, signal });
+      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+      const resumed = existing > 0 && response.status === 206;
+      let received = resumed ? existing : 0;
+      let lastPercent = -1;
+      const progress = new Transform({
+        transform(chunk, _encoding, done) {
+          received += chunk.length;
+          const resourceProgress = Math.min(1, received / resource.size);
+          const percent = Math.round(((resourceIndex + resourceProgress) / 2) * 95);
+          if (percent !== lastPercent) {
+            lastPercent = percent;
+            publishModelState(sender, { state: 'downloading', progress: percent, message: `正在下载 ${resource.name}` });
+          }
+          done(null, chunk);
+        },
+      });
+      await pipeline(Readable.fromWeb(response.body), progress, createWriteStream(temporary, { flags: resumed ? 'a' : 'w' }));
+      if (await hashFile(temporary) !== resource.sha256) {
+        await rm(temporary, { force: true });
+        throw new Error('checksum mismatch');
+      }
+      await rm(resource.output, { force: true });
+      await rename(temporary, resource.output);
+      return;
+    } catch (error) {
+      if (signal.aborted) throw error;
+    }
+  }
+  throw new Error(`无法下载 ${resource.name}`);
+}
+
+async function extractRuntime() {
+  const temporary = `${path.dirname(runtimeFile())}.extracting`;
+  await rm(temporary, { recursive: true, force: true });
+  await mkdir(temporary, { recursive: true });
+  await new Promise((resolve, reject) => {
+    const process = spawn('tar.exe', ['-xf', runtimeArchive(), '-C', temporary], { windowsHide: true, stdio: 'ignore' });
+    process.once('error', reject);
+    process.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`运行时解压失败 (${code})`)));
+  });
+  const destination = path.dirname(runtimeFile());
+  await rm(destination, { recursive: true, force: true });
+  await rename(temporary, destination);
+  await access(runtimeFile());
+}
+
+async function installModel(sender) {
+  if (modelInstallPromise) return modelInstallPromise;
+  modelDownloadController = new AbortController();
+  const signal = modelDownloadController.signal;
+  modelInstallPromise = (async () => {
+    await mkdir(dataRoot(), { recursive: true });
+    const disk = await statfs(dataRoot());
+    const available = Number(disk.bavail) * Number(disk.bsize);
+    const required = modelResources().reduce((sum, resource) => sum + resource.size, 0) + 600 * 1024 * 1024;
+    if (available < required) throw new Error(`磁盘空间不足，需要至少 ${(required / 1024 / 1024 / 1024).toFixed(1)} GB 可用空间`);
+    publishModelState(sender, { state: 'checking', progress: 0, message: '正在校验本地文件' });
+    const resources = modelResources();
+    for (const [index, resource] of resources.entries()) {
+      const valid = await access(resource.output).then(() => hashFile(resource.output)).then((digest) => digest === resource.sha256).catch(() => false);
+      if (!valid) await downloadResource(resource, sender, index, signal);
+    }
+    publishModelState(sender, { state: 'installing', progress: 96, message: '正在安装 llama.cpp 运行时' });
+    await access(runtimeFile()).catch(() => extractRuntime());
+    publishModelState(sender, { state: 'ready', progress: 100, message: '本地向量模型已就绪' });
+    return { installed: true };
+  })().catch((error) => {
+    if (signal.aborted) {
+      publishModelState(sender, { state: 'paused', message: '下载已暂停，可继续下载' });
+      return { installed: false, paused: true };
+    }
+    publishModelState(sender, { state: 'error', message: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }).finally(() => {
+    modelInstallPromise = undefined;
+    modelDownloadController = undefined;
+  });
+  return modelInstallPromise;
 }
 
 function libraryRoot() {
@@ -125,14 +258,38 @@ async function getSidecarUrl() {
   return sidecarPromise;
 }
 
-ipcMain.handle('embedding:status', async () => {
+async function getModelStatus() {
   try {
     await access(modelFile());
     await access(runtimeFile());
-    return { installed: true, model: embeddingModel, root: dataRoot() };
+    return { installed: true, model: embeddingModel, root: dataRoot(), ...modelInstallState, state: modelInstallState.state === 'idle' ? 'ready' : modelInstallState.state };
   } catch {
-    return { installed: false, model: embeddingModel, root: dataRoot() };
+    return { installed: false, model: embeddingModel, root: dataRoot(), ...modelInstallState };
   }
+}
+
+ipcMain.handle('embedding:status', getModelStatus);
+ipcMain.handle('model:install', (event) => installModel(event.sender));
+ipcMain.handle('model:pause', () => {
+  modelDownloadController?.abort();
+  return { paused: Boolean(modelDownloadController) };
+});
+ipcMain.handle('model:open-folder', async () => {
+  await mkdir(dataRoot(), { recursive: true });
+  const result = await shell.openPath(dataRoot());
+  if (result) throw new Error(result);
+  return { opened: true };
+});
+ipcMain.handle('model:remove', async () => {
+  modelDownloadController?.abort();
+  if (sidecarProcess && sidecarProcess.exitCode === null) sidecarProcess.kill();
+  sidecarProcess = undefined;
+  sidecarPromise = undefined;
+  await rm(path.dirname(modelFile()), { recursive: true, force: true });
+  await rm(path.dirname(runtimeFile()), { recursive: true, force: true });
+  await rm(runtimeArchive(), { force: true });
+  modelInstallState = { state: 'idle', progress: 0, message: '' };
+  return getModelStatus();
 });
 
 ipcMain.handle('embedding:embed', async (_event, texts) => {

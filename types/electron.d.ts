@@ -11,6 +11,7 @@ export type LibraryEntry = {
 };
 
 export type StoredIndexEntry = { id: string; page: number; text: string; vector: number[] };
+export type ModelInstallStatus = { installed: boolean; model: string; root: string; state: string; progress: number; message: string };
 
 declare global {
   interface Window {
@@ -18,7 +19,12 @@ declare global {
       platform: string;
       isDesktop: boolean;
       embed?: (texts: string[]) => Promise<number[][]>;
-      modelStatus?: () => Promise<{ installed: boolean; model: string; root: string }>;
+      modelStatus?: () => Promise<ModelInstallStatus>;
+      modelInstall?: () => Promise<{ installed: boolean; paused?: boolean }>;
+      modelPause?: () => Promise<{ paused: boolean }>;
+      modelOpenFolder?: () => Promise<{ opened: boolean }>;
+      modelRemove?: () => Promise<ModelInstallStatus>;
+      onModelProgress?: (listener: (progress: Omit<ModelInstallStatus, 'installed' | 'model' | 'root'>) => void) => () => void;
       libraryList?: () => Promise<LibraryEntry[]>;
       libraryImport?: (name: string, data: ArrayBuffer) => Promise<LibraryEntry>;
       libraryRead?: (id: string) => Promise<Uint8Array>;
