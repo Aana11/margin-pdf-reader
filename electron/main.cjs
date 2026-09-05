@@ -18,6 +18,7 @@ const modelRevision = 'f4602530db1d980e16da9d7d3a70294cf5c190be';
 const runtimeVersion = 'b10516';
 let sidecarPromise;
 let sidecarProcess;
+let sidecarIdleTimer;
 let catalogQueue = Promise.resolve();
 let modelInstallPromise;
 let modelDownloadController;
@@ -233,11 +234,19 @@ async function startSidecar() {
     '--pooling', 'last',
     '--host', '127.0.0.1',
     '--port', String(port),
-    '--ctx-size', '8192',
-    '--ubatch-size', '2048',
-    '--threads', String(Math.max(1, os.cpus().length - 1)),
+    '--ctx-size', '2048',
+    '--batch-size', '512',
+    '--ubatch-size', '512',
+    '--threads', String(Math.max(1, Math.min(8, Math.ceil(os.cpus().length / 2)))),
     '--no-webui',
   ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const launchedProcess = sidecarProcess;
+  launchedProcess.once('exit', () => {
+    if (sidecarProcess === launchedProcess) {
+      sidecarProcess = undefined;
+      sidecarPromise = undefined;
+    }
+  });
   const collect = (chunk) => { logs = `${logs}${chunk}`.slice(-6_000); };
   sidecarProcess.stdout.on('data', collect);
   sidecarProcess.stderr.on('data', collect);
@@ -253,6 +262,20 @@ async function startSidecar() {
   throw new Error(`本地向量模型加载超时：${logs.slice(-1000)}`);
 }
 
+function stopSidecar() {
+  if (sidecarIdleTimer) clearTimeout(sidecarIdleTimer);
+  sidecarIdleTimer = undefined;
+  if (sidecarProcess && sidecarProcess.exitCode === null) sidecarProcess.kill();
+  sidecarProcess = undefined;
+  sidecarPromise = undefined;
+}
+
+function scheduleSidecarIdleStop() {
+  if (sidecarIdleTimer) clearTimeout(sidecarIdleTimer);
+  sidecarIdleTimer = setTimeout(stopSidecar, 120_000);
+  sidecarIdleTimer.unref();
+}
+
 async function getSidecarUrl() {
   if (!sidecarPromise) sidecarPromise = startSidecar().catch((error) => { sidecarPromise = undefined; throw error; });
   return sidecarPromise;
@@ -262,9 +285,9 @@ async function getModelStatus() {
   try {
     await access(modelFile());
     await access(runtimeFile());
-    return { installed: true, model: embeddingModel, root: dataRoot(), ...modelInstallState, state: modelInstallState.state === 'idle' ? 'ready' : modelInstallState.state };
+    return { installed: true, loaded: Boolean(sidecarProcess && sidecarProcess.exitCode === null), model: embeddingModel, root: dataRoot(), ...modelInstallState, state: modelInstallState.state === 'idle' ? 'ready' : modelInstallState.state };
   } catch {
-    return { installed: false, model: embeddingModel, root: dataRoot(), ...modelInstallState };
+    return { installed: false, loaded: false, model: embeddingModel, root: dataRoot(), ...modelInstallState };
   }
 }
 
@@ -280,11 +303,13 @@ ipcMain.handle('model:open-folder', async () => {
   if (result) throw new Error(result);
   return { opened: true };
 });
+ipcMain.handle('model:unload', async () => {
+  stopSidecar();
+  return getModelStatus();
+});
 ipcMain.handle('model:remove', async () => {
   modelDownloadController?.abort();
-  if (sidecarProcess && sidecarProcess.exitCode === null) sidecarProcess.kill();
-  sidecarProcess = undefined;
-  sidecarPromise = undefined;
+  stopSidecar();
   await rm(path.dirname(modelFile()), { recursive: true, force: true });
   await rm(path.dirname(runtimeFile()), { recursive: true, force: true });
   await rm(runtimeArchive(), { force: true });
@@ -310,6 +335,7 @@ ipcMain.handle('embedding:embed', async (_event, texts) => {
   if (!response.ok) throw new Error((await response.text()) || `本地向量请求失败 (${response.status})`);
   const payload = await response.json();
   if (!Array.isArray(payload.data)) throw new Error('本地向量服务返回格式无效');
+  scheduleSidecarIdleStop();
   return payload.data.sort((a, b) => a.index - b.index).map((item) => item.embedding);
 });
 
@@ -329,6 +355,16 @@ ipcMain.handle('library:import', async (_event, payload) => {
 });
 
 ipcMain.handle('library:read', async (_event, id) => new Uint8Array(await readFile(path.join(bookDirectory(id), 'document.pdf'))));
+
+ipcMain.handle('library:remove', async (_event, id) => {
+  const bookId = assertBookId(id);
+  await rm(bookDirectory(bookId), { recursive: true, force: true });
+  return updateCatalog((catalog) => {
+    const index = catalog.findIndex((candidate) => candidate.id === bookId);
+    if (index >= 0) catalog.splice(index, 1);
+    return { removed: bookId };
+  });
+});
 
 ipcMain.handle('library:update', async (_event, id, changes) => updateCatalog((catalog) => {
   const entry = catalog.find((candidate) => candidate.id === assertBookId(id));
@@ -408,4 +444,4 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', () => { if (sidecarProcess && sidecarProcess.exitCode === null) sidecarProcess.kill(); });
+app.on('before-quit', stopSidecar);

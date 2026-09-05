@@ -76,14 +76,19 @@ try {
       page: document.querySelector('.page-label')?.textContent || '',
       canvasWidth: document.querySelector('canvas')?.width || 0,
       canvasCount: document.querySelectorAll('.pdf-page canvas').length,
+      scrollHeight: document.querySelector('.canvas-wrap')?.scrollHeight || 0,
+      clientHeight: document.querySelector('.canvas-wrap')?.clientHeight || 0,
       shelf: document.querySelector('.book-item strong')?.textContent || '',
       error: document.querySelector('.error-message')?.textContent || ''
     })`);
     if (state.error) throw new Error(state.error);
-    if (!state.page.includes('1 / 2') || state.canvasWidth <= 0 || state.canvasCount !== 2 || !state.shelf.includes('margin-reader-smoke')) throw new Error('Page 1 or bookshelf has not rendered yet');
+    if (!state.page.includes('1 / 2') || state.canvasWidth <= 0 || state.canvasCount !== 2 || state.scrollHeight <= state.clientHeight || !state.shelf.includes('margin-reader-smoke')) throw new Error(`Page 1, scroll region, or bookshelf has not rendered yet: ${JSON.stringify(state)}`);
     return state;
   }, 120, 500);
-  await evaluate(`document.querySelector('[aria-label="下一页"]')?.click()`);
+  for (let index = 0; index < 4; index += 1) {
+    await command('Input.dispatchMouseEvent', { type: 'mouseWheel', x: 650, y: 600, deltaX: 0, deltaY: 700 });
+    await delay(150);
+  }
   const pageTwo = await retry(async () => {
     const state = await evaluate(`({
       page: document.querySelector('.page-label')?.textContent || '',
@@ -102,6 +107,8 @@ try {
   const modelStatus = await evaluate(`window.marginDesktop.modelStatus()`, true);
   let embeddingDimensions = null;
   let indexStatus = null;
+  let modelLoaded = null;
+  let modelReleased = null;
   let persisted = null;
   if (testEmbedding) {
     const vectors = await evaluate(`window.marginDesktop.embed(['A short PDF retrieval passage.'])`, true);
@@ -117,6 +124,8 @@ try {
       if (!state.label.includes('全文索引已就绪')) throw new Error(`Index is not ready: ${state.label}`);
       return state.label;
     }, 360, 500);
+    modelLoaded = await evaluate(`window.marginDesktop.modelStatus()`, true);
+    if (!modelLoaded?.loaded) throw new Error('Local model process is not reported as loaded');
   }
   await evaluate(`window.location.reload()`);
   persisted = await retry(async () => {
@@ -139,7 +148,17 @@ try {
     if (!state.page.includes('2 / 2') || state.canvasWidth <= 0 || (testEmbedding && !state.index.includes('全文索引已就绪'))) throw new Error(`Persisted book or index has not reopened yet: ${JSON.stringify(state)}`);
     return state;
   }, 240, 500);
-  console.log(JSON.stringify({ pageOne, pageTwo, modelStatus, embeddingDimensions, indexStatus, persisted, reopened }));
+  if (testEmbedding) {
+    modelReleased = await evaluate(`window.marginDesktop.modelUnload()`, true);
+    if (modelReleased?.loaded) throw new Error('Local model process did not release memory');
+  }
+  await evaluate(`(() => { window.confirm = () => true; document.querySelector('.book-remove')?.click(); })()`);
+  const removed = await retry(async () => {
+    const state = await evaluate(`({ books: document.querySelectorAll('.book-item').length, hasPdf: Boolean(document.querySelector('.pdf-pages')) })`);
+    if (state.books !== 0 || state.hasPdf) throw new Error('Book removal has not completed yet');
+    return true;
+  }, 60, 500);
+  console.log(JSON.stringify({ pageOne, pageTwo, modelStatus, embeddingDimensions, indexStatus, modelLoaded, modelReleased, persisted, reopened, removed }));
 } finally {
   await Promise.race([command('Browser.close').catch(() => undefined), delay(2_000)]);
   socket.close();

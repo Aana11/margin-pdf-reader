@@ -1,7 +1,7 @@
 'use client';
 
 import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, BookOpen, Bot, FileText, HardDrive, Library, LoaderCircle, MessageSquareText, Plus, Send, Settings2, Sparkles, Upload } from 'lucide-react';
+import { ArrowDown, ArrowUp, BookOpen, Bot, FileText, HardDrive, Library, LoaderCircle, MessageSquareText, Plus, Send, Settings2, Sparkles, Trash2, Upload } from 'lucide-react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 // oxlint-disable-next-line import/default -- Vite's ?url loader provides this synthetic default export.
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
@@ -52,14 +52,15 @@ function PdfPageCanvas({ pdf, pageNumber, onText, onError }: PdfPageCanvasProps)
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [shouldRender, setShouldRender] = useState(false);
   const [availableWidth, setAvailableWidth] = useState(760);
+  const [pageRatio, setPageRatio] = useState(1 / 1.414);
 
   useEffect(() => {
     const shell = shellRef.current;
     if (!shell) return;
     const root = shell.closest('.canvas-wrap');
     const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) setShouldRender(true);
-    }, { root, rootMargin: '1200px 0px' });
+      setShouldRender(entries.some((entry) => entry.isIntersecting));
+    }, { root, rootMargin: '800px 0px' });
     observer.observe(shell);
     return () => observer.disconnect();
   }, []);
@@ -75,13 +76,22 @@ function PdfPageCanvas({ pdf, pageNumber, onText, onError }: PdfPageCanvasProps)
   }, []);
 
   useEffect(() => {
-    if (!shouldRender || !canvasRef.current) return;
+    if (!shouldRender || !canvasRef.current) {
+      if (canvasRef.current) {
+        canvasRef.current.width = 1;
+        canvasRef.current.height = 1;
+        canvasRef.current.style.width = '';
+        canvasRef.current.style.height = '';
+      }
+      return;
+    }
     let cancelled = false;
     let renderTask: { cancel: () => void; promise: Promise<void> } | undefined;
     async function renderPage() {
       const pdfPage = await pdf.getPage(pageNumber);
       if (cancelled || !canvasRef.current) return;
       const baseViewport = pdfPage.getViewport({ scale: 1 });
+      setPageRatio(baseViewport.width / baseViewport.height);
       const scale = Math.min(2, Math.max(0.5, (availableWidth - 32) / baseViewport.width));
       const viewport = pdfPage.getViewport({ scale });
       const canvas = canvasRef.current;
@@ -103,7 +113,7 @@ function PdfPageCanvas({ pdf, pageNumber, onText, onError }: PdfPageCanvasProps)
     return () => { cancelled = true; renderTask?.cancel(); };
   }, [availableWidth, onError, onText, pageNumber, pdf, shouldRender]);
 
-  return <div ref={shellRef} className="pdf-page" data-page={pageNumber} aria-label={`PDF 第 ${pageNumber} 页`}>
+  return <div ref={shellRef} className="pdf-page" style={{ aspectRatio: pageRatio }} data-page={pageNumber} aria-label={`PDF 第 ${pageNumber} 页`}>
     <canvas ref={canvasRef} />
     <span className="pdf-page-number">{pageNumber}</span>
   </div>;
@@ -113,6 +123,7 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const readerScrollRef = useRef<HTMLDivElement>(null);
   const pageTextsRef = useRef(new Map<number, string>());
+  const visiblePagesRef = useRef(new Map<number, number>());
   const vectorIndexRef = useRef(new MemoryVectorIndex());
   const embeddingProviderRef = useRef<EmbeddingProvider | null>(null);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
@@ -125,8 +136,9 @@ export default function Home() {
   const [loadingPdf, setLoadingPdf] = useState(false);
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState('');
-  const [indexStatus, setIndexStatus] = useState<'idle' | 'indexing' | 'ready'>('idle');
+  const [indexStatus, setIndexStatus] = useState<'idle' | 'indexing' | 'ready' | 'error'>('idle');
   const [indexProgress, setIndexProgress] = useState(0);
+  const [indexMessage, setIndexMessage] = useState('');
   const [settings, setSettings] = useState<ModelSettings>(readSavedSettings);
   const [library, setLibrary] = useState<LibraryEntry[]>([]);
   const [activeBookId, setActiveBookId] = useState<string | null>(null);
@@ -205,6 +217,23 @@ export default function Home() {
   }, [pdf, pageCount, scrollToPage]);
 
   useEffect(() => {
+    const root = readerScrollRef.current;
+    if (!pdf || !root) return;
+    visiblePagesRef.current.clear();
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) visiblePagesRef.current.set(Number((entry.target as HTMLElement).dataset.page), entry.intersectionRatio);
+      let nextPage = 1;
+      let bestRatio = 0;
+      for (const [pageNumber, ratio] of visiblePagesRef.current) {
+        if (ratio > bestRatio) { nextPage = pageNumber; bestRatio = ratio; }
+      }
+      if (bestRatio > 0) setPage((current) => current === nextPage ? current : nextPage);
+    }, { root, threshold: [0, 0.15, 0.35, 0.55, 0.75] });
+    for (const element of root.querySelectorAll('.pdf-page')) observer.observe(element);
+    return () => observer.disconnect();
+  }, [pdf, pageCount]);
+
+  useEffect(() => {
     if (!pdf) return;
     let cancelled = false;
     async function updatePageText() {
@@ -219,24 +248,6 @@ export default function Home() {
     updatePageText().catch(() => { if (!cancelled) setPageText(''); });
     return () => { cancelled = true; };
   }, [pdf, page]);
-
-  function syncPageFromScroll() {
-    const container = readerScrollRef.current;
-    if (!container) return;
-    const viewport = container.getBoundingClientRect();
-    const focusLine = viewport.top + Math.min(180, viewport.height * 0.35);
-    let closestPage = page;
-    let closestDistance = Number.POSITIVE_INFINITY;
-    for (const element of container.querySelectorAll<HTMLElement>('.pdf-page')) {
-      const rect = element.getBoundingClientRect();
-      const distance = Math.abs(rect.top - focusLine);
-      if (distance < closestDistance) {
-        closestDistance = distance;
-        closestPage = Number(element.dataset.page);
-      }
-    }
-    if (closestPage !== page) setPage(closestPage);
-  }
 
   function createConfiguredProvider() {
     return createEmbeddingProvider({
@@ -257,7 +268,7 @@ export default function Home() {
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       pageTextsRef.current.clear();
       setScanWarning('');
-      setIndexStatus('idle'); setIndexProgress(0);
+      setIndexStatus('idle'); setIndexProgress(0); setIndexMessage('');
       const initialPage = Math.min(document.numPages, Math.max(1, book?.lastPage || 1));
       setPdf(document); setFileName(name); setPageCount(document.numPages); setPage(initialPage); setActiveBookId(book?.id || null);
       if (book && window.marginDesktop?.libraryUpdate) {
@@ -271,7 +282,7 @@ export default function Home() {
           if (stored?.length) {
             vectorIndexRef.current.restore(stored, provider.dimensions);
             embeddingProviderRef.current = provider;
-            setIndexStatus('ready'); setIndexProgress(100);
+            setIndexStatus('ready'); setIndexProgress(100); setIndexMessage(`已从本地恢复 ${stored.length} 个片段`);
           }
         } catch { /* A changed or incomplete provider simply requires rebuilding the index. */ }
       }
@@ -311,10 +322,25 @@ export default function Home() {
     }
   }
 
+  async function removeLibraryBook(book: LibraryEntry) {
+    if (!window.marginDesktop?.libraryRemove || !window.confirm(`从本地书架移除《${book.name}》？PDF 副本与已保存索引会从 Margin 数据目录删除。`)) return;
+    try {
+      await window.marginDesktop.libraryRemove(book.id);
+      setLibrary((current) => current.filter((entry) => entry.id !== book.id));
+      if (activeBookId === book.id) {
+        await pdf?.destroy();
+        vectorIndexRef.current.clear(); embeddingProviderRef.current = null; pageTextsRef.current.clear();
+        setPdf(null); setFileName(''); setPage(1); setPageCount(0); setPageText(''); setActiveBookId(null); setMessages([]); setIndexStatus('idle'); setIndexProgress(0); setIndexMessage(''); setScanWarning('');
+      }
+    } catch (reason) {
+      setError(`移除失败：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`);
+    }
+  }
+
   function saveSettings() {
     localStorage.setItem('margin-ai-settings', JSON.stringify(settings));
     vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
-    setIndexStatus('idle'); setIndexProgress(0);
+    setIndexStatus('idle'); setIndexProgress(0); setIndexMessage('向量模型配置已变化，请重新建立索引');
   }
 
   async function installLocalModel() {
@@ -331,12 +357,17 @@ export default function Home() {
   async function removeLocalModel() {
     if (!window.marginDesktop?.modelRemove || !window.confirm('确认卸载本地向量模型？已保存的索引仍会保留，但无法检索，直到重新安装模型。')) return;
     setModelStatus(await window.marginDesktop.modelRemove());
-    vectorIndexRef.current.clear(); embeddingProviderRef.current = null; setIndexStatus('idle');
+    vectorIndexRef.current.clear(); embeddingProviderRef.current = null; setIndexStatus('idle'); setIndexMessage('本地模型已卸载');
+  }
+
+  async function releaseModelMemory() {
+    if (!window.marginDesktop?.modelUnload) return;
+    setModelStatus(await window.marginDesktop.modelUnload());
   }
 
   async function buildIndex() {
     if (!pdf || indexStatus === 'indexing') return;
-    setError(''); setIndexStatus('indexing'); setIndexProgress(0);
+    setError(''); setIndexStatus('indexing'); setIndexProgress(0); setIndexMessage('正在提取 PDF 文本');
     try {
       const provider = createConfiguredProvider();
       embeddingProviderRef.current = provider;
@@ -350,22 +381,27 @@ export default function Home() {
         if (!text.trim()) emptyPages += 1;
         allChunks.push(...chunkPage(text, pageNumber));
         setIndexProgress(Math.round((pageNumber / pdf.numPages) * 35));
+        setIndexMessage(`正在提取文本：第 ${pageNumber} / ${pdf.numPages} 页`);
       }
       if (allChunks.length === 0) throw new Error('这个 PDF 没有可提取文本，可能是扫描件；需要 OCR 后才能建立索引。');
       const batchSize = settings.embeddingKind === 'local-qwen3-embedding-4b' ? 1 : 16;
       for (let start = 0; start < allChunks.length; start += batchSize) {
         await vectorIndexRef.current.add(allChunks.slice(start, start + batchSize), provider);
         setIndexProgress(35 + Math.round((Math.min(start + batchSize, allChunks.length) / Math.max(allChunks.length, 1)) * 65));
+        setIndexMessage(`正在生成向量：${Math.min(start + batchSize, allChunks.length)} / ${allChunks.length} 个片段`);
       }
       setScanWarning(emptyPages > 0 ? `检测到 ${emptyPages} 页没有可提取文本；这些扫描页暂未进入索引。` : '');
       if (activeBookId && window.marginDesktop?.libraryIndexSave) {
+        setIndexMessage('正在保存本地索引');
         await window.marginDesktop.libraryIndexSave(activeBookId, provider.id, vectorIndexRef.current.snapshot());
         await refreshLibrary();
       }
-      setIndexStatus('ready'); setIndexProgress(100);
+      setIndexStatus('ready'); setIndexProgress(100); setIndexMessage(`索引完成：${allChunks.length} 个片段${activeBookId ? '，已持久化' : ''}`);
+      if (settings.embeddingKind === 'local-qwen3-embedding-4b') setModelStatus(await window.marginDesktop?.modelStatus?.() ?? modelStatus);
     } catch (reason) {
-      setIndexStatus('idle');
-      setError(`建立索引失败：${reason instanceof Error ? reason.message.slice(0, 180) : '未知错误'}`);
+      const message = reason instanceof Error ? reason.message.slice(0, 180) : '未知错误';
+      setIndexStatus('error'); setIndexMessage(message);
+      setError(`建立索引失败：${message}`);
     }
   }
 
@@ -426,12 +462,12 @@ export default function Home() {
                   <NativeSelectOption value="openai-compatible">OpenAI 兼容提供商</NativeSelectOption>
                 </NativeSelect>
                 {settings.embeddingKind === 'local-qwen3-embedding-4b' && <div className="model-manager">
-                  <div className="model-manager-status"><span className={modelStatus?.installed ? 'status-dot online' : 'status-dot'} /><div><strong>{modelStatus?.installed ? '本地模型已就绪' : modelStatus?.state === 'paused' ? '下载已暂停' : '尚未安装本地模型'}</strong><small>{modelStatus?.message || 'Qwen3-Embedding-4B · Q4_K_M · 约 2.50 GB'}</small></div></div>
+                  <div className="model-manager-status"><span className={modelStatus?.installed ? 'status-dot online' : 'status-dot'} /><div><strong>{modelStatus?.loaded ? '模型已载入内存' : modelStatus?.installed ? '本地模型已就绪' : modelStatus?.state === 'paused' ? '下载已暂停' : '尚未安装本地模型'}</strong><small>{modelStatus?.message || (modelStatus?.loaded ? '空闲 2 分钟后自动释放内存' : 'Qwen3-Embedding-4B · Q4_K_M · 约 2.50 GB')}</small></div></div>
                   {modelStatus && ['checking', 'downloading', 'installing'].includes(modelStatus.state) && <div className="model-progress"><i style={{ width: `${modelStatus.progress}%` }} /></div>}
                   <div className="model-manager-actions">
                     {!modelStatus?.installed && modelStatus?.state !== 'downloading' && <Button size="sm" variant="outline" onClick={() => void installLocalModel()}>{modelStatus?.state === 'paused' ? '继续下载' : '下载并安装'}</Button>}
                     {modelStatus?.state === 'downloading' && <Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.modelPause?.()}>暂停</Button>}
-                    {modelStatus?.installed && <><Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.modelOpenFolder?.()}>打开目录</Button><Button size="sm" variant="ghost" onClick={() => void removeLocalModel()}>卸载</Button></>}
+                    {modelStatus?.installed && <>{modelStatus.loaded && <Button size="sm" variant="outline" onClick={() => void releaseModelMemory()}>释放内存</Button>}<Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.modelOpenFolder?.()}>打开目录</Button><Button size="sm" variant="ghost" onClick={() => void removeLocalModel()}>卸载</Button></>}
                   </div>
                 </div>}
                 {settings.embeddingKind === 'openai-compatible' && <>
@@ -443,22 +479,20 @@ export default function Home() {
               <DialogFooter><Button onClick={saveSettings}>保存配置</Button></DialogFooter>
             </DialogContent>
           </Dialog>
-          <Button variant="outline" onClick={() => fileInputRef.current?.click()}><Plus /> 导入 PDF</Button>
         </div>
         <input ref={fileInputRef} className="sr-only" type="file" accept="application/pdf,.pdf" onChange={(event) => void openPdf(event.target.files?.[0])} />
       </header>
 
       <div className="workspace">
         <aside className="bookshelf-panel" aria-label="本地书架">
-          <div className="bookshelf-heading"><div><Library /><span>本地书架</span></div><strong>{library.length}</strong></div>
+          <div className="bookshelf-heading"><div><Library /><span>本地书架</span><strong>{library.length}</strong></div><Button variant="ghost" size="icon" onClick={() => fileInputRef.current?.click()} aria-label="添加到本地书架"><Plus /></Button></div>
           <div className="book-list">
             {library.length === 0 ? <div className="bookshelf-empty"><BookOpen /><p>导入的 PDF 会保存在本机，并记住阅读进度与向量索引。</p></div> : library.map((book) =>
-              <button className={book.id === activeBookId ? 'book-item active' : 'book-item'} key={book.id} onClick={() => void openLibraryBook(book)}>
+              <div className="book-row" key={book.id}><button className={book.id === activeBookId ? 'book-item active' : 'book-item'} onClick={() => void openLibraryBook(book)}>
                 <span className="book-icon"><FileText /></span><span className="book-copy"><strong>{book.name}</strong><small>{book.pageCount ? `${book.lastPage} / ${book.pageCount} 页` : '等待首次打开'}</small></span>
                 {book.indexProviderId && <span className="book-index" title="已保存向量索引"><HardDrive /></span>}
-              </button>)}
+              </button><button className="book-remove" onClick={() => void removeLibraryBook(book)} aria-label={`从书架移除 ${book.name}`}><Trash2 /></button></div>)}
           </div>
-          <Button variant="outline" className="bookshelf-import" onClick={() => fileInputRef.current?.click()}><Plus /> 添加到书架</Button>
         </aside>
         <section className="reader-panel" aria-label="PDF 阅读区">
           {pdf ? <>
@@ -470,23 +504,22 @@ export default function Home() {
                 <Button variant="ghost" size="icon" disabled={page >= pageCount} onClick={() => scrollToPage(Math.min(pageCount, page + 1))} aria-label="下一页"><ArrowDown /></Button>
               </div>
             </div>
-            <div ref={readerScrollRef} className="canvas-wrap" onScroll={syncPageFromScroll}><div className="pdf-pages">
+            <div ref={readerScrollRef} className="canvas-wrap"><div className="pdf-pages">
               {Array.from({ length: pageCount }, (_, index) => <PdfPageCanvas key={index + 1} pdf={pdf} pageNumber={index + 1} onText={handlePageText} onError={handleRenderError} />)}
             </div></div>
           </> : <div className="empty-state">
             <div className="empty-icon"><Upload /></div><p className="eyebrow">私密 · 本地阅读</p>
             <h1>打开一本 PDF，<br />开始深度阅读。</h1>
             <p>文档仅在你的浏览器中解析。AI 会自动携带当前页内容，无需反复截图或复制。</p>
-            <Button size="lg" onClick={() => fileInputRef.current?.click()} disabled={loadingPdf}>{loadingPdf ? <LoaderCircle className="spin" /> : <Upload />} 选择 PDF 文件</Button>
-            <span className="file-note">支持本地 PDF · 文件不会上传</span>
+            <span className="file-note">点击“本地书架”旁的 ＋ 导入 PDF · 文件不会上传</span>
           </div>}
         </section>
 
         <aside className="ai-panel" aria-label="AI 阅读助手">
           <div className="ai-heading"><div className="ai-avatar"><Sparkles /></div><div><h2>阅读助手</h2><p>{pdf ? `已同步第 ${page} 页` : '等待打开文档'}</p></div><span className={pdf ? 'sync-badge active' : 'sync-badge'}>{pdf ? '已定位' : '未连接'}</span></div>
-          {pdf && <div className="index-strip">
-            <div><strong>{indexStatus === 'ready' ? '全文索引已就绪' : indexStatus === 'indexing' ? `正在建立索引 ${indexProgress}%` : '尚未建立全文索引'}</strong><span>{settings.embeddingKind === 'local-qwen3-embedding-4b' ? '本地 Qwen3-Embedding-4B · Q4_K_M' : settings.embeddingModel}</span></div>
-            <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" disabled={indexStatus === 'indexing'} onClick={() => void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? <LoaderCircle className="spin" /> : '建立索引'}</Button>
+          {pdf && <div className={`index-strip ${indexStatus}`}>
+            <div><strong>{indexStatus === 'ready' ? '全文索引已就绪' : indexStatus === 'indexing' ? `正在建立索引 ${indexProgress}%` : indexStatus === 'error' ? '索引建立失败' : '尚未建立全文索引'}</strong><span title={indexMessage}>{indexMessage || (settings.embeddingKind === 'local-qwen3-embedding-4b' ? '本地 Qwen3-Embedding-4B · Q4_K_M' : settings.embeddingModel)}</span>{indexStatus === 'indexing' && <span className="index-progress"><i style={{ width: `${indexProgress}%` }} /></span>}</div>
+            <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" disabled={indexStatus === 'indexing'} onClick={() => void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? <LoaderCircle className="spin" /> : indexStatus === 'error' ? '重试' : '建立索引'}</Button>
           </div>}
           {scanWarning && <p className="scan-warning">{scanWarning}</p>}
           <div className="chat-area">
