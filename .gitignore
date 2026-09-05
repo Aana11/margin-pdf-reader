@@ -22,6 +22,7 @@
 
 # Generated from a pinned model revision during release.
 /public/models/
+/models/
 
 # debug
 npm-debug.log*
@@ -37,6 +38,7 @@ yarn-error.log*
 next-env.d.ts
 /dist/
 /release/
+/tmp/
 /.wrangler/
 /outputs/
 /work/

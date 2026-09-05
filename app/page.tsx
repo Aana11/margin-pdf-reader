@@ -3,6 +3,8 @@
 import { SyntheticEvent, useEffect, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRight, Bot, FileText, LoaderCircle, MessageSquareText, Plus, Send, Settings2, Sparkles, Upload } from 'lucide-react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
+// oxlint-disable-next-line import/default -- Vite's ?url loader provides this synthetic default export.
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
@@ -119,12 +121,16 @@ export default function Home() {
     setLoadingPdf(true); setError(''); setMessages([]);
     try {
       const pdfJs = await import('pdfjs-dist');
-      pdfJs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
+      pdfJs.GlobalWorkerOptions.workerSrc = new URL(pdfWorkerUrl, window.location.href).toString();
       const document = await pdfJs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       setIndexStatus('idle'); setIndexProgress(0);
       setPdf(document); setFileName(file.name); setPageCount(document.numPages); setPage(1);
-    } catch { setError('无法打开这个 PDF，请确认文件未加密且没有损坏。'); }
+    } catch (reason) {
+      console.error('Failed to open PDF', reason);
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setError(`无法打开这个 PDF：${detail.slice(0, 160)}`);
+    }
     finally { setLoadingPdf(false); if (fileInputRef.current) fileInputRef.current.value = ''; }
   }
 
@@ -219,7 +225,7 @@ export default function Home() {
                 <div className="settings-divider"><span>向量检索</span></div>
                 <Label htmlFor="embedding-kind">向量模型</Label>
                 <NativeSelect id="embedding-kind" className="w-full" value={settings.embeddingKind} onChange={(e) => setSettings({ ...settings, embeddingKind: e.target.value as EmbeddingProviderKind })}>
-                  <NativeSelectOption value="local-qwen3-embedding-4b">本地 Qwen3-Embedding-4B（Q8 模型包）</NativeSelectOption>
+                  <NativeSelectOption value="local-qwen3-embedding-4b">本地 Qwen3-Embedding-4B（Q4_K_M）</NativeSelectOption>
                   <NativeSelectOption value="openai-compatible">OpenAI 兼容提供商</NativeSelectOption>
                 </NativeSelect>
                 {settings.embeddingKind === 'openai-compatible' && <>
@@ -260,7 +266,7 @@ export default function Home() {
         <aside className="ai-panel" aria-label="AI 阅读助手">
           <div className="ai-heading"><div className="ai-avatar"><Sparkles /></div><div><h2>阅读助手</h2><p>{pdf ? `已同步第 ${page} 页` : '等待打开文档'}</p></div><span className={pdf ? 'sync-badge active' : 'sync-badge'}>{pdf ? '已定位' : '未连接'}</span></div>
           {pdf && <div className="index-strip">
-            <div><strong>{indexStatus === 'ready' ? '全文索引已就绪' : indexStatus === 'indexing' ? `正在建立索引 ${indexProgress}%` : '尚未建立全文索引'}</strong><span>{settings.embeddingKind === 'local-qwen3-embedding-4b' ? '本地 Qwen3-Embedding-4B · Q8' : settings.embeddingModel}</span></div>
+            <div><strong>{indexStatus === 'ready' ? '全文索引已就绪' : indexStatus === 'indexing' ? `正在建立索引 ${indexProgress}%` : '尚未建立全文索引'}</strong><span>{settings.embeddingKind === 'local-qwen3-embedding-4b' ? '本地 Qwen3-Embedding-4B · Q4_K_M' : settings.embeddingModel}</span></div>
             <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" disabled={indexStatus === 'indexing'} onClick={() => void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? <LoaderCircle className="spin" /> : '建立索引'}</Button>
           </div>}
           <div className="chat-area">

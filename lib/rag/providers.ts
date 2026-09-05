@@ -1,12 +1,5 @@
 import type { EmbeddingProvider, EmbeddingProviderConfig, EmbeddingPurpose } from './types';
 
-type FeatureExtractor = (
-  texts: string[],
-  options: { pooling: 'last_token'; normalize: boolean },
-) => Promise<{ tolist(): number[][] }>;
-
-let localExtractor: Promise<FeatureExtractor> | null = null;
-
 const QWEN_MODEL = 'Qwen/Qwen3-Embedding-4B';
 const QUERY_INSTRUCTION = 'Given a user question about a PDF, retrieve passages that answer the question';
 
@@ -15,22 +8,11 @@ class LocalQwenEmbeddingProvider implements EmbeddingProvider {
   readonly dimensions = 2560;
 
   async embed(texts: string[], purpose: EmbeddingPurpose = 'document'): Promise<number[][]> {
-    if (!localExtractor) {
-      localExtractor = import('@huggingface/transformers').then(async ({ env, pipeline }) => {
-        env.allowLocalModels = true;
-        env.localModelPath = '/models/';
-        const extractor = await pipeline(
-          'feature-extraction',
-          QWEN_MODEL,
-          { dtype: 'q8', device: 'wasm' },
-        );
-        return extractor as unknown as FeatureExtractor;
-      });
-    }
     const prepared = purpose === 'query'
       ? texts.map((text) => `Instruct: ${QUERY_INSTRUCTION}\nQuery: ${text}`)
       : texts;
-    return (await (await localExtractor)(prepared, { pooling: 'last_token', normalize: true })).tolist();
+    if (!window.marginDesktop?.embed) throw new Error('本地向量模型仅在 Margin 桌面应用中可用');
+    return window.marginDesktop.embed(prepared);
   }
 }
 
