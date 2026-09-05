@@ -5,8 +5,10 @@ Margin 是一个本地优先的极简 AI PDF 阅读器：导入 PDF、自动跟�
 ## 当前能力
 
 - Electron Windows 桌面壳，PDF 解析与页面文本提取均在本机完成
+- 连续纵向滚动阅读，滚动位置实时同步当前页
+- 本地书架保存 PDF、阅读进度与向量索引
 - 当前页自动同步到 AI 上下文
-- 内存向量索引，检索结果保留原始页码
+- 向量索引在内存中检索并持久化到书籍目录，结果保留原始页码
 - 内置 `Qwen/Qwen3-Embedding-4B` 官方 Q4_K_M GGUF 模型适配器
 - 自定义 OpenAI-compatible 对话与向量端点、模型名和独立 API Key
 - Hugging Face 下载失败时自动回退 ModelScope，并校验模型 SHA-256
@@ -38,6 +40,8 @@ npm run desktop:release:bundled
 ```
 
 下载顺序为 Hugging Face → ModelScope → Hugging Face 国内镜像，模型与 llama.cpp Windows CPU 运行时都会验证固定 SHA-256。低内存设备建议先使用自定义 OpenAI-compatible 向量端点。GitHub 自动发布的是不含模型资源的轻量程序壳；模型安装在独立用户目录中。
+
+书架默认位于 `%APPDATA%\Margin\library`。每本书拥有独立目录，保存原始 PDF 和与当前向量提供商匹配的索引；更换向量模型或端点后会要求重新建立索引。
 
 ## 发布流程
 

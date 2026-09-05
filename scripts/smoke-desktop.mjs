@@ -6,7 +6,8 @@ const pdfPath = path.resolve(process.argv[2] || 'tmp/pdfs/margin-reader-smoke.pd
 const testEmbedding = process.argv.includes('--embedding');
 const executable = path.resolve('release', 'win-unpacked', 'Margin.exe');
 const port = 9333;
-const child = spawn(executable, [`--remote-debugging-port=${port}`], { stdio: 'ignore' });
+const libraryRoot = path.resolve('tmp', `smoke-library-${Date.now()}`);
+const child = spawn(executable, [`--remote-debugging-port=${port}`], { stdio: 'ignore', env: { ...process.env, MARGIN_LIBRARY_ROOT: libraryRoot } });
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -74,10 +75,12 @@ try {
     const state = await evaluate(`({
       page: document.querySelector('.page-label')?.textContent || '',
       canvasWidth: document.querySelector('canvas')?.width || 0,
+      canvasCount: document.querySelectorAll('.pdf-page canvas').length,
+      shelf: document.querySelector('.book-item strong')?.textContent || '',
       error: document.querySelector('.error-message')?.textContent || ''
     })`);
     if (state.error) throw new Error(state.error);
-    if (!state.page.includes('1 / 2') || state.canvasWidth <= 0) throw new Error('Page 1 has not rendered yet');
+    if (!state.page.includes('1 / 2') || state.canvasWidth <= 0 || state.canvasCount !== 2 || !state.shelf.includes('margin-reader-smoke')) throw new Error('Page 1 or bookshelf has not rendered yet');
     return state;
   }, 120, 500);
   await evaluate(`document.querySelector('[aria-label="下一页"]')?.click()`);
@@ -85,15 +88,21 @@ try {
     const state = await evaluate(`({
       page: document.querySelector('.page-label')?.textContent || '',
       synced: document.querySelector('.ai-heading p')?.textContent || '',
-      canvasWidth: document.querySelector('canvas')?.width || 0
+      canvasWidth: document.querySelector('.pdf-page[data-page="2"] canvas')?.width || 0
     })`);
     if (!state.page.includes('2 / 2') || !state.synced.includes('2') || state.canvasWidth <= 0) throw new Error('Page 2 has not rendered yet');
     return state;
   }, 120, 500);
+  await retry(async () => {
+    const entries = await evaluate(`window.marginDesktop.libraryList()`, true);
+    if (entries?.[0]?.lastPage !== 2) throw new Error('Reading progress has not persisted yet');
+    return entries[0];
+  }, 30, 500);
 
   const modelStatus = await evaluate(`window.marginDesktop.modelStatus()`, true);
   let embeddingDimensions = null;
   let indexStatus = null;
+  let persisted = null;
   if (testEmbedding) {
     const vectors = await evaluate(`window.marginDesktop.embed(['A short PDF retrieval passage.'])`, true);
     embeddingDimensions = vectors?.[0]?.length ?? 0;
@@ -109,10 +118,31 @@ try {
       return state.label;
     }, 360, 500);
   }
-  console.log(JSON.stringify({ pageOne, pageTwo, modelStatus, embeddingDimensions, indexStatus }));
+  await evaluate(`window.location.reload()`);
+  persisted = await retry(async () => {
+    const shelf = await evaluate(`({
+      name: document.querySelector('.book-item strong')?.textContent || '',
+      indexed: Boolean(document.querySelector('.book-index'))
+    })`);
+    if (!shelf.name.includes('margin-reader-smoke') || (testEmbedding && !shelf.indexed)) throw new Error('Bookshelf state has not persisted yet');
+    return shelf;
+  }, 120, 500);
+  await evaluate(`document.querySelector('.book-item')?.click()`);
+  const reopened = await retry(async () => {
+    const state = await evaluate(`({
+      page: document.querySelector('.page-label')?.textContent || '',
+      canvasWidth: document.querySelector('.pdf-page[data-page="2"] canvas')?.width || 0,
+      index: document.querySelector('.index-strip strong')?.textContent || '',
+      error: document.querySelector('.error-message')?.textContent || ''
+    })`);
+    if (state.error) throw new Error(state.error);
+    if (!state.page.includes('2 / 2') || state.canvasWidth <= 0 || (testEmbedding && !state.index.includes('全文索引已就绪'))) throw new Error(`Persisted book or index has not reopened yet: ${JSON.stringify(state)}`);
+    return state;
+  }, 240, 500);
+  console.log(JSON.stringify({ pageOne, pageTwo, modelStatus, embeddingDimensions, indexStatus, persisted, reopened }));
 } finally {
   await Promise.race([command('Browser.close').catch(() => undefined), delay(2_000)]);
   socket.close();
+  if (child.exitCode === null) child.kill();
   await Promise.race([new Promise((resolve) => child.once('exit', resolve)), delay(5_000)]);
-  if (!child.killed) child.kill();
 }

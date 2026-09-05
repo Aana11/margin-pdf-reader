@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, net, protocol, shell } = require('electron');
 const { spawn } = require('node:child_process');
-const { access } = require('node:fs/promises');
+const { randomUUID } = require('node:crypto');
+const { access, mkdir, readFile, rename, rm, writeFile } = require('node:fs/promises');
 const nodeNet = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
@@ -12,6 +13,7 @@ const modelDirectory = 'Qwen3-Embedding-4B-GGUF';
 const modelName = 'Qwen3-Embedding-4B-Q4_K_M.gguf';
 let sidecarPromise;
 let sidecarProcess;
+let catalogQueue = Promise.resolve();
 
 app.setName('Margin');
 
@@ -27,6 +29,52 @@ function modelFile() {
 
 function runtimeFile() {
   return path.join(dataRoot(), 'runtime', 'llama', 'llama-server.exe');
+}
+
+function libraryRoot() {
+  return process.env.MARGIN_LIBRARY_ROOT || path.join(dataRoot(), 'library');
+}
+
+function catalogFile() {
+  return path.join(libraryRoot(), 'catalog.json');
+}
+
+function assertBookId(id) {
+  if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/.test(id)) throw new Error('Invalid library book id');
+  return id;
+}
+
+function bookDirectory(id) {
+  return path.join(libraryRoot(), assertBookId(id));
+}
+
+async function readCatalog() {
+  try {
+    const payload = JSON.parse(await readFile(catalogFile(), 'utf8'));
+    return Array.isArray(payload) ? payload : [];
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+async function writeJsonAtomic(file, value) {
+  await mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporary, JSON.stringify(value));
+  await rm(file, { force: true });
+  await rename(temporary, file);
+}
+
+function updateCatalog(mutator) {
+  const operation = catalogQueue.then(async () => {
+    const catalog = await readCatalog();
+    const result = await mutator(catalog);
+    await writeJsonAtomic(catalogFile(), catalog);
+    return result;
+  });
+  catalogQueue = operation.catch(() => undefined);
+  return operation;
 }
 
 async function getFreePort() {
@@ -108,11 +156,61 @@ ipcMain.handle('embedding:embed', async (_event, texts) => {
   return payload.data.sort((a, b) => a.index - b.index).map((item) => item.embedding);
 });
 
+ipcMain.handle('library:list', async () => (await readCatalog()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+
+ipcMain.handle('library:import', async (_event, payload) => {
+  if (!payload || typeof payload.name !== 'string' || payload.name.length > 300) throw new Error('Invalid PDF import');
+  const bytes = Buffer.from(payload.data);
+  if (bytes.length < 5 || bytes.length > 1024 * 1024 * 1024 || bytes.subarray(0, 5).toString() !== '%PDF-') throw new Error('Invalid or oversized PDF');
+  const now = new Date().toISOString();
+  const entry = { id: randomUUID(), name: path.basename(payload.name), pageCount: 0, lastPage: 1, addedAt: now, updatedAt: now, indexProviderId: null };
+  const directory = bookDirectory(entry.id);
+  await mkdir(directory, { recursive: true });
+  await writeFile(path.join(directory, 'document.pdf'), bytes);
+  await updateCatalog((catalog) => { catalog.unshift(entry); });
+  return entry;
+});
+
+ipcMain.handle('library:read', async (_event, id) => new Uint8Array(await readFile(path.join(bookDirectory(id), 'document.pdf'))));
+
+ipcMain.handle('library:update', async (_event, id, changes) => updateCatalog((catalog) => {
+  const entry = catalog.find((candidate) => candidate.id === assertBookId(id));
+  if (!entry) throw new Error('Book not found');
+  if (Number.isInteger(changes?.pageCount) && changes.pageCount > 0) entry.pageCount = changes.pageCount;
+  if (Number.isInteger(changes?.lastPage) && changes.lastPage > 0) entry.lastPage = Math.min(changes.lastPage, entry.pageCount || changes.lastPage);
+  entry.updatedAt = new Date().toISOString();
+  return entry;
+}));
+
+ipcMain.handle('library:index-save', async (_event, id, providerId, entries) => {
+  if (typeof providerId !== 'string' || providerId.length > 500 || !Array.isArray(entries)) throw new Error('Invalid vector index');
+  const directory = bookDirectory(id);
+  await writeJsonAtomic(path.join(directory, 'index.json'), { version: 1, providerId, createdAt: new Date().toISOString(), entries });
+  return updateCatalog((catalog) => {
+    const entry = catalog.find((candidate) => candidate.id === id);
+    if (!entry) throw new Error('Book not found');
+    entry.indexProviderId = providerId;
+    entry.updatedAt = new Date().toISOString();
+    return { saved: true, chunks: entries.length };
+  });
+});
+
+ipcMain.handle('library:index-load', async (_event, id, providerId) => {
+  try {
+    const payload = JSON.parse(await readFile(path.join(bookDirectory(id), 'index.json'), 'utf8'));
+    if (payload?.version !== 1 || payload.providerId !== providerId || !Array.isArray(payload.entries)) return null;
+    return payload.entries;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+});
+
 function createWindow() {
   const window = new BrowserWindow({
     width: 1420,
     height: 900,
-    minWidth: 980,
+    minWidth: 1120,
     minHeight: 680,
     backgroundColor: '#eef1f4',
     titleBarStyle: 'hiddenInset',

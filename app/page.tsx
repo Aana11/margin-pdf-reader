@@ -1,7 +1,7 @@
 'use client';
 
 import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Bot, FileText, LoaderCircle, MessageSquareText, Plus, Send, Settings2, Sparkles, Upload } from 'lucide-react';
+import { ArrowDown, ArrowUp, BookOpen, Bot, FileText, HardDrive, Library, LoaderCircle, MessageSquareText, Plus, Send, Settings2, Sparkles, Upload } from 'lucide-react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 // oxlint-disable-next-line import/default -- Vite's ?url loader provides this synthetic default export.
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
@@ -14,7 +14,8 @@ import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { chunkPage } from '@/lib/rag/chunk';
 import { MemoryVectorIndex } from '@/lib/rag/memory-index';
 import { createEmbeddingProvider } from '@/lib/rag/providers';
-import type { EmbeddingProvider, EmbeddingProviderKind, RagChunk } from '@/lib/rag/types';
+import type { EmbeddingProvider, EmbeddingProviderKind, RagChunk, StoredIndexEntry } from '@/lib/rag/types';
+import type { LibraryEntry } from '@/types/electron';
 
 type Message = { role: 'user' | 'assistant'; content: string; page: number };
 type ModelSettings = {
@@ -127,6 +128,8 @@ export default function Home() {
   const [indexStatus, setIndexStatus] = useState<'idle' | 'indexing' | 'ready'>('idle');
   const [indexProgress, setIndexProgress] = useState(0);
   const [settings, setSettings] = useState<ModelSettings>(readSavedSettings);
+  const [library, setLibrary] = useState<LibraryEntry[]>([]);
+  const [activeBookId, setActiveBookId] = useState<string | null>(null);
 
   const scrollToPage = useCallback((target: number, behavior: ScrollBehavior = 'smooth') => {
     const container = readerScrollRef.current;
@@ -141,6 +144,25 @@ export default function Home() {
   }, []);
 
   const handleRenderError = useCallback((message: string) => setError(message), []);
+
+  const refreshLibrary = useCallback(async () => {
+    if (!window.marginDesktop?.libraryList) return;
+    setLibrary(await window.marginDesktop.libraryList());
+  }, []);
+
+  useEffect(() => {
+    window.queueMicrotask(() => void refreshLibrary());
+  }, [refreshLibrary]);
+
+  useEffect(() => {
+    if (!activeBookId || !page || !window.marginDesktop?.libraryUpdate) return;
+    const timeout = window.setTimeout(() => {
+      void window.marginDesktop?.libraryUpdate?.(activeBookId, { lastPage: page }).then((entry) => {
+        setLibrary((current) => current.map((book) => book.id === entry.id ? entry : book));
+      });
+    }, 600);
+    return () => window.clearTimeout(timeout);
+  }, [activeBookId, page]);
 
   useEffect(() => {
     const modelContext = (document as Document & {
@@ -205,23 +227,76 @@ export default function Home() {
     if (closestPage !== page) setPage(closestPage);
   }
 
-  async function openPdf(file?: File) {
-    if (!file) return;
+  function createConfiguredProvider() {
+    return createEmbeddingProvider({
+      kind: settings.embeddingKind,
+      endpoint: settings.embeddingEndpoint,
+      model: settings.embeddingModel,
+      apiKey: settings.embeddingApiKey,
+    });
+  }
+
+  async function loadPdf(data: ArrayBuffer | Uint8Array, name: string, book?: LibraryEntry) {
     setLoadingPdf(true); setError(''); setMessages([]);
     try {
       const pdfJs = await import('pdfjs-dist');
       pdfJs.GlobalWorkerOptions.workerSrc = new URL(pdfWorkerUrl, window.location.href).toString();
-      const document = await pdfJs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+      const bytes = data instanceof Uint8Array ? new Uint8Array(data) : new Uint8Array(data);
+      const document = await pdfJs.getDocument({ data: bytes }).promise;
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       pageTextsRef.current.clear();
       setIndexStatus('idle'); setIndexProgress(0);
-      setPdf(document); setFileName(file.name); setPageCount(document.numPages); setPage(1);
+      const initialPage = Math.min(document.numPages, Math.max(1, book?.lastPage || 1));
+      setPdf(document); setFileName(name); setPageCount(document.numPages); setPage(initialPage); setActiveBookId(book?.id || null);
+      if (book && window.marginDesktop?.libraryUpdate) {
+        const updated = await window.marginDesktop.libraryUpdate(book.id, { pageCount: document.numPages, lastPage: initialPage });
+        setLibrary((current) => current.map((entry) => entry.id === updated.id ? updated : entry));
+      }
+      if (book && window.marginDesktop?.libraryIndexLoad) {
+        try {
+          const provider = createConfiguredProvider();
+          const stored = await window.marginDesktop.libraryIndexLoad(book.id, provider.id) as StoredIndexEntry[] | null;
+          if (stored?.length) {
+            vectorIndexRef.current.restore(stored, provider.dimensions);
+            embeddingProviderRef.current = provider;
+            setIndexStatus('ready'); setIndexProgress(100);
+          }
+        } catch { /* A changed or incomplete provider simply requires rebuilding the index. */ }
+      }
+      window.setTimeout(() => scrollToPage(initialPage, 'auto'), 0);
     } catch (reason) {
       console.error('Failed to open PDF', reason);
       const detail = reason instanceof Error ? reason.message : String(reason);
       setError(`无法打开这个 PDF：${detail.slice(0, 160)}`);
     }
-    finally { setLoadingPdf(false); if (fileInputRef.current) fileInputRef.current.value = ''; }
+    finally { setLoadingPdf(false); }
+  }
+
+  async function openPdf(file?: File) {
+    if (!file) return;
+    const data = await file.arrayBuffer();
+    try {
+      if (window.marginDesktop?.libraryImport) {
+        const entry = await window.marginDesktop.libraryImport(file.name, data);
+        setLibrary((current) => [entry, ...current]);
+        await loadPdf(data, entry.name, entry);
+      } else {
+        await loadPdf(data, file.name);
+      }
+    } catch (reason) {
+      setError(`导入书架失败：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`);
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
+
+  async function openLibraryBook(book: LibraryEntry) {
+    if (!window.marginDesktop?.libraryRead || loadingPdf) return;
+    try {
+      await loadPdf(await window.marginDesktop.libraryRead(book.id), book.name, book);
+    } catch (reason) {
+      setError(`无法从书架打开：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`);
+    }
   }
 
   function saveSettings() {
@@ -234,12 +309,7 @@ export default function Home() {
     if (!pdf || indexStatus === 'indexing') return;
     setError(''); setIndexStatus('indexing'); setIndexProgress(0);
     try {
-      const provider = createEmbeddingProvider({
-        kind: settings.embeddingKind,
-        endpoint: settings.embeddingEndpoint,
-        model: settings.embeddingModel,
-        apiKey: settings.embeddingApiKey,
-      });
+      const provider = createConfiguredProvider();
       embeddingProviderRef.current = provider;
       vectorIndexRef.current.clear();
       const allChunks: RagChunk[] = [];
@@ -254,6 +324,10 @@ export default function Home() {
       for (let start = 0; start < allChunks.length; start += batchSize) {
         await vectorIndexRef.current.add(allChunks.slice(start, start + batchSize), provider);
         setIndexProgress(35 + Math.round((Math.min(start + batchSize, allChunks.length) / Math.max(allChunks.length, 1)) * 65));
+      }
+      if (activeBookId && window.marginDesktop?.libraryIndexSave) {
+        await window.marginDesktop.libraryIndexSave(activeBookId, provider.id, vectorIndexRef.current.snapshot());
+        await refreshLibrary();
       }
       setIndexStatus('ready'); setIndexProgress(100);
     } catch (reason) {
@@ -327,12 +401,23 @@ export default function Home() {
               <DialogFooter><Button onClick={saveSettings}>保存配置</Button></DialogFooter>
             </DialogContent>
           </Dialog>
-          <Button variant="outline" onClick={() => fileInputRef.current?.click()}><Plus /> 打开 PDF</Button>
+          <Button variant="outline" onClick={() => fileInputRef.current?.click()}><Plus /> 导入 PDF</Button>
         </div>
         <input ref={fileInputRef} className="sr-only" type="file" accept="application/pdf,.pdf" onChange={(event) => void openPdf(event.target.files?.[0])} />
       </header>
 
       <div className="workspace">
+        <aside className="bookshelf-panel" aria-label="本地书架">
+          <div className="bookshelf-heading"><div><Library /><span>本地书架</span></div><strong>{library.length}</strong></div>
+          <div className="book-list">
+            {library.length === 0 ? <div className="bookshelf-empty"><BookOpen /><p>导入的 PDF 会保存在本机，并记住阅读进度与向量索引。</p></div> : library.map((book) =>
+              <button className={book.id === activeBookId ? 'book-item active' : 'book-item'} key={book.id} onClick={() => void openLibraryBook(book)}>
+                <span className="book-icon"><FileText /></span><span className="book-copy"><strong>{book.name}</strong><small>{book.pageCount ? `${book.lastPage} / ${book.pageCount} 页` : '等待首次打开'}</small></span>
+                {book.indexProviderId && <span className="book-index" title="已保存向量索引"><HardDrive /></span>}
+              </button>)}
+          </div>
+          <Button variant="outline" className="bookshelf-import" onClick={() => fileInputRef.current?.click()}><Plus /> 添加到书架</Button>
+        </aside>
         <section className="reader-panel" aria-label="PDF 阅读区">
           {pdf ? <>
             <div className="reader-toolbar">

@@ -4,7 +4,7 @@ Margin is a local-first desktop PDF reader. The renderer owns PDF parsing, page 
 
 ## Runtime boundaries
 
-- **Electron main process:** window lifecycle and operating-system integration only. It does not receive model keys or document text.
+- **Electron main process:** window lifecycle, local library persistence, and the llama.cpp sidecar. It does not receive model keys.
 - **Sandboxed renderer:** PDF.js, local embedding inference, the vector index, and the reading UI.
 - **Model providers:** small interfaces isolate chat and embedding vendors from the reader and index.
 
@@ -18,7 +18,7 @@ The Electron renderer has `nodeIntegration` disabled, `contextIsolation` enabled
 4. The local index ranks chunks with cosine similarity.
 5. The current page and top-ranked chunks are sent to the configured chat model.
 
-The first index implementation is intentionally in memory. The next storage step should be SQLite with a document fingerprint and provider/model schema version so indexes can be reused safely without mixing incompatible vector spaces.
+Search executes against an in-memory index. The Electron main process persists each completed index beside its book under the local Margin library and restores it only when the provider identity matches. PDF bytes, catalog metadata, reading progress, and indexes stay on the machine. A future storage migration can replace JSON vectors with SQLite without changing the provider or search boundary.
 
 ## Embedding providers
 

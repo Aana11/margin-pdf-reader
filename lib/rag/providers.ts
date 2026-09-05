@@ -4,7 +4,7 @@ const QWEN_MODEL = 'Qwen/Qwen3-Embedding-4B';
 const QUERY_INSTRUCTION = 'Given a user question about a PDF, retrieve passages that answer the question';
 
 class LocalQwenEmbeddingProvider implements EmbeddingProvider {
-  readonly id = `local:${QWEN_MODEL}:q8`;
+  readonly id = `local:${QWEN_MODEL}:q4_k_m`;
   readonly dimensions = 2560;
 
   async embed(texts: string[], purpose: EmbeddingPurpose = 'document'): Promise<number[][]> {
