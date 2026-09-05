@@ -20,6 +20,9 @@
 .DS_Store
 *.pem
 
+# Generated from a pinned model revision during release.
+/public/models/
+
 # debug
 npm-debug.log*
 yarn-debug.log*
@@ -33,6 +36,8 @@ yarn-error.log*
 .vercel
 next-env.d.ts
 /dist/
+/release/
 /.wrangler/
 /outputs/
 /work/
+*.tsbuildinfo
