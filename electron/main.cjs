@@ -23,6 +23,7 @@ let catalogQueue = Promise.resolve();
 let modelInstallPromise;
 let modelDownloadController;
 let modelInstallState = { state: 'idle', progress: 0, message: '' };
+let runtimeRepairPromise;
 
 app.setName('Margin');
 
@@ -129,6 +130,24 @@ async function extractRuntime() {
   await rm(destination, { recursive: true, force: true });
   await rename(temporary, destination);
   await access(runtimeFile());
+}
+
+async function exists(file) {
+  return access(file).then(() => true).catch(() => false);
+}
+
+async function ensureEmbeddingFiles() {
+  if (!await exists(modelFile())) {
+    throw new Error(`本地 GGUF 模型文件缺失：${modelFile()}。请在模型设置中点击“下载并安装”。`);
+  }
+  if (!await exists(runtimeFile())) {
+    if (await exists(runtimeArchive()) && await hashFile(runtimeArchive()) === modelResources()[1].sha256) {
+      if (!runtimeRepairPromise) runtimeRepairPromise = extractRuntime().finally(() => { runtimeRepairPromise = undefined; });
+      await runtimeRepairPromise;
+    } else {
+      throw new Error(`llama.cpp 运行时缺失：${runtimeFile()}。请在模型设置中点击“下载并安装”。`);
+    }
+  }
 }
 
 async function installModel(sender) {
@@ -282,16 +301,21 @@ async function getSidecarUrl() {
 }
 
 async function getModelStatus() {
-  try {
-    await access(modelFile());
-    await access(runtimeFile());
+  const missing = [];
+  if (!await exists(modelFile())) missing.push('model');
+  if (!await exists(runtimeFile())) missing.push('runtime');
+  if (missing.length === 0) {
     return { installed: true, loaded: Boolean(sidecarProcess && sidecarProcess.exitCode === null), model: embeddingModel, root: dataRoot(), ...modelInstallState, state: modelInstallState.state === 'idle' ? 'ready' : modelInstallState.state };
-  } catch {
-    return { installed: false, loaded: false, model: embeddingModel, root: dataRoot(), ...modelInstallState };
   }
+  return { installed: false, loaded: false, missing, model: embeddingModel, root: dataRoot(), ...modelInstallState };
 }
 
 ipcMain.handle('embedding:status', getModelStatus);
+ipcMain.handle('app:info', () => ({ version: app.getVersion(), packaged: app.isPackaged }));
+ipcMain.handle('model:prepare', async () => {
+  await ensureEmbeddingFiles();
+  return getModelStatus();
+});
 ipcMain.handle('model:install', (event) => installModel(event.sender));
 ipcMain.handle('model:pause', () => {
   modelDownloadController?.abort();
@@ -321,11 +345,7 @@ ipcMain.handle('embedding:embed', async (_event, texts) => {
   if (!Array.isArray(texts) || texts.length === 0 || texts.length > 16 || texts.some((text) => typeof text !== 'string' || text.length > 20_000)) {
     throw new Error('Invalid embedding input');
   }
-  try {
-    await Promise.all([access(modelFile()), access(runtimeFile())]);
-  } catch {
-    throw new Error(`本地模型或 llama.cpp 运行时尚未安装。请运行 npm run model:bundle，目标目录：${dataRoot()}`);
-  }
+  await ensureEmbeddingFiles();
   const baseUrl = await getSidecarUrl();
   const response = await fetch(`${baseUrl}/v1/embeddings`, {
     method: 'POST',

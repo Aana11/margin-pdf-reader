@@ -11,15 +11,17 @@ export type LibraryEntry = {
 };
 
 export type StoredIndexEntry = { id: string; page: number; text: string; vector: number[] };
-export type ModelInstallStatus = { installed: boolean; loaded: boolean; model: string; root: string; state: string; progress: number; message: string };
+export type ModelInstallStatus = { installed: boolean; loaded: boolean; missing?: string[]; model: string; root: string; state: string; progress: number; message: string };
 
 declare global {
   interface Window {
     marginDesktop?: {
       platform: string;
       isDesktop: boolean;
+      appInfo?: () => Promise<{ version: string; packaged: boolean }>;
       embed?: (texts: string[]) => Promise<number[][]>;
       modelStatus?: () => Promise<ModelInstallStatus>;
+      modelPrepare?: () => Promise<ModelInstallStatus>;
       modelInstall?: () => Promise<{ installed: boolean; paused?: boolean }>;
       modelPause?: () => Promise<{ paused: boolean }>;
       modelOpenFolder?: () => Promise<{ opened: boolean }>;

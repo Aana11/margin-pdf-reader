@@ -82,7 +82,7 @@ try {
       error: document.querySelector('.error-message')?.textContent || ''
     })`);
     if (state.error) throw new Error(state.error);
-    if (!state.page.includes('1 / 2') || state.canvasWidth <= 0 || state.canvasCount !== 2 || state.scrollHeight <= state.clientHeight || !state.shelf.includes('margin-reader-smoke')) throw new Error(`Page 1, scroll region, or bookshelf has not rendered yet: ${JSON.stringify(state)}`);
+    if (!state.page.includes('1 / 2') || state.canvasWidth <= 1 || state.canvasCount !== 2 || state.scrollHeight <= state.clientHeight || !state.shelf.includes('margin-reader-smoke')) throw new Error(`Page 1, scroll region, or bookshelf has not rendered yet: ${JSON.stringify(state)}`);
     return state;
   }, 120, 500);
   for (let index = 0; index < 4; index += 1) {
@@ -95,7 +95,7 @@ try {
       synced: document.querySelector('.ai-heading p')?.textContent || '',
       canvasWidth: document.querySelector('.pdf-page[data-page="2"] canvas')?.width || 0
     })`);
-    if (!state.page.includes('2 / 2') || !state.synced.includes('2') || state.canvasWidth <= 0) throw new Error('Page 2 has not rendered yet');
+    if (!state.page.includes('2 / 2') || !state.synced.includes('2') || state.canvasWidth <= 1) throw new Error('Page 2 has not rendered yet');
     return state;
   }, 120, 500);
   await retry(async () => {
@@ -145,7 +145,7 @@ try {
       error: document.querySelector('.error-message')?.textContent || ''
     })`);
     if (state.error) throw new Error(state.error);
-    if (!state.page.includes('2 / 2') || state.canvasWidth <= 0 || (testEmbedding && !state.index.includes('全文索引已就绪'))) throw new Error(`Persisted book or index has not reopened yet: ${JSON.stringify(state)}`);
+    if (!state.page.includes('2 / 2') || state.canvasWidth <= 1 || (testEmbedding && !state.index.includes('全文索引已就绪'))) throw new Error(`Persisted book or index has not reopened yet: ${JSON.stringify(state)}`);
     return state;
   }, 240, 500);
   if (testEmbedding) {

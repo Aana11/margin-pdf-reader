@@ -43,14 +43,15 @@ function readSavedSettings(): ModelSettings {
 type PdfPageCanvasProps = {
   pdf: PDFDocumentProxy;
   pageNumber: number;
+  activePage: number;
   onText: (pageNumber: number, text: string) => void;
   onError: (message: string) => void;
 };
 
-function PdfPageCanvas({ pdf, pageNumber, onText, onError }: PdfPageCanvasProps) {
+function PdfPageCanvas({ pdf, pageNumber, activePage, onText, onError }: PdfPageCanvasProps) {
   const shellRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [shouldRender, setShouldRender] = useState(false);
+  const [nearViewport, setNearViewport] = useState(false);
   const [availableWidth, setAvailableWidth] = useState(760);
   const [pageRatio, setPageRatio] = useState(1 / 1.414);
 
@@ -59,11 +60,13 @@ function PdfPageCanvas({ pdf, pageNumber, onText, onError }: PdfPageCanvasProps)
     if (!shell) return;
     const root = shell.closest('.canvas-wrap');
     const observer = new IntersectionObserver((entries) => {
-      setShouldRender(entries.some((entry) => entry.isIntersecting));
+      setNearViewport(entries.some((entry) => entry.isIntersecting));
     }, { root, rootMargin: '800px 0px' });
     observer.observe(shell);
     return () => observer.disconnect();
   }, []);
+
+  const shouldRender = nearViewport || Math.abs(pageNumber - activePage) <= 1;
 
   useEffect(() => {
     const shell = shellRef.current;
@@ -144,6 +147,7 @@ export default function Home() {
   const [activeBookId, setActiveBookId] = useState<string | null>(null);
   const [modelStatus, setModelStatus] = useState<ModelInstallStatus | null>(null);
   const [scanWarning, setScanWarning] = useState('');
+  const [appVersion, setAppVersion] = useState('');
 
   const scrollToPage = useCallback((target: number, behavior: ScrollBehavior = 'smooth') => {
     const container = readerScrollRef.current;
@@ -172,6 +176,7 @@ export default function Home() {
     const bridge = window.marginDesktop;
     if (!bridge?.modelStatus) return;
     window.queueMicrotask(() => void bridge.modelStatus?.().then(setModelStatus));
+    window.queueMicrotask(() => void bridge.appInfo?.().then((info) => setAppVersion(info.version)));
     return bridge.onModelProgress?.((progress) => {
       setModelStatus((current) => current ? { ...current, ...progress } : current);
     });
@@ -369,6 +374,10 @@ export default function Home() {
     if (!pdf || indexStatus === 'indexing') return;
     setError(''); setIndexStatus('indexing'); setIndexProgress(0); setIndexMessage('正在提取 PDF 文本');
     try {
+      if (settings.embeddingKind === 'local-qwen3-embedding-4b' && window.marginDesktop?.modelPrepare) {
+        setIndexMessage('正在检查本地模型与运行时');
+        setModelStatus(await window.marginDesktop.modelPrepare());
+      }
       const provider = createConfiguredProvider();
       embeddingProviderRef.current = provider;
       vectorIndexRef.current.clear();
@@ -444,7 +453,7 @@ export default function Home() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand"><span className="brand-mark"><FileText /></span><span>页间 <em>Margin</em></span></div>
+        <div className="brand"><span className="brand-mark"><FileText /></span><span>页间 <em>Margin{appVersion ? ` v${appVersion}` : ''}</em></span></div>
         <div className="document-title"><span className={pdf ? 'status-dot online' : 'status-dot'} /><span>{fileName || '尚未打开文档'}</span></div>
         <div className="top-actions">
           <Dialog>
@@ -462,7 +471,7 @@ export default function Home() {
                   <NativeSelectOption value="openai-compatible">OpenAI 兼容提供商</NativeSelectOption>
                 </NativeSelect>
                 {settings.embeddingKind === 'local-qwen3-embedding-4b' && <div className="model-manager">
-                  <div className="model-manager-status"><span className={modelStatus?.installed ? 'status-dot online' : 'status-dot'} /><div><strong>{modelStatus?.loaded ? '模型已载入内存' : modelStatus?.installed ? '本地模型已就绪' : modelStatus?.state === 'paused' ? '下载已暂停' : '尚未安装本地模型'}</strong><small>{modelStatus?.message || (modelStatus?.loaded ? '空闲 2 分钟后自动释放内存' : 'Qwen3-Embedding-4B · Q4_K_M · 约 2.50 GB')}</small></div></div>
+                  <div className="model-manager-status"><span className={modelStatus?.installed ? 'status-dot online' : 'status-dot'} /><div><strong>{modelStatus?.loaded ? '模型已载入内存' : modelStatus?.installed ? '本地模型已就绪' : modelStatus?.state === 'paused' ? '下载已暂停' : '尚未安装本地模型'}</strong><small>{modelStatus?.message || (modelStatus?.missing?.length ? `缺少：${modelStatus.missing.join('、')}` : modelStatus?.loaded ? '空闲 2 分钟后自动释放内存' : 'Qwen3-Embedding-4B · Q4_K_M · 约 2.50 GB')}</small></div></div>
                   {modelStatus && ['checking', 'downloading', 'installing'].includes(modelStatus.state) && <div className="model-progress"><i style={{ width: `${modelStatus.progress}%` }} /></div>}
                   <div className="model-manager-actions">
                     {!modelStatus?.installed && modelStatus?.state !== 'downloading' && <Button size="sm" variant="outline" onClick={() => void installLocalModel()}>{modelStatus?.state === 'paused' ? '继续下载' : '下载并安装'}</Button>}
@@ -505,7 +514,7 @@ export default function Home() {
               </div>
             </div>
             <div ref={readerScrollRef} className="canvas-wrap"><div className="pdf-pages">
-              {Array.from({ length: pageCount }, (_, index) => <PdfPageCanvas key={index + 1} pdf={pdf} pageNumber={index + 1} onText={handlePageText} onError={handleRenderError} />)}
+              {Array.from({ length: pageCount }, (_, index) => <PdfPageCanvas key={index + 1} pdf={pdf} pageNumber={index + 1} activePage={page} onText={handlePageText} onError={handleRenderError} />)}
             </div></div>
           </> : <div className="empty-state">
             <div className="empty-icon"><Upload /></div><p className="eyebrow">私密 · 本地阅读</p>

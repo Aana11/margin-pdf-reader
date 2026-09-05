@@ -3,8 +3,10 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('marginDesktop', {
   platform: process.platform,
   isDesktop: true,
+  appInfo: () => ipcRenderer.invoke('app:info'),
   embed: (texts) => ipcRenderer.invoke('embedding:embed', texts),
   modelStatus: () => ipcRenderer.invoke('embedding:status'),
+  modelPrepare: () => ipcRenderer.invoke('model:prepare'),
   modelInstall: () => ipcRenderer.invoke('model:install'),
   modelPause: () => ipcRenderer.invoke('model:pause'),
   modelOpenFolder: () => ipcRenderer.invoke('model:open-folder'),

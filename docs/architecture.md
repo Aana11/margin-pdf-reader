@@ -26,6 +26,8 @@ The built-in provider uses `Qwen/Qwen3-Embedding-4B`, produces 2560-dimensional 
 
 The model is an optional application resource rather than a Git-tracked blob. `npm run model:bundle` and the in-app model manager perform resumable downloads from Hugging Face, ModelScope, or the domestic Hugging Face mirror, verify pinned SHA-256 values for both the model and llama.cpp runtime, and install them under the user's Margin data directory. The manager checks available disk space and supports pause, resume, opening the data directory, and uninstall. The Q4_K_M artifact is about 2.50 GB, so it is deliberately not part of ordinary CI or the source repository.
 
+Indexing performs a model preflight. A missing runtime is reconstructed from the pinned, checksum-verified archive when possible; otherwise the renderer receives a component-specific error with the expected path instead of a combined “model or runtime missing” message.
+
 The remote provider follows the OpenAI-compatible `/embeddings` contract. Provider configuration belongs to the local user profile and must never be committed.
 
 ## Deliberate constraints
