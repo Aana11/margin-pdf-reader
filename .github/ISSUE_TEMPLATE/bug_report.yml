@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible problem in Margin
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: textarea
+    attributes: { label: What happened? }
+    validations: { required: true }
+  - type: textarea
+    attributes: { label: Steps to reproduce }
+    validations: { required: true }
+  - type: input
+    attributes: { label: Margin version }
+  - type: dropdown
+    attributes:
+      label: Operating system
+      options: [Windows, macOS, Linux]
+    validations: { required: true }
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Do not include PDF contents, API keys, or other credentials.

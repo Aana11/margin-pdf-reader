@@ -1,22 +1,28 @@
 {
-  "name": "sites-project",
+  "name": "margin-pdf-reader",
   "version": "0.1.0",
+  "description": "Local-first AI PDF reader with offline and pluggable RAG",
+  "author": "Margin contributors",
   "private": true,
+  "main": "electron/main.cjs",
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
     "dev": "vinext dev",
-    "build": "vinext build",
-    "start": "wrangler dev --config dist/server/wrangler.json",
-    "lint": "oxlint",
+    "build": "node scripts/build-desktop.mjs",
+    "desktop:dev": "concurrently -k -s first \"npm run dev\" \"wait-on http://localhost:3000 && electron .\"",
+    "desktop:pack": "npm run build && electron-builder --dir",
+    "desktop:release": "npm run build && electron-builder --publish never",
+    "desktop:release:bundled": "npm run model:bundle && npm run desktop:release",
+    "model:bundle": "node scripts/bundle-qwen3.mjs",
+    "test:desktop": "node scripts/smoke-desktop.mjs tmp/pdfs/margin-reader-smoke.pdf",
+    "test:desktop:embedding": "node scripts/smoke-desktop.mjs tmp/pdfs/margin-reader-smoke.pdf --embedding",
+    "lint": "oxlint app lib scripts",
+    "lint:electron": "node --check electron/main.cjs && node --check electron/preload.cjs",
     "format": "oxfmt"
   },
   "dependencies": {
-    "react": "19.2.6",
-    "react-dom": "19.2.6",
-    "react-server-dom-webpack": "19.2.6",
-    "vinext": "1.0.0-beta.5",
     "@base-ui/react": "1.7.0",
     "@shadcn/react": "0.3.0",
     "class-variance-authority": "0.7.1",
@@ -27,30 +33,62 @@
     "input-otp": "1.4.2",
     "lucide-react": "1.31.0",
     "pdfjs-dist": "5.4.149",
+    "react": "19.2.8",
     "react-day-picker": "9.8.1",
+    "react-dom": "19.2.8",
     "react-resizable-panels": "4.5.8",
+    "react-server-dom-webpack": "19.2.8",
     "recharts": "3.8.0",
-    "shadcn": "4.18.0",
     "tailwind-merge": "3.6.0",
-    "tw-animate-css": "1.4.0"
+    "tw-animate-css": "1.4.0",
+    "vinext": "1.0.0-beta.9"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.37.1",
-    "@cloudflare/workers-types": "4.20260515.1",
-    "@openai/sites-vite-plugin": "0.2.0",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
-    "@vitejs/plugin-rsc": "0.5.26",
+    "@vitejs/plugin-rsc": "0.5.34",
+    "concurrently": "10.0.5",
+    "electron": "44.2.0",
+    "electron-builder": "26.15.3",
     "oxfmt": "0.61.0",
     "oxlint": "1.76.0",
     "oxlint-tsgolint": "7.0.2001",
+    "shadcn": "4.18.0",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3",
-    "vite": "8.0.13",
-    "wrangler": "4.92.0"
+    "vite": "8.0.16",
+    "wait-on": "9.1.0"
   },
-  "type": "module"
+  "type": "module",
+  "build": {
+    "appId": "site.chatgpt.margin.reader",
+    "productName": "Margin",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/client/**/*",
+      "electron/**/*",
+      "package.json",
+      "!node_modules/**/*"
+    ],
+    "npmRebuild": false,
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "overrides": {
+    "rolldown": "1.0.1"
+  }
 }
