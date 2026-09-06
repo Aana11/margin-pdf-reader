@@ -2,6 +2,19 @@
 
 All notable changes to Margin are documented here.
 
+## [0.2.1] - 2026-09-06
+
+### Added
+
+- Optional GLM-OCR precision reading through OpenAI-compatible Ollama, vLLM, or SGLang endpoints.
+- Query-time coordination in which the embedding model retrieves relevant pages and GLM-OCR re-reads up to two formula, code, table, or explicitly requested pages from their rendered images.
+- Official task routing for formula, table, and text recognition, with session caching, visible status, diagnostics, and graceful fallback to ordinary RAG.
+- Unit-level protocol coverage and a packaged desktop vector → image → GLM-OCR → chat integration smoke test.
+
+### Privacy and packaging
+
+- GLM-OCR is disabled by default and its weights/runtime are not bundled. Local endpoints keep page images on-device; remote endpoints receive only the selected candidate pages.
+
 ## [0.2.0] - 2026-09-06
 
 ### Added
