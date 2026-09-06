@@ -1,7 +1,10 @@
 import type { RagChunk } from './types';
 
-const DEFAULT_CHUNK_SIZE = 900;
-const DEFAULT_OVERLAP = 150;
+// Qwen3-Embedding supports much longer inputs than this. A moderately larger
+// chunk cuts large-book inference calls by roughly a quarter while retaining
+// enough overlap for paragraphs that cross a boundary.
+const DEFAULT_CHUNK_SIZE = 1200;
+const DEFAULT_OVERLAP = 180;
 
 export function chunkPage(
   text: string,

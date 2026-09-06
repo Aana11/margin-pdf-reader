@@ -24,3 +24,7 @@ jobs:
       - run: npm run test:ocr
       - run: npm run test:deep-reading
       - run: npm run build
+      - run: npx electron-builder --dir
+      - run: npm run test:desktop
+      - run: npm run test:desktop:ocr
+      - run: npm run test:desktop:deep-reading

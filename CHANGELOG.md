@@ -2,6 +2,25 @@
 
 All notable changes to Margin are documented here.
 
+## [0.2.4] - 2026-09-06
+
+### Added
+
+- A permanent compact application sidebar with reserved module positions; the local bookshelf now opens as a focused management dialog and model settings live at the bottom.
+- Live vector-index throughput and estimated remaining time, plus stage-level timing in diagnostic logs.
+
+### Changed
+
+- Removed the top Margin banner to return vertical space to the document and assistant.
+- PDF text extraction now uses bounded six-page concurrency.
+- Textless pages are rendered and recognized through a three-worker local Tesseract pool instead of one global serial queue.
+- Vulkan-backed Qwen indexing uses eight llama.cpp slots and eight-chunk requests; CPU remains capped at four to avoid oversubscription.
+- Text chunks are moderately larger and SQLite appends are grouped into batches of up to 64, reducing model requests, IPC transfers, and transactions for large books.
+
+### Performance diagnosis
+
+- Direct inspection of the reported 421-page algebra book found no PDF text layer on any page, making serial OCR its immediate bottleneck. Earlier electronic-book logs separately showed 411 pages of text extraction completing in about 2.2 seconds while 4-chunk embedding requests took 18–22 seconds on the CPU path. SQLite storage was not the bottleneck in either case.
+
 ## [0.2.1] - 2026-09-06
 
 ### Added

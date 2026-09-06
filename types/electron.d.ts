@@ -31,8 +31,8 @@ declare global {
       modelUnload?: () => Promise<ModelInstallStatus>;
       modelRemove?: () => Promise<ModelInstallStatus>;
       onModelProgress?: (listener: (progress: Omit<ModelInstallStatus, 'installed' | 'model' | 'root'>) => void) => () => void;
-      ocrRecognize?: (image: Uint8Array, language: 'eng' | 'chi_sim+eng' | 'chi_tra+eng') => Promise<{ text: string; confidence: number }>;
-      onOcrProgress?: (listener: (progress: { status: string; progress: number }) => void) => () => void;
+      ocrRecognize?: (image: Uint8Array, language: 'eng' | 'chi_sim+eng' | 'chi_tra+eng', page?: number) => Promise<{ text: string; confidence: number }>;
+      onOcrProgress?: (listener: (progress: { page: number; status: string; progress: number }) => void) => () => void;
       libraryList?: () => Promise<LibraryEntry[]>;
       libraryImport?: (name: string, data: ArrayBuffer) => Promise<LibraryEntry>;
       libraryImportFile?: (file: File) => Promise<LibraryEntry>;

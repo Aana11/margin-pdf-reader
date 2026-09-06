@@ -29,26 +29,28 @@ function scannedPdf(jpeg, width, height) {
     parts.push(Buffer.from(`${number} 0 obj\n`, 'ascii'), body, Buffer.from('\nendobj\n', 'ascii'));
   };
   object(1, Buffer.from('<< /Type /Catalog /Pages 2 0 R >>', 'ascii'));
-  object(2, Buffer.from('<< /Type /Pages /Kids [3 0 R] /Count 1 >>', 'ascii'));
+  object(2, Buffer.from('<< /Type /Pages /Kids [3 0 R 6 0 R 7 0 R] /Count 3 >>', 'ascii'));
   object(3, Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Image0 5 0 R >> >> /Contents 4 0 R >>', 'ascii'));
   const content = Buffer.from('q 612 0 0 792 0 0 cm /Image0 Do Q', 'ascii');
   object(4, Buffer.concat([Buffer.from(`<< /Length ${content.length} >>\nstream\n`, 'ascii'), content, Buffer.from('\nendstream', 'ascii')]));
   object(5, Buffer.concat([Buffer.from(`<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`, 'ascii'), jpeg, Buffer.from('\nendstream', 'ascii')]));
+  object(6, Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Image0 5 0 R >> >> /Contents 4 0 R >>', 'ascii'));
+  object(7, Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Image0 5 0 R >> >> /Contents 4 0 R >>', 'ascii'));
   const xrefOffset = parts.reduce((sum, part) => sum + part.length, 0);
-  const xref = [`xref\n0 6\n`, '0000000000 65535 f \n'];
-  for (let index = 1; index <= 5; index += 1) xref.push(`${String(offsets[index]).padStart(10, '0')} 00000 n \n`);
-  parts.push(Buffer.from(`${xref.join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`, 'ascii'));
+  const xref = [`xref\n0 8\n`, '0000000000 65535 f \n'];
+  for (let index = 1; index <= 7; index += 1) xref.push(`${String(offsets[index]).padStart(10, '0')} 00000 n \n`);
+  parts.push(Buffer.from(`${xref.join('')}trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`, 'ascii'));
   return Buffer.concat(parts);
 }
 
-const targets = await retry(async () => {
+const target = await retry(async () => {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`);
   if (!response.ok) throw new Error(`CDP discovery failed: ${response.status}`);
   const payload = await response.json();
-  if (!Array.isArray(payload) || payload.length === 0) throw new Error('No Electron page target');
-  return payload;
+  const ready = Array.isArray(payload) ? payload.find((candidate) => candidate.url?.startsWith('margin://')) : null;
+  if (!ready) throw new Error('Margin renderer is not ready');
+  return ready;
 });
-const target = targets.find((candidate) => candidate.url?.startsWith('margin://')) || targets[0];
 const socket = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((resolve, reject) => {
   socket.addEventListener('open', resolve, { once: true });
@@ -132,7 +134,7 @@ try {
   await retry(async () => {
     const state = await evaluate(`({ page: document.querySelector('.page-label')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`);
     if (state.error) throw new Error(state.error);
-    if (!state.page.includes('1 / 1')) throw new Error('Scanned PDF has not opened');
+    if (!state.page.includes('1 / 3')) throw new Error('Scanned PDF has not opened');
     return state;
   });
   await evaluate(`[...document.querySelectorAll('.index-strip button')].find((button) => button.textContent?.includes('建立索引'))?.click()`);
@@ -149,7 +151,7 @@ try {
     const matches = await window.marginDesktop.libraryIndexSearch(book.id, providerId, new Float32Array([1, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125]), 1);
     return { info, match: matches[0] };
   })()`, true);
-  if (result.info?.format !== 'sqlite-f32' || !/ORCHID/i.test(result.match?.text || '')) throw new Error(`OCR text was not stored in SQLite: ${JSON.stringify(result)}`);
+  if (result.info?.format !== 'sqlite-f32' || result.info.chunks < 3 || !/ORCHID/i.test(result.match?.text || '')) throw new Error(`Concurrent OCR text was not stored in SQLite: ${JSON.stringify(result)}`);
   console.log(JSON.stringify({ indexed, info: result.info, match: { page: result.match.page, text: result.match.text.slice(0, 120) } }));
 } finally {
   await Promise.race([command('Browser.close').catch(() => undefined), delay(2_000)]);

@@ -1,6 +1,6 @@
 {
   "name": "margin-pdf-reader",
-  "version": "0.2.1",
+  "version": "0.2.4",
   "description": "Local-first AI PDF reader with offline and pluggable RAG",
   "author": "Margin contributors",
   "private": true,

@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { ensureSmokePdf } from './smoke-fixture.mjs';
 
 const executable = process.env.MARGIN_PACKAGED_APP || path.resolve('release', 'win-unpacked', 'Margin.exe');
 const pdfPath = path.resolve(process.argv[2] || 'tmp/pdfs/margin-reader-smoke.pdf');
+await ensureSmokePdf(pdfPath);
 const root = path.resolve('tmp', `deep-reading-smoke-${Date.now()}`);
 const cdpPort = 9338;
 const requests = { glm: [], chat: [], embedding: 0 };
@@ -61,13 +63,13 @@ async function retry(operation, attempts = 120, interval = 500) {
 
 let socket;
 try {
-  const targets = await retry(async () => {
+  const target = await retry(async () => {
     const response = await fetch(`http://127.0.0.1:${cdpPort}/json/list`);
     const values = await response.json();
-    if (!values.length) throw new Error('No Electron target');
-    return values;
+    const ready = values.find((candidate) => candidate.url?.startsWith('margin://'));
+    if (!ready) throw new Error('Margin renderer is not ready');
+    return ready;
   });
-  const target = targets.find((candidate) => candidate.url?.startsWith('margin://')) || targets[0];
   socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, { once: true }); socket.addEventListener('error', reject, { once: true }); });
   let messageId = 0;

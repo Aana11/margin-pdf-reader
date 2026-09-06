@@ -27,14 +27,14 @@ async function retry(operation, attempts = 120, interval = 500) {
   throw lastError;
 }
 
-const targets = await retry(async () => {
+const target = await retry(async () => {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`);
   if (!response.ok) throw new Error(`CDP discovery failed: ${response.status}`);
   const payload = await response.json();
-  if (!Array.isArray(payload) || payload.length === 0) throw new Error('No Electron page target');
-  return payload;
+  const ready = Array.isArray(payload) ? payload.find((candidate) => candidate.url?.startsWith('margin://')) : null;
+  if (!ready) throw new Error('Margin renderer is not ready');
+  return ready;
 });
-const target = targets.find((candidate) => candidate.url?.startsWith('margin://')) || targets[0];
 const socket = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((resolve, reject) => {
   socket.addEventListener('open', resolve, { once: true });
@@ -89,11 +89,10 @@ try {
   })()`);
   const book = await retry(async () => {
     const state = await evaluate(`(async () => ({
-      book: document.querySelector('.book-item strong')?.textContent || '',
       page: document.querySelector('.page-label')?.textContent || '',
       entries: await window.marginDesktop.libraryList()
     }))()`, true);
-    if (!state.book.includes('Margin-Reader-Demo') || !state.page.includes('1 / 2')) throw new Error('Demo PDF has not opened');
+    if (!state.entries.some((entry) => entry.name.includes('Margin-Reader-Demo')) || !state.page.includes('1 / 2')) throw new Error('Demo PDF has not opened');
     return state.entries[0];
   });
   await evaluate(`(() => {
@@ -116,10 +115,11 @@ try {
     window.location.reload();
   })()`);
   await retry(async () => {
-    const ready = await evaluate(`Boolean(document.querySelector('.book-item'))`);
-    if (!ready) throw new Error('Bookshelf has not restored');
+    const ready = await evaluate(`Boolean(document.querySelector('[aria-label="本地书架"]'))`);
+    if (!ready) throw new Error('Sidebar has not restored');
     return ready;
   });
+  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
   await evaluate(`document.querySelector('.book-item')?.click()`);
   await retry(async () => {
     const state = await evaluate(`({ page: document.querySelector('.page-label')?.textContent || '', messages: document.querySelectorAll('.message').length })`);
