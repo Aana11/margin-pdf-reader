@@ -26,7 +26,7 @@ export class MemoryVectorIndex {
   }
 
   restore(entries: StoredIndexEntry[], expectedDimensions: number | null): void {
-    if (!Array.isArray(entries) || entries.some((entry) => !entry || typeof entry.id !== 'string' || !Number.isInteger(entry.page) || typeof entry.text !== 'string' || !Array.isArray(entry.vector) || entry.vector.some((value) => !Number.isFinite(value)))) {
+    if (!Array.isArray(entries) || entries.some((entry) => !entry || typeof entry.id !== 'string' || !Number.isInteger(entry.page) || typeof entry.text !== 'string' || (!Array.isArray(entry.vector) && !(entry.vector instanceof Float32Array)) || Array.from(entry.vector).some((value) => !Number.isFinite(value)))) {
       throw new Error('Stored vector index is invalid');
     }
     if (expectedDimensions && entries.some((entry) => entry.vector.length !== expectedDimensions)) throw new Error('Stored vector dimensions do not match provider');
@@ -36,6 +36,10 @@ export class MemoryVectorIndex {
   async add(chunks: RagChunk[], provider: EmbeddingProvider): Promise<void> {
     if (chunks.length === 0) return;
     const vectors = await provider.embed(chunks.map((chunk) => chunk.text), 'document');
+    this.addVectors(chunks, vectors);
+  }
+
+  addVectors(chunks: RagChunk[], vectors: ArrayLike<number>[]): void {
     if (vectors.length !== chunks.length) throw new Error('Embedding provider returned an unexpected vector count');
     this.entries.push(...chunks.map((chunk, index) => ({ ...chunk, vector: Float32Array.from(vectors[index]) })));
   }

@@ -21,4 +21,4 @@ export type RagChunk = {
 };
 
 export type RagMatch = RagChunk & { score: number };
-export type StoredIndexEntry = RagChunk & { vector: number[] };
+export type StoredIndexEntry = RagChunk & { vector: number[] | Float32Array };

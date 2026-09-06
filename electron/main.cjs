@@ -2,13 +2,14 @@ const { app, BrowserWindow, ipcMain, net, protocol, shell } = require('electron'
 const { spawn, spawnSync } = require('node:child_process');
 const { createHash, randomUUID } = require('node:crypto');
 const { createReadStream, createWriteStream } = require('node:fs');
-const { access, appendFile, mkdir, readFile, rename, rm, stat, statfs, writeFile } = require('node:fs/promises');
+const { access, appendFile, copyFile, mkdir, open, readFile, rename, rm, stat, statfs, writeFile } = require('node:fs/promises');
 const nodeNet = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { Readable, Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
+const { appendIndexBatch, cancelIndexBuild, finishIndexBuild, openIndex, searchIndex, startIndexBuild } = require('./index-store.cjs');
 
 const isDevelopment = !app.isPackaged;
 const embeddingModel = 'Qwen/Qwen3-Embedding-4B';
@@ -30,6 +31,10 @@ let modelDownloadController;
 let modelInstallState = { state: 'idle', progress: 0, message: '' };
 let runtimeRepairPromise;
 let logQueue = Promise.resolve();
+let ocrWorkerPromise;
+let ocrWorkerLanguage;
+let ocrQueue = Promise.resolve();
+const indexBuilds = new Map();
 
 app.setName('Margin');
 
@@ -41,6 +46,70 @@ function dataRoot() {
 
 function logFile() {
   return path.join(dataRoot(), 'logs', 'main.log');
+}
+
+function ocrRoot() {
+  return path.join(dataRoot(), 'ocr');
+}
+
+const ocrLanguages = {
+  'eng': ['eng'],
+  'chi_sim+eng': ['chi_sim', 'eng'],
+  'chi_tra+eng': ['chi_tra', 'eng'],
+};
+
+async function ensureOcrLanguageData(language) {
+  const codes = ocrLanguages[language];
+  if (!codes) throw new Error('Unsupported OCR language');
+  if (app.isPackaged) {
+    const destination = path.join(process.resourcesPath, 'ocr', 'tessdata');
+    for (const code of codes) await access(path.join(destination, `${code}.traineddata.gz`));
+    return { codes, destination };
+  }
+  const destination = path.join(ocrRoot(), 'tessdata');
+  await mkdir(destination, { recursive: true });
+  const packages = {
+    eng: require('@tesseract.js-data/eng'),
+    chi_sim: require('@tesseract.js-data/chi_sim'),
+    chi_tra: require('@tesseract.js-data/chi_tra'),
+  };
+  for (const code of codes) {
+    const target = path.join(destination, `${code}.traineddata.gz`);
+    if (!await exists(target)) await copyFile(path.join(packages[code].langPath, `${code}.traineddata.gz`), target);
+  }
+  return { codes, destination };
+}
+
+async function getOcrWorker(language, sender) {
+  if (ocrWorkerLanguage !== language) {
+    if (ocrWorkerPromise) await ocrWorkerPromise.then((worker) => worker.terminate()).catch(() => undefined);
+    ocrWorkerPromise = undefined;
+    ocrWorkerLanguage = language;
+  }
+  if (!ocrWorkerPromise) {
+    const { codes, destination } = await ensureOcrLanguageData(language);
+    const { createWorker, OEM } = require('tesseract.js');
+    ocrWorkerPromise = createWorker(codes, OEM.LSTM_ONLY, {
+      langPath: destination,
+      cachePath: path.join(ocrRoot(), 'cache'),
+      gzip: true,
+      logger(message) {
+        if (sender && !sender.isDestroyed()) sender.send('ocr:progress', { status: message.status, progress: Math.round((message.progress || 0) * 100) });
+      },
+    }).catch((error) => {
+      ocrWorkerPromise = undefined;
+      ocrWorkerLanguage = undefined;
+      throw error;
+    });
+  }
+  return ocrWorkerPromise;
+}
+
+function stopOcrWorker() {
+  const current = ocrWorkerPromise;
+  ocrWorkerPromise = undefined;
+  ocrWorkerLanguage = undefined;
+  if (current) void current.then((worker) => worker.terminate()).catch(() => undefined);
 }
 
 function describeError(error) {
@@ -473,6 +542,28 @@ ipcMain.on('log:renderer', (_event, payload) => {
   void logEvent(payload.level === 'error' ? 'error' : 'info', `renderer.${payload.event.slice(0, 80)}`, typeof payload.details === 'object' && payload.details ? payload.details : {});
 });
 
+ipcMain.handle('ocr:recognize', (event, payload) => {
+  const operation = ocrQueue.then(async () => {
+    const image = payload?.image;
+    const language = payload?.language || 'chi_sim+eng';
+    if (!(image instanceof Uint8Array) || image.byteLength < 16 || image.byteLength > 24 * 1024 * 1024 || !ocrLanguages[language]) throw new Error('Invalid OCR request');
+    const startedAt = Date.now();
+    await logEvent('info', 'ocr.started', { language, bytes: image.byteLength });
+    try {
+      const worker = await getOcrWorker(language, event.sender);
+      const result = await worker.recognize(Buffer.from(image.buffer, image.byteOffset, image.byteLength), { rotateAuto: true });
+      const text = String(result?.data?.text || '').replace(/\s+/g, ' ').trim();
+      await logEvent('info', 'ocr.succeeded', { language, characters: text.length, confidence: result?.data?.confidence, elapsedMs: Date.now() - startedAt });
+      return { text, confidence: Number(result?.data?.confidence || 0) };
+    } catch (error) {
+      await logEvent('error', 'ocr.failed', { language, elapsedMs: Date.now() - startedAt, error: describeError(error) });
+      throw error;
+    }
+  });
+  ocrQueue = operation.catch(() => undefined);
+  return operation;
+});
+
 ipcMain.handle('library:list', async () => (await readCatalog()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
 
 ipcMain.handle('library:import', async (_event, payload) => {
@@ -484,6 +575,28 @@ ipcMain.handle('library:import', async (_event, payload) => {
   const directory = bookDirectory(entry.id);
   await mkdir(directory, { recursive: true });
   await writeFile(path.join(directory, 'document.pdf'), bytes);
+  await updateCatalog((catalog) => { catalog.unshift(entry); });
+  return entry;
+});
+
+ipcMain.handle('library:import-file', async (_event, payload) => {
+  if (!payload || typeof payload.name !== 'string' || payload.name.length > 300 || typeof payload.filePath !== 'string' || !path.isAbsolute(payload.filePath)) throw new Error('Invalid PDF import path');
+  const source = path.resolve(payload.filePath);
+  const sourceStats = await stat(source);
+  if (!sourceStats.isFile() || sourceStats.size < 5 || sourceStats.size > 1024 * 1024 * 1024) throw new Error('Invalid or oversized PDF');
+  const handle = await open(source, 'r');
+  try {
+    const signature = Buffer.alloc(5);
+    await handle.read(signature, 0, signature.length, 0);
+    if (signature.toString() !== '%PDF-') throw new Error('Invalid PDF signature');
+  } finally {
+    await handle.close();
+  }
+  const now = new Date().toISOString();
+  const entry = { id: randomUUID(), name: path.basename(payload.name), pageCount: 0, lastPage: 1, addedAt: now, updatedAt: now, indexProviderId: null };
+  const directory = bookDirectory(entry.id);
+  await mkdir(directory, { recursive: true });
+  await copyFile(source, path.join(directory, 'document.pdf'));
   await updateCatalog((catalog) => { catalog.unshift(entry); });
   return entry;
 });
@@ -509,28 +622,59 @@ ipcMain.handle('library:update', async (_event, id, changes) => updateCatalog((c
   return entry;
 }));
 
-ipcMain.handle('library:index-save', async (_event, id, providerId, entries) => {
-  if (typeof providerId !== 'string' || providerId.length > 500 || !Array.isArray(entries)) throw new Error('Invalid vector index');
-  const directory = bookDirectory(id);
-  await writeJsonAtomic(path.join(directory, 'index.json'), { version: 1, providerId, createdAt: new Date().toISOString(), entries });
-  return updateCatalog((catalog) => {
-    const entry = catalog.find((candidate) => candidate.id === id);
-    if (!entry) throw new Error('Book not found');
-    entry.indexProviderId = providerId;
-    entry.updatedAt = new Date().toISOString();
-    return { saved: true, chunks: entries.length };
-  });
+ipcMain.handle('library:index-open', async (_event, id, providerId) => {
+  const startedAt = Date.now();
+  const result = openIndex(bookDirectory(id), providerId);
+  if (result) await logEvent('info', result.migrated ? 'index.migrated' : 'index.opened', { bookId: id, ...result, elapsedMs: Date.now() - startedAt });
+  return result;
 });
 
-ipcMain.handle('library:index-load', async (_event, id, providerId) => {
+ipcMain.handle('library:index-start', (_event, id, providerId, dimensions) => {
+  const bookId = assertBookId(id);
+  const existing = indexBuilds.get(bookId);
+  if (existing) cancelIndexBuild(existing);
+  const build = startIndexBuild(bookDirectory(bookId), providerId, dimensions);
+  indexBuilds.set(bookId, build);
+  return { started: true, format: 'sqlite-f32', dimensions };
+});
+
+ipcMain.handle('library:index-append', (_event, id, entries) => {
+  const bookId = assertBookId(id);
+  const build = indexBuilds.get(bookId);
+  if (!build) throw new Error('Vector index build has not started');
+  return { chunks: appendIndexBatch(build, entries) };
+});
+
+ipcMain.handle('library:index-finish', async (_event, id) => {
+  const bookId = assertBookId(id);
+  const build = indexBuilds.get(bookId);
+  if (!build) throw new Error('Vector index build has not started');
   try {
-    const payload = JSON.parse(await readFile(path.join(bookDirectory(id), 'index.json'), 'utf8'));
-    if (payload?.version !== 1 || payload.providerId !== providerId || !Array.isArray(payload.entries)) return null;
-    return payload.entries;
-  } catch (error) {
-    if (error?.code === 'ENOENT') return null;
-    throw error;
+    const result = finishIndexBuild(build);
+    await updateCatalog((catalog) => {
+      const entry = catalog.find((candidate) => candidate.id === bookId);
+      if (!entry) throw new Error('Book not found');
+      entry.indexProviderId = build.providerId;
+      entry.updatedAt = new Date().toISOString();
+    });
+    await logEvent('info', 'index.sqlite-finished', { bookId, providerId: build.providerId, ...result });
+    return result;
+  } finally {
+    indexBuilds.delete(bookId);
   }
+});
+
+ipcMain.handle('library:index-cancel', (_event, id) => {
+  const bookId = assertBookId(id);
+  const build = indexBuilds.get(bookId);
+  if (build) cancelIndexBuild(build);
+  indexBuilds.delete(bookId);
+  return { cancelled: Boolean(build) };
+});
+
+ipcMain.handle('library:index-search', (_event, id, providerId, vector, limit) => {
+  if (!Number.isInteger(limit) || limit <= 0 || limit > 20) throw new Error('Invalid search limit');
+  return searchIndex(bookDirectory(id), providerId, vector, limit);
 });
 
 function createWindow() {
@@ -569,7 +713,14 @@ app.whenReady().then(() => {
   void logEvent('info', 'app.ready', { version: app.getVersion(), packaged: app.isPackaged, executablePath: process.execPath, dataRoot: dataRoot(), modelPath: modelFile(), runtimePath: runtimeFile(), runtimeMarker: runtimeMarker(), backend: runtimeBackend });
   const rendererRoot = path.resolve(__dirname, '..', 'dist', 'client');
   protocol.handle('margin', (request) => {
-    const pathname = decodeURIComponent(new URL(request.url).pathname);
+    const url = new URL(request.url);
+    const pathname = decodeURIComponent(url.pathname);
+    const libraryMatch = pathname.match(/^\/library\/([0-9a-f-]{36})\/document\.pdf$/);
+    if (url.host === 'app' && libraryMatch) {
+      const file = path.join(bookDirectory(libraryMatch[1]), 'document.pdf');
+      return net.fetch(pathToFileURL(file).toString(), { headers: request.headers });
+    }
+    if (url.host !== 'app') return new Response('Not found', { status: 404 });
     const requested = path.resolve(rendererRoot, pathname === '/' ? 'index.html' : `.${pathname}`);
     if (requested !== rendererRoot && !requested.startsWith(`${rendererRoot}${path.sep}`)) return new Response('Not found', { status: 404 });
     return net.fetch(pathToFileURL(requested).toString());
@@ -579,6 +730,11 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', stopSidecar);
+app.on('before-quit', () => {
+  stopSidecar();
+  stopOcrWorker();
+  for (const build of indexBuilds.values()) cancelIndexBuild(build);
+  indexBuilds.clear();
+});
 process.on('uncaughtException', (error) => { void logEvent('error', 'process.uncaught-exception', { error: describeError(error) }); });
 process.on('unhandledRejection', (error) => { void logEvent('error', 'process.unhandled-rejection', { error: describeError(error) }); });

@@ -35,7 +35,8 @@
 | 自定义对话模型 | 支持 OpenAI-compatible `/chat/completions` 端点、模型列表读取、流式回答和自定义系统提示词。 |
 | 本地向量模型 | 内置 `Qwen/Qwen3-Embedding-4B` Q4_K_M GGUF，提供 2560 维向量，无需把全文交给远程向量服务。 |
 | 模型管理 | 应用内完成空间检查、断点续传、暂停/继续、校验、打开目录、释放内存和卸载。 |
-| 扫描件诊断 | 会明确标记无法提取文本的扫描页，避免静默生成空索引。 |
+| 本地 OCR | PDF.js 无法提取文字时，自动用 Tesseract.js 识别扫描页；支持简体中文、繁体中文与英文组合，全程不上传图片。 |
+| 紧凑索引 | 每本书使用 SQLite 保存元数据与 Float32 二进制向量，旧版 `index.json` 首次打开时自动迁移。 |
 | 运行诊断 | 本地主进程与索引流程写入滚动日志，可从模型设置直接打开日志位置。 |
 
 ## 界面导览
@@ -56,20 +57,24 @@
 flowchart LR
     PDF[本地 PDF] --> JS[PDF.js 页面渲染与文本提取]
     JS --> PAGE[当前页上下文]
+    JS -->|无文本页| OCR[本地 Tesseract OCR]
     JS --> CHUNK[按页切分文本]
+    OCR --> CHUNK
     CHUNK --> EMBED[本地或自定义向量模型]
-    EMBED --> INDEX[本地向量索引]
+    EMBED --> INDEX[SQLite + Float32 向量]
     INDEX --> MATCH[相关页片段]
     PAGE --> CHAT[用户配置的对话模型]
     MATCH --> CHAT
     CHAT --> UI[流式回答]
 ```
 
-1. PDF.js 在渲染进程中读取页面并提取可选文本。
-2. 建立索引时，文本按页切分为重叠片段。
-3. 内置 Qwen 或自定义 `/embeddings` 端点生成向量。
-4. 提问时，Margin 检索最相关的片段，并与当前页原文一起发送给对话端点。
-5. 回答以 OpenAI-compatible SSE 流式显示；对话记录留在本机。
+1. PDF.js 从应用管理的本地 URL 按需读取和渲染页面，而不是把整本 PDF 复制进渲染进程。
+2. 建立索引时先提取文本；纯图片页会按设置在本机执行 OCR，再按页切分为重叠片段。
+3. 内置 Qwen 或自定义 `/embeddings` 端点分批生成向量；每批结果立即写入 SQLite。
+4. 向量以 Float32 BLOB 保存。查询时主进程流式扫描数据库并只保留 Top-K，避免反序列化巨大的 JSON 数组。
+5. 命中片段与当前页原文只在主动提问时发送给对话端点，回答以 SSE 流式显示。
+
+索引写入使用临时数据库，完成后原子替换；中途点击“停止”不会破坏上一次可用索引。旧版 `index.json` 会在首次打开时自动迁移。大型书籍结果见 [索引性能基准](docs/index-benchmark.md)。
 
 更完整的运行边界和约束见 [架构说明](docs/architecture.md)。
 
@@ -81,7 +86,8 @@ Margin 的“本地优先”并不代表所有功能都完全离线。数据是�
 | --- | --- | --- |
 | PDF 原文件与本地副本 | `%APPDATA%\Margin\library` | 当前版本不会自动上传 PDF 字节。 |
 | 阅读进度与书架目录 | 本地书籍目录 | 不会自动上传。 |
-| 向量索引 | 每本书的本地目录 | 使用内置 Qwen 时不上传；选择远程向量端点时，待嵌入文本会发送给该服务。 |
+| 向量索引 | 每本书目录内的 `index.sqlite` | 使用内置 Qwen 时不上传；选择远程向量端点时，待嵌入文本会发送给该服务。 |
+| OCR 图片与字库 | 页面图片仅在内存中短暂存在；字库随安装包提供 | OCR 在本机运行，不会发送扫描页。 |
 | 当前页与命中片段 | 内存 | 仅在主动提问时发送给配置的对话端点。 |
 | 提问历史与系统提示词 | Electron 浏览器存储 | 不会自动上传；历史只在后续提问时作为最近对话上下文发送。 |
 | API Key | Electron 浏览器存储 | 仅随请求发送给对应端点；不会进入 Git。 |
@@ -114,8 +120,9 @@ npm run desktop:dev
 1. 点击左侧“本地书架”旁的 `＋` 导入 PDF。
 2. 打开右上角模型设置，填写 OpenAI-compatible 对话端点、模型名称和 API Key。
 3. 按需调整系统提示词。
-4. 直接针对当前页提问；需要跨页检索时，点击“建立索引”。
-5. 首次使用内置向量模型时，应用会下载并校验模型与 llama.cpp 运行时。
+4. 按文档选择 OCR 语言；有文本层的页面不会重复识别。
+5. 直接针对当前页提问；需要跨页检索时，点击“建立索引”。
+6. 首次使用内置向量模型时，应用会下载并校验模型与 llama.cpp 运行时。
 
 ## 模型配置
 
@@ -158,10 +165,11 @@ npm run desktop:dev
 
 ```text
 Margin/
-├─ library/                 # PDF、本地目录信息与每本书的向量索引
+├─ library/                 # 每本书的 PDF、元数据与 index.sqlite
 ├─ models/                  # 下载的 GGUF 模型
 ├─ runtime/llama/           # llama.cpp CPU 或 Vulkan 运行时
 ├─ downloads/               # 可续传、可校验的下载文件
+├─ ocr/                     # 开发模式 OCR 缓存（发行版字库随程序提供）
 └─ logs/main.log            # 本地主进程与索引诊断日志
 ```
 
@@ -181,6 +189,9 @@ Margin/
 | `npm run lint:electron` | 检查 Electron 主进程和 preload 语法。 |
 | `npm run test:desktop` | 使用真实两页 PDF 验证导入、滚动、书架、历史与设置持久化。 |
 | `npm run test:desktop:embedding` | 在桌面冒烟测试基础上执行真实 2560 维本地向量与索引验证。 |
+| `npm run test:ocr` | 对真实页面截图执行本地中英文 OCR 快速测试。 |
+| `npm run test:desktop:ocr` | 用无文本层扫描 PDF 验证 OCR → 嵌入 → SQLite → 检索完整链路。 |
+| `npm run benchmark:index` | 对比大型书籍 JSON 与 SQLite/Float32 索引的体积、写入和查询。 |
 | `npm run diagnose:library-index -- <书名片段>` | 对本地书架中的指定书籍执行可观察的索引诊断。 |
 | `npm run docs:screenshots` | 使用隔离的演示数据重新生成 README 截图。 |
 
@@ -191,6 +202,7 @@ npm ci
 npm run lint
 npm run lint:electron
 npx tsc --noEmit
+npm run test:ocr
 npm run build
 ```
 
@@ -208,16 +220,15 @@ docs/                # 架构说明和 README 截图
 
 ## 已知限制
 
-- **暂不支持 OCR：** 纯扫描 PDF 无法转成可检索文本；混合文档中的无文本页面会被明确标记并跳过。
+- **OCR 不是版面还原：** 低清晰度、手写体、复杂多栏和特殊公式可能识别不准；OCR 文本用于助手上下文与检索，不会叠加为 PDF 可选文字层。
 - **当前仅重点支持 Windows：** 构建、原生运行时和桌面冒烟测试均面向 Windows x64。
-- **大索引仍使用 JSON：** 长篇书籍会占用更多磁盘和加载时间，后续计划迁移到 SQLite 或紧凑二进制格式。
 - **尚未代码签名：** 本地构建的安装包可能触发 Windows SmartScreen 提示。
 - **暂未提供内置云模型：** 对话能力需要用户自行配置兼容端点和凭据。
 
 ## 路线图
 
-- 为扫描件加入可选 OCR。
-- 将大型向量索引迁移到 SQLite/二进制存储。
+- 为 OCR 增加版面分析、手动页范围和可选文字层导出。
+- 为超大型资料库增加近似最近邻索引与跨书检索。
 - 增加应用图标、代码签名和稳定版安装体验。
 - 完善历史搜索、导出与更细粒度的数据清理。
 
@@ -225,4 +236,4 @@ docs/                # 架构说明和 README 截图
 
 项目使用 GitHub Flow：功能在独立分支完成，通过 Pull Request 检查和评审后再合并到 `main`。详细约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-推送 `vX.Y.Z` 标签会触发 Windows 构建并创建草稿 GitHub Release。发布产物默认不捆绑约 2.5 GB 的本地模型，模型由应用按需安装到用户数据目录。
+推送 `vX.Y.Z` 标签会先执行静态检查和 OCR 测试，再构建 Windows 安装版与便携版并发布 GitHub Release。产物包含 OCR 引擎和中英文字库，但不捆绑约 2.5 GB 的向量模型。版本变化见 [CHANGELOG.md](CHANGELOG.md)。

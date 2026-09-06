@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('marginDesktop', {
   platform: process.platform,
@@ -19,13 +19,28 @@ contextBridge.exposeInMainWorld('marginDesktop', {
     ipcRenderer.on('model:progress', handler);
     return () => ipcRenderer.removeListener('model:progress', handler);
   },
+  ocrRecognize: (image, language) => ipcRenderer.invoke('ocr:recognize', { image, language }),
+  onOcrProgress: (listener) => {
+    const handler = (_event, progress) => listener(progress);
+    ipcRenderer.on('ocr:progress', handler);
+    return () => ipcRenderer.removeListener('ocr:progress', handler);
+  },
   libraryList: () => ipcRenderer.invoke('library:list'),
   libraryImport: (name, data) => ipcRenderer.invoke('library:import', { name, data }),
+  libraryImportFile: async (file) => {
+    const filePath = webUtils.getPathForFile(file);
+    if (filePath) return ipcRenderer.invoke('library:import-file', { name: file.name, filePath });
+    return ipcRenderer.invoke('library:import', { name: file.name, data: await file.arrayBuffer() });
+  },
   libraryRead: (id) => ipcRenderer.invoke('library:read', id),
   libraryRemove: (id) => ipcRenderer.invoke('library:remove', id),
   libraryUpdate: (id, changes) => ipcRenderer.invoke('library:update', id, changes),
-  libraryIndexSave: (id, providerId, entries) => ipcRenderer.invoke('library:index-save', id, providerId, entries),
-  libraryIndexLoad: (id, providerId) => ipcRenderer.invoke('library:index-load', id, providerId),
+  libraryIndexOpen: (id, providerId) => ipcRenderer.invoke('library:index-open', id, providerId),
+  libraryIndexStart: (id, providerId, dimensions) => ipcRenderer.invoke('library:index-start', id, providerId, dimensions),
+  libraryIndexAppend: (id, entries) => ipcRenderer.invoke('library:index-append', id, entries),
+  libraryIndexFinish: (id) => ipcRenderer.invoke('library:index-finish', id),
+  libraryIndexCancel: (id) => ipcRenderer.invoke('library:index-cancel', id),
+  libraryIndexSearch: (id, providerId, vector, limit) => ipcRenderer.invoke('library:index-search', id, providerId, vector, limit),
 });
 
 window.addEventListener('error', (event) => {

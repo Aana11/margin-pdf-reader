@@ -4,10 +4,11 @@ import path from 'node:path';
 
 const pdfPath = path.resolve(process.argv[2] || 'tmp/pdfs/margin-reader-smoke.pdf');
 const testEmbedding = process.argv.includes('--embedding');
-const executable = path.resolve('release', 'win-unpacked', 'Margin.exe');
+const executable = process.env.MARGIN_PACKAGED_APP || path.resolve('release', 'win-unpacked', 'Margin.exe');
 const port = 9333;
 const libraryRoot = path.resolve('tmp', `smoke-library-${Date.now()}`);
-const child = spawn(executable, [`--remote-debugging-port=${port}`], { stdio: 'ignore', env: { ...process.env, MARGIN_LIBRARY_ROOT: libraryRoot } });
+const dataRoot = testEmbedding ? (process.env.MARGIN_DATA_ROOT || path.join(process.env.APPDATA || libraryRoot, 'Margin')) : path.join(libraryRoot, 'data');
+const child = spawn(executable, ['--disable-gpu', `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(libraryRoot, 'profile')}`], { stdio: 'ignore', env: { ...process.env, MARGIN_DATA_ROOT: dataRoot, MARGIN_LIBRARY_ROOT: path.join(libraryRoot, 'library') } });
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -63,15 +64,10 @@ async function evaluate(expression, awaitPromise = false) {
 try {
   await command('Runtime.enable');
   await evaluate(`document.querySelector('[aria-label="展开本地书架"]')?.click()`);
-  const pdfBase64 = (await readFile(pdfPath)).toString('base64');
-  await evaluate(`(() => {
-    const bytes = Uint8Array.from(atob('${pdfBase64}'), character => character.charCodeAt(0));
-    const transfer = new DataTransfer();
-    transfer.items.add(new File([bytes], 'margin-reader-smoke.pdf', { type: 'application/pdf' }));
-    const input = document.querySelector('input[type="file"]');
-    input.files = transfer.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-  })()`);
+  await command('DOM.enable');
+  const documentNode = await command('DOM.getDocument');
+  const fileInput = await command('DOM.querySelector', { nodeId: documentNode.root.nodeId, selector: 'input[type="file"]' });
+  await command('DOM.setFileInputFiles', { files: [pdfPath], nodeId: fileInput.nodeId });
   const pageOne = await retry(async () => {
     const state = await evaluate(`({
       page: document.querySelector('.page-label')?.textContent || '',
@@ -99,6 +95,12 @@ try {
     if (!state.page.includes('2 / 2') || !state.synced.includes('2') || state.canvasWidth <= 1) throw new Error('Page 2 has not rendered yet');
     return state;
   }, 120, 500);
+  const ocrImageBase64 = (await readFile(path.resolve('docs', 'images', 'reader-overview.png'))).toString('base64');
+  const ocrResult = await evaluate(`(() => {
+    const image = Uint8Array.from(atob('${ocrImageBase64}'), character => character.charCodeAt(0));
+    return window.marginDesktop.ocrRecognize(image, 'chi_sim+eng');
+  })()`, true);
+  if (!/Margin/i.test(ocrResult?.text || '') || !/PDF/i.test(ocrResult?.text || '')) throw new Error(`Packaged OCR failed: ${ocrResult?.text?.slice(0, 200) || 'no text'}`);
   await retry(async () => {
     const entries = await evaluate(`window.marginDesktop.libraryList()`, true);
     if (entries?.[0]?.lastPage !== 2) throw new Error('Reading progress has not persisted yet');
@@ -217,7 +219,7 @@ try {
     if (state.books !== 0 || state.hasPdf || state.history !== 0) throw new Error('Book removal or history cleanup has not completed yet');
     return true;
   }, 60, 500);
-  console.log(JSON.stringify({ pageOne, pageTwo, settingsControls, savedPrompt, modelStatus, embeddingDimensions, indexStatus, modelLoaded, modelReleased, historySeed, persistedUi, persisted, persistedHistory, reopened, removed }));
+  console.log(JSON.stringify({ pageOne, pageTwo, ocrResult: { confidence: ocrResult.confidence, characters: ocrResult.text.length }, settingsControls, savedPrompt, modelStatus, embeddingDimensions, indexStatus, modelLoaded, modelReleased, historySeed, persistedUi, persisted, persistedHistory, reopened, removed }));
 } finally {
   await Promise.race([command('Browser.close').catch(() => undefined), delay(2_000)]);
   socket.close();
