@@ -1,8 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { ensureSmokePdf } from './smoke-fixture.mjs';
 
 const pdfPath = path.resolve(process.argv[2] || 'tmp/pdfs/margin-reader-smoke.pdf');
+await ensureSmokePdf(pdfPath);
 const testEmbedding = process.argv.includes('--embedding');
 const executable = process.env.MARGIN_PACKAGED_APP || path.resolve('release', 'win-unpacked', 'Margin.exe');
 const port = Number(process.env.MARGIN_CDP_PORT || 9333);

@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { ensureSmokePdf } from './smoke-fixture.mjs';
 
 const executable = process.env.MARGIN_PACKAGED_APP || path.resolve('release', 'win-unpacked', 'Margin.exe');
 const pdfPath = path.resolve(process.argv[2] || 'tmp/pdfs/margin-reader-smoke.pdf');
+await ensureSmokePdf(pdfPath);
 const root = path.resolve('tmp', `deep-reading-smoke-${Date.now()}`);
 const cdpPort = 9338;
 const requests = { glm: [], chat: [], embedding: 0 };
