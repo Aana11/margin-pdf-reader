@@ -64,6 +64,19 @@ async function evaluate(expression, awaitPromise = false) {
   return result.result?.value;
 }
 
+async function openDialog(triggerLabel, expectedText) {
+  return retry(async () => {
+    const state = await evaluate(`(() => {
+      const dialog = document.querySelector('[role="dialog"]');
+      if (dialog) return { open: true, text: dialog.textContent || '' };
+      document.querySelector('[aria-label="${triggerLabel}"]')?.click();
+      return { open: false, text: '' };
+    })()`);
+    if (!state.open || !state.text.includes(expectedText)) throw new Error(`${expectedText} dialog is not open yet`);
+    return state;
+  }, 120, 500);
+}
+
 try {
   await command('Runtime.enable');
   await command('DOM.enable');
@@ -180,7 +193,7 @@ try {
     if (!state.hasSidebar || !state.hasLibrary || !state.settingsAtBottom) throw new Error('Application sidebar did not persist');
     return state;
   });
-  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
+  await openDialog('本地书架', '集中管理保存在本机的 PDF');
   persisted = await retry(async () => {
     const shelf = await evaluate(`({
       name: document.querySelector('.book-item strong')?.textContent || '',
@@ -191,7 +204,7 @@ try {
   }, 120, 500);
   await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' });
   await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' });
-  await evaluate(`document.querySelector('[aria-label="提问历史"]')?.click()`);
+  await openDialog('提问历史', '问答按书籍保存在本机');
   const persistedHistory = await retry(async () => {
     const text = await evaluate(`document.querySelector('.history-item')?.textContent || ''`);
     if (!text.includes('冒烟测试提问') || !text.includes('第 2 页')) throw new Error('Question history did not persist');
@@ -199,7 +212,7 @@ try {
   });
   await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' });
   await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' });
-  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
+  await openDialog('本地书架', '集中管理保存在本机的 PDF');
   await evaluate(`document.querySelector('.book-item')?.click()`);
   const reopened = await retry(async () => {
     const state = await evaluate(`({
@@ -216,7 +229,7 @@ try {
     modelReleased = await evaluate(`window.marginDesktop.modelUnload()`, true);
     if (modelReleased?.loaded) throw new Error('Local model process did not release memory');
   }
-  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
+  await openDialog('本地书架', '集中管理保存在本机的 PDF');
   await evaluate(`(() => { window.confirm = () => true; document.querySelector('.book-remove')?.click(); })()`);
   const removed = await retry(async () => {
     const state = await evaluate(`({ books: document.querySelectorAll('.book-item').length, hasPdf: Boolean(document.querySelector('.pdf-pages')), history: JSON.parse(localStorage.getItem('margin-chat-history-v1') || '[]').length })`);
