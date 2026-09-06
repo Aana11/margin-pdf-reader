@@ -61,13 +61,13 @@ async function retry(operation, attempts = 120, interval = 500) {
 
 let socket;
 try {
-  const targets = await retry(async () => {
+  const target = await retry(async () => {
     const response = await fetch(`http://127.0.0.1:${cdpPort}/json/list`);
     const values = await response.json();
-    if (!values.length) throw new Error('No Electron target');
-    return values;
+    const ready = values.find((candidate) => candidate.url?.startsWith('margin://'));
+    if (!ready) throw new Error('Margin renderer is not ready');
+    return ready;
   });
-  const target = targets.find((candidate) => candidate.url?.startsWith('margin://')) || targets[0];
   socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, { once: true }); socket.addEventListener('error', reject, { once: true }); });
   let messageId = 0;

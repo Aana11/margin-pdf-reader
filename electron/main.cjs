@@ -31,9 +31,10 @@ let modelDownloadController;
 let modelInstallState = { state: 'idle', progress: 0, message: '' };
 let runtimeRepairPromise;
 let logQueue = Promise.resolve();
-let ocrWorkerPromise;
+const OCR_WORKER_COUNT = 3;
 let ocrWorkerLanguage;
-let ocrQueue = Promise.resolve();
+let ocrWorkerSlots = [];
+let ocrPoolSetupPromise;
 const indexBuilds = new Map();
 
 app.setName('Margin');
@@ -80,36 +81,46 @@ async function ensureOcrLanguageData(language) {
   return { codes, destination };
 }
 
-async function getOcrWorker(language, sender) {
-  if (ocrWorkerLanguage !== language) {
-    if (ocrWorkerPromise) await ocrWorkerPromise.then((worker) => worker.terminate()).catch(() => undefined);
-    ocrWorkerPromise = undefined;
-    ocrWorkerLanguage = language;
-  }
-  if (!ocrWorkerPromise) {
-    const { codes, destination } = await ensureOcrLanguageData(language);
-    const { createWorker, OEM } = require('tesseract.js');
-    ocrWorkerPromise = createWorker(codes, OEM.LSTM_ONLY, {
+async function createOcrWorkerPool(language) {
+  stopOcrWorker();
+  ocrWorkerLanguage = language;
+  const { codes, destination } = await ensureOcrLanguageData(language);
+  const { createWorker, OEM } = require('tesseract.js');
+  const slots = Array.from({ length: OCR_WORKER_COUNT }, (_, index) => {
+    const slot = { index, pending: 0, page: 0, sender: null, queue: Promise.resolve(), worker: null };
+    slot.worker = createWorker(codes, OEM.LSTM_ONLY, {
       langPath: destination,
       cachePath: path.join(ocrRoot(), 'cache'),
       gzip: true,
       logger(message) {
-        if (sender && !sender.isDestroyed()) sender.send('ocr:progress', { status: message.status, progress: Math.round((message.progress || 0) * 100) });
+        if (slot.sender && !slot.sender.isDestroyed()) slot.sender.send('ocr:progress', { page: slot.page, status: message.status, progress: Math.round((message.progress || 0) * 100) });
       },
-    }).catch((error) => {
-      ocrWorkerPromise = undefined;
-      ocrWorkerLanguage = undefined;
-      throw error;
     });
+    return slot;
+  });
+  ocrWorkerSlots = slots;
+  await Promise.all(slots.map((slot) => slot.worker));
+  await logEvent('info', 'ocr.pool-ready', { language, workers: slots.length });
+  return slots;
+}
+
+function getOcrWorkerPool(language) {
+  if (ocrWorkerLanguage === language && ocrWorkerSlots.length === OCR_WORKER_COUNT) return Promise.resolve(ocrWorkerSlots);
+  if (!ocrPoolSetupPromise) {
+    ocrPoolSetupPromise = createOcrWorkerPool(language).catch((error) => {
+      ocrWorkerLanguage = undefined;
+      ocrWorkerSlots = [];
+      throw error;
+    }).finally(() => { ocrPoolSetupPromise = undefined; });
   }
-  return ocrWorkerPromise;
+  return ocrPoolSetupPromise;
 }
 
 function stopOcrWorker() {
-  const current = ocrWorkerPromise;
-  ocrWorkerPromise = undefined;
+  const current = ocrWorkerSlots;
+  ocrWorkerSlots = [];
   ocrWorkerLanguage = undefined;
-  if (current) void current.then((worker) => worker.terminate()).catch(() => undefined);
+  for (const slot of current) void slot.worker.then((worker) => worker.terminate()).catch(() => undefined);
 }
 
 function describeError(error) {
@@ -387,7 +398,9 @@ async function startSidecar() {
   const baseUrl = `http://127.0.0.1:${port}`;
   let logs = '';
   const startedAt = Date.now();
-  await logEvent('info', 'sidecar.starting', { runtimePath: runtimeFile(), modelPath: modelFile(), backend: runtimeBackend, port, contextSize: 2048, batchSize: 512 });
+  const parallelSlots = runtimeBackend === 'vulkan' ? 8 : 4;
+  const batchSize = runtimeBackend === 'vulkan' ? 1024 : 512;
+  await logEvent('info', 'sidecar.starting', { runtimePath: runtimeFile(), modelPath: modelFile(), backend: runtimeBackend, port, contextSize: 2048, batchSize, parallelSlots });
   sidecarProcess = spawn(runtimeFile(), [
     '--model', modelFile(),
     '--embedding',
@@ -395,8 +408,10 @@ async function startSidecar() {
     '--host', '127.0.0.1',
     '--port', String(port),
     '--ctx-size', '2048',
-    '--batch-size', '512',
-    '--ubatch-size', '512',
+    '--parallel', String(parallelSlots),
+    '--kv-unified',
+    '--batch-size', String(batchSize),
+    '--ubatch-size', String(batchSize),
     '--threads', String(Math.max(1, Math.min(8, Math.ceil(os.cpus().length / 2)))),
     ...(runtimeBackend === 'vulkan' ? ['--n-gpu-layers', '99'] : []),
     '--no-webui',
@@ -542,26 +557,35 @@ ipcMain.on('log:renderer', (_event, payload) => {
   void logEvent(payload.level === 'error' ? 'error' : 'info', `renderer.${payload.event.slice(0, 80)}`, typeof payload.details === 'object' && payload.details ? payload.details : {});
 });
 
-ipcMain.handle('ocr:recognize', (event, payload) => {
-  const operation = ocrQueue.then(async () => {
-    const image = payload?.image;
-    const language = payload?.language || 'chi_sim+eng';
-    if (!(image instanceof Uint8Array) || image.byteLength < 16 || image.byteLength > 24 * 1024 * 1024 || !ocrLanguages[language]) throw new Error('Invalid OCR request');
+ipcMain.handle('ocr:recognize', async (event, payload) => {
+  const image = payload?.image;
+  const language = payload?.language || 'chi_sim+eng';
+  const page = Number.isInteger(payload?.page) && payload.page > 0 ? payload.page : 0;
+  if (!(image instanceof Uint8Array) || image.byteLength < 16 || image.byteLength > 24 * 1024 * 1024 || !ocrLanguages[language]) throw new Error('Invalid OCR request');
+  const slots = await getOcrWorkerPool(language);
+  const slot = slots.reduce((best, candidate) => candidate.pending < best.pending ? candidate : best, slots[0]);
+  slot.pending += 1;
+  const operation = slot.queue.then(async () => {
     const startedAt = Date.now();
-    await logEvent('info', 'ocr.started', { language, bytes: image.byteLength });
+    slot.page = page;
+    slot.sender = event.sender;
+    await logEvent('info', 'ocr.started', { language, page, worker: slot.index, bytes: image.byteLength });
     try {
-      const worker = await getOcrWorker(language, event.sender);
+      const worker = await slot.worker;
       const result = await worker.recognize(Buffer.from(image.buffer, image.byteOffset, image.byteLength), { rotateAuto: true });
       const text = String(result?.data?.text || '').replace(/\s+/g, ' ').trim();
-      await logEvent('info', 'ocr.succeeded', { language, characters: text.length, confidence: result?.data?.confidence, elapsedMs: Date.now() - startedAt });
+      await logEvent('info', 'ocr.succeeded', { language, page, worker: slot.index, characters: text.length, confidence: result?.data?.confidence, elapsedMs: Date.now() - startedAt });
       return { text, confidence: Number(result?.data?.confidence || 0) };
     } catch (error) {
-      await logEvent('error', 'ocr.failed', { language, elapsedMs: Date.now() - startedAt, error: describeError(error) });
+      await logEvent('error', 'ocr.failed', { language, page, worker: slot.index, elapsedMs: Date.now() - startedAt, error: describeError(error) });
       throw error;
+    } finally {
+      slot.page = 0;
+      slot.sender = null;
     }
   });
-  ocrQueue = operation.catch(() => undefined);
-  return operation;
+  slot.queue = operation.catch(() => undefined);
+  return operation.finally(() => { slot.pending -= 1; });
 });
 
 ipcMain.handle('library:list', async () => (await readCatalog()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));

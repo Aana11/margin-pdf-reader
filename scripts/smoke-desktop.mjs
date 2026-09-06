@@ -5,10 +5,11 @@ import path from 'node:path';
 const pdfPath = path.resolve(process.argv[2] || 'tmp/pdfs/margin-reader-smoke.pdf');
 const testEmbedding = process.argv.includes('--embedding');
 const executable = process.env.MARGIN_PACKAGED_APP || path.resolve('release', 'win-unpacked', 'Margin.exe');
-const port = 9333;
+const port = Number(process.env.MARGIN_CDP_PORT || 9333);
 const libraryRoot = path.resolve('tmp', `smoke-library-${Date.now()}`);
 const dataRoot = testEmbedding ? (process.env.MARGIN_DATA_ROOT || path.join(process.env.APPDATA || libraryRoot, 'Margin')) : path.join(libraryRoot, 'data');
-const child = spawn(executable, ['--disable-gpu', `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(libraryRoot, 'profile')}`], { stdio: 'ignore', env: { ...process.env, MARGIN_DATA_ROOT: dataRoot, MARGIN_LIBRARY_ROOT: path.join(libraryRoot, 'library') } });
+const attachToRunningApp = process.env.MARGIN_CDP_ATTACH === '1';
+const child = attachToRunningApp ? null : spawn(executable, ['--disable-gpu', `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(libraryRoot, 'profile')}`], { stdio: 'ignore', env: { ...process.env, MARGIN_DATA_ROOT: dataRoot, MARGIN_LIBRARY_ROOT: path.join(libraryRoot, 'library') } });
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -21,14 +22,14 @@ async function retry(operation, attempts = 60, interval = 500) {
   throw lastError;
 }
 
-const targets = await retry(async () => {
+const target = await retry(async () => {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`);
   if (!response.ok) throw new Error(`CDP discovery failed: ${response.status}`);
   const payload = await response.json();
-  if (!Array.isArray(payload) || payload.length === 0) throw new Error('No Electron page target');
-  return payload;
+  const ready = Array.isArray(payload) ? payload.find((candidate) => candidate.url?.startsWith('margin://')) : null;
+  if (!ready) throw new Error('Margin renderer is not ready');
+  return ready;
 });
-const target = targets.find((candidate) => candidate.url?.startsWith('margin://')) || targets[0];
 const socket = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((resolve, reject) => {
   socket.addEventListener('open', resolve, { once: true });
@@ -63,7 +64,6 @@ async function evaluate(expression, awaitPromise = false) {
 
 try {
   await command('Runtime.enable');
-  await evaluate(`document.querySelector('[aria-label="展开本地书架"]')?.click()`);
   await command('DOM.enable');
   const documentNode = await command('DOM.getDocument');
   const fileInput = await command('DOM.querySelector', { nodeId: documentNode.root.nodeId, selector: 'input[type="file"]' });
@@ -75,11 +75,10 @@ try {
       canvasCount: document.querySelectorAll('.pdf-page canvas').length,
       scrollHeight: document.querySelector('.canvas-wrap')?.scrollHeight || 0,
       clientHeight: document.querySelector('.canvas-wrap')?.clientHeight || 0,
-      shelf: document.querySelector('.book-item strong')?.textContent || '',
       error: document.querySelector('.error-message')?.textContent || ''
     })`);
     if (state.error) throw new Error(state.error);
-    if (!state.page.includes('1 / 2') || state.canvasWidth <= 1 || state.canvasCount !== 2 || state.scrollHeight <= state.clientHeight || !state.shelf.includes('margin-reader-smoke')) throw new Error(`Page 1, scroll region, or bookshelf has not rendered yet: ${JSON.stringify(state)}`);
+    if (!state.page.includes('1 / 2') || state.canvasWidth <= 1 || state.canvasCount !== 2 || state.scrollHeight <= state.clientHeight) throw new Error(`Page 1 or scroll region has not rendered yet: ${JSON.stringify(state)}`);
     return state;
   }, 120, 500);
   for (let index = 0; index < 4; index += 1) {
@@ -140,10 +139,14 @@ try {
       'A short PDF retrieval passage.',
       'A second passage for the local batch.',
       '第三个用于批量向量测试的中文片段。',
-      'Fourth local embedding test passage.'
+      'Fourth local embedding test passage.',
+      'Fifth passage validates wider Vulkan batches.',
+      '第六个片段验证八路并发向量槽。',
+      'Seventh local embedding test passage.',
+      'Eighth local embedding test passage.'
     ])`, true);
     embeddingDimensions = vectors?.[0]?.length ?? 0;
-    if (vectors?.length !== 4 || vectors.some((vector) => vector.length !== 2560)) throw new Error(`Unexpected batched embeddings: ${vectors?.length} x ${embeddingDimensions}`);
+    if (vectors?.length !== 8 || vectors.some((vector) => vector.length !== 2560)) throw new Error(`Unexpected batched embeddings: ${vectors?.length} x ${embeddingDimensions}`);
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.includes('建立索引'))?.click()`);
     indexStatus = await retry(async () => {
       const state = await evaluate(`({
@@ -163,24 +166,19 @@ try {
       { role: 'user', content: '冒烟测试提问', page: 2, createdAt: new Date().toISOString() },
       { role: 'assistant', content: '冒烟测试回答', page: 2, createdAt: new Date().toISOString() }
     ] }]));
-    document.querySelector('[aria-label="收起本地书架"]')?.click();
     return { bookId: book.id };
   })()`, true);
-  await retry(async () => {
-    const collapsed = await evaluate(`document.querySelector('.workspace')?.classList.contains('shelf-collapsed')`);
-    if (!collapsed) throw new Error('Bookshelf did not collapse');
-    return collapsed;
-  });
   await evaluate(`window.location.reload()`);
   const persistedUi = await retry(async () => {
     const state = await evaluate(`({
-      collapsed: document.querySelector('.workspace')?.classList.contains('shelf-collapsed'),
-      hasExpand: Boolean(document.querySelector('[aria-label="展开本地书架"]'))
+      hasSidebar: Boolean(document.querySelector('.app-sidebar')),
+      hasLibrary: Boolean(document.querySelector('[aria-label="本地书架"]')),
+      settingsAtBottom: Boolean(document.querySelector('.sidebar-bottom [aria-label="模型设置"]'))
     })`);
-    if (!state.collapsed || !state.hasExpand) throw new Error('Collapsed bookshelf state did not persist');
+    if (!state.hasSidebar || !state.hasLibrary || !state.settingsAtBottom) throw new Error('Application sidebar did not persist');
     return state;
   });
-  await evaluate(`document.querySelector('[aria-label="展开本地书架"]')?.click()`);
+  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
   persisted = await retry(async () => {
     const shelf = await evaluate(`({
       name: document.querySelector('.book-item strong')?.textContent || '',
@@ -189,6 +187,8 @@ try {
     if (!shelf.name.includes('margin-reader-smoke') || (testEmbedding && !shelf.indexed)) throw new Error('Bookshelf state has not persisted yet');
     return shelf;
   }, 120, 500);
+  await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' });
+  await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' });
   await evaluate(`document.querySelector('[aria-label="提问历史"]')?.click()`);
   const persistedHistory = await retry(async () => {
     const text = await evaluate(`document.querySelector('.history-item')?.textContent || ''`);
@@ -197,6 +197,7 @@ try {
   });
   await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' });
   await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' });
+  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
   await evaluate(`document.querySelector('.book-item')?.click()`);
   const reopened = await retry(async () => {
     const state = await evaluate(`({
@@ -213,6 +214,7 @@ try {
     modelReleased = await evaluate(`window.marginDesktop.modelUnload()`, true);
     if (modelReleased?.loaded) throw new Error('Local model process did not release memory');
   }
+  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
   await evaluate(`(() => { window.confirm = () => true; document.querySelector('.book-remove')?.click(); })()`);
   const removed = await retry(async () => {
     const state = await evaluate(`({ books: document.querySelectorAll('.book-item').length, hasPdf: Boolean(document.querySelector('.pdf-pages')), history: JSON.parse(localStorage.getItem('margin-chat-history-v1') || '[]').length })`);
@@ -223,6 +225,6 @@ try {
 } finally {
   await Promise.race([command('Browser.close').catch(() => undefined), delay(2_000)]);
   socket.close();
-  if (child.exitCode === null) child.kill();
-  await Promise.race([new Promise((resolve) => child.once('exit', resolve)), delay(5_000)]);
+  if (child?.exitCode === null) child.kill();
+  if (child) await Promise.race([new Promise((resolve) => child.once('exit', resolve)), delay(5_000)]);
 }

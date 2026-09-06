@@ -1,7 +1,7 @@
 'use client';
 
 import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, BookOpen, Bot, FileText, HardDrive, History, Library, MessageSquareText, PanelLeftClose, PanelLeftOpen, Plus, Send, Settings2, Sparkles, Trash2, Upload } from 'lucide-react';
+import { ArrowDown, ArrowUp, BookOpen, Bot, FileText, HardDrive, History, Library, MessageSquareText, Plus, Send, Settings2, Sparkles, Trash2, Upload } from 'lucide-react';
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist';
 // oxlint-disable-next-line import/default -- Vite's ?url loader provides this synthetic default export.
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
@@ -62,8 +62,25 @@ function readChatHistory(): ChatHistoryRecord[] {
   } catch { return []; }
 }
 
-function readShelfCollapsed() {
-  return typeof window !== 'undefined' && localStorage.getItem('margin-bookshelf-collapsed') === 'true';
+function formatRemaining(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  if (seconds < 60) return `约 ${Math.max(1, Math.ceil(seconds))} 秒`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `约 ${minutes} 分钟`;
+  return `约 ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
+}
+
+async function mapWithConcurrency<T>(count: number, concurrency: number, task: (pageNumber: number) => Promise<T>): Promise<T[]> {
+  const results = Array.from<T>({ length: count });
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(count, concurrency) }, async () => {
+    while (cursor < count) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await task(index + 1);
+    }
+  }));
+  return results;
 }
 
 async function renderPageImage(pdfPage: PDFPageProxy, format: 'png' | 'jpeg' = 'png'): Promise<{ bytes: Uint8Array; mimeType: string }> {
@@ -199,7 +216,7 @@ export default function Home() {
   const [chatModelList, setChatModelList] = useState<string[]>([]);
   const [chatModelListLoading, setChatModelListLoading] = useState(false);
   const [chatModelListError, setChatModelListError] = useState('');
-  const [bookshelfCollapsed, setBookshelfCollapsed] = useState(readShelfCollapsed);
+  const [libraryOpen, setLibraryOpen] = useState(false);
   const [chatHistory, setChatHistory] = useState<ChatHistoryRecord[]>(readChatHistory);
 
   const saveChatHistory = useCallback((bookId: string, bookName: string, nextMessages: Message[]) => {
@@ -211,13 +228,6 @@ export default function Home() {
       return next;
     });
   }, []);
-
-  const toggleBookshelf = () => {
-    setBookshelfCollapsed((current) => {
-      localStorage.setItem('margin-bookshelf-collapsed', String(!current));
-      return !current;
-    });
-  };
 
   const scrollToPage = useCallback((target: number, behavior: ScrollBehavior = 'smooth') => {
     const container = readerScrollRef.current;
@@ -391,6 +401,7 @@ export default function Home() {
         const entry = await window.marginDesktop.libraryImportFile(file);
         setLibrary((current) => [entry, ...current]);
         await loadPdf(`margin://app/library/${entry.id}/document.pdf`, entry.name, entry);
+        setLibraryOpen(false);
       } else {
         await loadPdf(await file.arrayBuffer(), file.name);
       }
@@ -405,6 +416,7 @@ export default function Home() {
     if (!window.marginDesktop || loadingPdf) return;
     try {
       await loadPdf(`margin://app/library/${book.id}/document.pdf`, book.name, book);
+      setLibraryOpen(false);
     } catch (reason) {
       setError(`无法从书架打开：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`);
     }
@@ -515,6 +527,12 @@ export default function Home() {
     setError(''); setIndexStatus('indexing'); setIndexProgress(0); setIndexMessage('正在提取 PDF 文本');
     let phase = 'starting';
     let persistentBuildStarted = false;
+    const indexStartedAt = new Date().getTime();
+    let extractionElapsedMs = 0;
+    let ocrElapsedMs = 0;
+    let embeddingElapsedMs = 0;
+    let persistenceElapsedMs = 0;
+    let runtimeBackend = modelStatus?.backend;
     window.marginDesktop?.logEvent?.('index-started', {
       bookId: activeBookId,
       fileName,
@@ -531,7 +549,9 @@ export default function Home() {
           else if (progress.state === 'checking') setIndexMessage('正在校验本地文件');
         });
         try {
-          setModelStatus(await window.marginDesktop.modelPrepare());
+          const prepared = await window.marginDesktop.modelPrepare();
+          runtimeBackend = prepared.backend;
+          setModelStatus(prepared);
         } finally {
           unsubscribe?.();
         }
@@ -544,42 +564,76 @@ export default function Home() {
       let emptyPages = 0;
       let ocrPages = 0;
       let ocrFailures = 0;
-      for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const extractionStartedAt = new Date().getTime();
+      let extractedPages = 0;
+      const extracted = await mapWithConcurrency(pdf.numPages, 6, async (pageNumber) => {
         if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
         const pdfPage = await pdf.getPage(pageNumber);
         const content = await pdfPage.getTextContent();
-        let text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim();
-        if (!text && settings.ocrMode === 'auto' && window.marginDesktop?.ocrRecognize) {
-          phase = 'ocr';
-          setIndexMessage(`正在 OCR：第 ${pageNumber} / ${pdf.numPages} 页`);
-          const unsubscribe = window.marginDesktop.onOcrProgress?.((progress) => setIndexMessage(`正在 OCR：第 ${pageNumber} / ${pdf.numPages} 页 · ${progress.progress}%`));
-          try {
-            const image = await renderPageImage(pdfPage);
-            const result = await window.marginDesktop.ocrRecognize(image.bytes, settings.ocrLanguage);
-            text = result.text;
-            if (text) {
-              ocrPages += 1;
-              pageTextsRef.current.set(pageNumber, text);
-              if (pageNumber === page) setPageText(text);
-            } else ocrFailures += 1;
-          } catch (reason) {
-            ocrFailures += 1;
-            window.marginDesktop?.logEvent?.('ocr-page-failed', { bookId: activeBookId, page: pageNumber, message: reason instanceof Error ? reason.message : String(reason) }, 'error');
-          } finally {
-            unsubscribe?.();
-          }
+        const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim();
+        extractedPages += 1;
+        setIndexProgress(Math.round((extractedPages / pdf.numPages) * 10));
+        setIndexMessage(`正在并发提取文本：${extractedPages} / ${pdf.numPages} 页`);
+        return { pageNumber, text };
+      });
+      const ocrCandidates = extracted.filter((entry) => !entry.text);
+      if (ocrCandidates.length > 0 && settings.ocrMode === 'auto' && window.marginDesktop?.ocrRecognize) {
+        phase = 'ocr';
+        const ocrStartedAt = new Date().getTime();
+        let ocrCompleted = 0;
+        const updateOcrMessage = (detail = '') => {
+          const elapsedSeconds = Math.max((new Date().getTime() - ocrStartedAt) / 1000, 0.001);
+          const pagesPerMinute = (ocrCompleted / elapsedSeconds) * 60;
+          const remaining = ocrCompleted > 0 ? formatRemaining(((ocrCandidates.length - ocrCompleted) / pagesPerMinute) * 60) : '';
+          setIndexMessage(`3 路 OCR：${ocrCompleted} / ${ocrCandidates.length} 页${pagesPerMinute > 0 ? ` · ${pagesPerMinute.toFixed(1)} 页/分钟` : ''}${remaining ? ` · ${remaining}` : ''}${detail}`);
+        };
+        const unsubscribe = window.marginDesktop.onOcrProgress?.((progress) => updateOcrMessage(progress.page ? ` · 第 ${progress.page} 页 ${progress.progress}%` : ''));
+        try {
+          await mapWithConcurrency(ocrCandidates.length, 3, async (candidateNumber) => {
+            if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
+            const candidate = ocrCandidates[candidateNumber - 1];
+            const pageNumber = candidate.pageNumber;
+            try {
+              const pdfPage = await pdf.getPage(pageNumber);
+              const image = await renderPageImage(pdfPage);
+              const result = await window.marginDesktop!.ocrRecognize!(image.bytes, settings.ocrLanguage, pageNumber);
+              candidate.text = result.text;
+              if (result.text) {
+                ocrPages += 1;
+                pageTextsRef.current.set(pageNumber, result.text);
+                if (pageNumber === page) setPageText(result.text);
+              } else ocrFailures += 1;
+            } catch (reason) {
+              ocrFailures += 1;
+              window.marginDesktop?.logEvent?.('ocr-page-failed', { bookId: activeBookId, page: pageNumber, message: reason instanceof Error ? reason.message : String(reason) }, 'error');
+            }
+            ocrCompleted += 1;
+            setIndexProgress(10 + Math.round((ocrCompleted / ocrCandidates.length) * 25));
+            updateOcrMessage();
+            return candidate;
+          });
+        } finally {
+          unsubscribe?.();
         }
+        ocrElapsedMs = new Date().getTime() - ocrStartedAt;
+      }
+      for (const extractedPage of extracted) {
+        if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
+        const { pageNumber, text } = extractedPage;
         if (!text) emptyPages += 1;
         allChunks.push(...chunkPage(text, pageNumber));
-        setIndexProgress(Math.round((pageNumber / pdf.numPages) * 35));
-        setIndexMessage(`正在提取文本：第 ${pageNumber} / ${pdf.numPages} 页${ocrPages ? ` · OCR ${ocrPages} 页` : ''}`);
+        setIndexProgress(35);
+        setIndexMessage(`正在整理文本：第 ${pageNumber} / ${pdf.numPages} 页${ocrPages ? ` · OCR ${ocrPages} 页` : ''}`);
       }
+      extractionElapsedMs = new Date().getTime() - extractionStartedAt;
       if (allChunks.length === 0) throw new Error(settings.ocrMode === 'off' ? '这个 PDF 没有可提取文本；请在模型设置中启用 OCR。' : 'OCR 完成，但没有识别出可索引文本。请尝试切换 OCR 语言或使用更清晰的扫描件。');
-      window.marginDesktop?.logEvent?.('index-text-extracted', { bookId: activeBookId, chunks: allChunks.length, emptyPages, ocrPages, ocrFailures });
+      window.marginDesktop?.logEvent?.('index-text-extracted', { bookId: activeBookId, chunks: allChunks.length, emptyPages, ocrPages, ocrFailures, elapsedMs: Math.round(extractionElapsedMs), ocrElapsedMs: Math.round(ocrElapsedMs), textConcurrency: 6, ocrConcurrency: 3 });
       phase = 'embedding';
-      // llama.cpp exposes four embedding slots; feeding all four together keeps the
-      // model busy without increasing the resident model footprint.
-      const batchSize = settings.embeddingKind === 'local-qwen3-embedding-4b' ? 4 : 16;
+      // Vulkan has enough parallelism for eight llama.cpp slots. CPU stays at four
+      // to avoid oversubscription; remote providers use their existing larger batch.
+      const batchSize = settings.embeddingKind === 'local-qwen3-embedding-4b' ? (runtimeBackend === 'vulkan' ? 8 : 4) : 16;
+      const embeddingStartedAt = new Date().getTime();
+      const pendingEntries: Array<RagChunk & { vector: Float32Array }> = [];
       for (let start = 0; start < allChunks.length; start += batchSize) {
         if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
         const chunks = allChunks.slice(start, start + batchSize);
@@ -590,19 +644,29 @@ export default function Home() {
             await window.marginDesktop.libraryIndexStart(activeBookId, provider.id, vectors[0].length);
             persistentBuildStarted = true;
           }
-          await window.marginDesktop.libraryIndexAppend(activeBookId, chunks.map((chunk, index) => ({ ...chunk, vector: Float32Array.from(vectors[index]) })));
+          pendingEntries.push(...chunks.map((chunk, index) => ({ ...chunk, vector: Float32Array.from(vectors[index]) })));
+          if (pendingEntries.length >= 64 || start + batchSize >= allChunks.length) {
+            await window.marginDesktop.libraryIndexAppend(activeBookId, pendingEntries.splice(0, pendingEntries.length));
+          }
         } else {
           vectorIndexRef.current.addVectors(chunks, vectors);
         }
-        setIndexProgress(35 + Math.round((Math.min(start + batchSize, allChunks.length) / Math.max(allChunks.length, 1)) * 65));
-        setIndexMessage(`正在生成向量：${Math.min(start + batchSize, allChunks.length)} / ${allChunks.length} 个片段`);
+        const completed = Math.min(start + batchSize, allChunks.length);
+        const elapsedSeconds = Math.max((new Date().getTime() - embeddingStartedAt) / 1000, 0.001);
+        const chunksPerSecond = completed / elapsedSeconds;
+        const remaining = formatRemaining((allChunks.length - completed) / chunksPerSecond);
+        setIndexProgress(35 + Math.round((completed / Math.max(allChunks.length, 1)) * 64));
+        setIndexMessage(`正在生成向量：${completed} / ${allChunks.length} · ${chunksPerSecond.toFixed(1)} 片段/秒${remaining ? ` · ${remaining}` : ''}`);
       }
+      embeddingElapsedMs = new Date().getTime() - embeddingStartedAt;
       setScanWarning(emptyPages > 0 ? `${ocrPages > 0 ? `OCR 已识别 ${ocrPages} 页；` : ''}仍有 ${emptyPages} 页没有可提取文本。${ocrFailures ? ` ${ocrFailures} 页识别失败。` : ''}` : ocrPages > 0 ? `OCR 已识别并索引 ${ocrPages} 个扫描页。` : '');
       let persistedInfo;
       if (persistentBuildStarted && activeBookId && window.marginDesktop?.libraryIndexFinish) {
         phase = 'persistence';
         setIndexMessage('正在完成 SQLite 索引');
+        const persistenceStartedAt = new Date().getTime();
         persistedInfo = await window.marginDesktop.libraryIndexFinish(activeBookId);
+        persistenceElapsedMs = new Date().getTime() - persistenceStartedAt;
         persistentBuildStarted = false;
         await refreshLibrary();
       }
@@ -613,6 +677,13 @@ export default function Home() {
         providerId: provider.id,
         chunks: allChunks.length,
         persisted: Boolean(activeBookId),
+        batchSize,
+        runtimeBackend,
+        extractionElapsedMs: Math.round(extractionElapsedMs),
+        ocrElapsedMs: Math.round(ocrElapsedMs),
+        embeddingElapsedMs: Math.round(embeddingElapsedMs),
+        persistenceElapsedMs: Math.round(persistenceElapsedMs),
+        totalElapsedMs: Math.round(new Date().getTime() - indexStartedAt),
       });
       if (settings.embeddingKind === 'local-qwen3-embedding-4b') setModelStatus(await window.marginDesktop?.modelStatus?.() ?? modelStatus);
     } catch (reason) {
@@ -773,12 +844,28 @@ export default function Home() {
 
   return (
     <main className="app-shell">
-      <header className="topbar">
-        <div className="brand"><span className="brand-mark"><FileText /></span><span>页间 <em>Margin{appVersion ? ` v${appVersion}` : ''}</em></span></div>
-        <div className="document-title"><span className={pdf ? 'status-dot online' : 'status-dot'} /><span>{fileName || '尚未打开文档'}</span></div>
-        <div className="top-actions">
+      <aside className="app-sidebar" aria-label="应用功能">
+        <div className="sidebar-brand" title={`Margin${appVersion ? ` v${appVersion}` : ''}`}><FileText /><span className="sr-only">Margin{appVersion ? ` v${appVersion}` : ''}</span></div>
+        <nav className="sidebar-modules" aria-label="功能模块">
+          <Dialog open={libraryOpen} onOpenChange={setLibraryOpen}>
+            <DialogTrigger render={<button className="sidebar-module-button" aria-label="本地书架" title="本地书架" />}><Library /><span>书架</span>{library.length > 0 && <strong>{library.length}</strong>}</DialogTrigger>
+            <DialogContent className="library-dialog">
+              <DialogHeader><DialogTitle>本地书架</DialogTitle><DialogDescription>集中管理保存在本机的 PDF、阅读进度与全文向量索引。</DialogDescription></DialogHeader>
+              <div className="library-dialog-actions"><Button onClick={() => fileInputRef.current?.click()}><Plus />导入 PDF</Button><span>{library.length} 本书 · 数据仅保存在本机</span></div>
+              <div className="book-list">
+                {library.length === 0 ? <div className="bookshelf-empty"><BookOpen /><p>还没有书籍。导入的 PDF 会保存在本机，并记住阅读进度与向量索引。</p></div> : library.map((book) =>
+                  <div className="book-row" key={book.id}><button className={book.id === activeBookId ? 'book-item active' : 'book-item'} onClick={() => void openLibraryBook(book)}>
+                    <span className="book-icon"><FileText /></span><span className="book-copy"><strong>{book.name}</strong><small>{book.pageCount ? `${book.lastPage} / ${book.pageCount} 页` : '等待首次打开'}</small></span>
+                    {book.indexProviderId && <span className="book-index" title="已保存向量索引"><HardDrive /></span>}
+                  </button><button className="book-remove" onClick={() => void removeLibraryBook(book)} aria-label={`从书架移除 ${book.name}`}><Trash2 /></button></div>)}
+              </div>
+            </DialogContent>
+          </Dialog>
+          <div className="sidebar-future-slots" aria-hidden="true"><span /><span /></div>
+        </nav>
+        <div className="sidebar-bottom">
           <Dialog>
-            <DialogTrigger render={<Button variant="ghost" size="icon-lg" aria-label="模型设置" />}><Settings2 /></DialogTrigger>
+            <DialogTrigger render={<button className="sidebar-module-button" aria-label="模型设置" title="模型设置" />}><Settings2 /><span>设置</span></DialogTrigger>
             <DialogContent className="settings-dialog">
               <DialogHeader><DialogTitle>模型设置</DialogTitle><DialogDescription>支持 OpenAI 兼容的 <code>/chat/completions</code> 端点。配置仅保存在本机浏览器。</DialogDescription></DialogHeader>
               <div className="settings-fields">
@@ -845,19 +932,9 @@ export default function Home() {
           </Dialog>
         </div>
         <input ref={fileInputRef} className="sr-only" type="file" accept="application/pdf,.pdf" onChange={(event) => void openPdf(event.target.files?.[0])} />
-      </header>
+      </aside>
 
-      <div className={bookshelfCollapsed ? 'workspace shelf-collapsed' : 'workspace'}>
-        <aside className={bookshelfCollapsed ? 'bookshelf-panel collapsed' : 'bookshelf-panel'} aria-label="本地书架">
-          {bookshelfCollapsed ? <div className="bookshelf-rail"><Button variant="ghost" size="icon" onClick={toggleBookshelf} aria-label="展开本地书架" title="展开本地书架"><PanelLeftOpen /></Button><Button variant="ghost" size="icon" onClick={() => fileInputRef.current?.click()} aria-label="添加到本地书架" title="添加 PDF"><Plus /></Button></div> : <div className="bookshelf-heading"><div><Library /><span>本地书架</span><strong>{library.length}</strong></div><span className="bookshelf-actions"><Button variant="ghost" size="icon" onClick={() => fileInputRef.current?.click()} aria-label="添加到本地书架" title="添加 PDF"><Plus /></Button><Button variant="ghost" size="icon" onClick={toggleBookshelf} aria-label="收起本地书架" title="收起本地书架"><PanelLeftClose /></Button></span></div>}
-          <div className="book-list">
-            {library.length === 0 ? <div className="bookshelf-empty"><BookOpen /><p>导入的 PDF 会保存在本机，并记住阅读进度与向量索引。</p></div> : library.map((book) =>
-              <div className="book-row" key={book.id}><button className={book.id === activeBookId ? 'book-item active' : 'book-item'} onClick={() => void openLibraryBook(book)}>
-                <span className="book-icon"><FileText /></span><span className="book-copy"><strong>{book.name}</strong><small>{book.pageCount ? `${book.lastPage} / ${book.pageCount} 页` : '等待首次打开'}</small></span>
-                {book.indexProviderId && <span className="book-index" title="已保存向量索引"><HardDrive /></span>}
-              </button><button className="book-remove" onClick={() => void removeLibraryBook(book)} aria-label={`从书架移除 ${book.name}`}><Trash2 /></button></div>)}
-          </div>
-        </aside>
+      <div className="workspace">
         <section className="reader-panel" aria-label="PDF 阅读区">
           {pdf ? <>
             <div className="reader-toolbar">
@@ -875,7 +952,7 @@ export default function Home() {
             <div className="empty-icon"><Upload /></div><p className="eyebrow">私密 · 本地阅读</p>
             <h1>打开一本 PDF，<br />开始深度阅读。</h1>
             <p>文档仅在你的浏览器中解析。AI 会自动携带当前页内容，无需反复截图或复制。</p>
-            <span className="file-note">点击“本地书架”旁的 ＋ 导入 PDF · 文件不会上传</span>
+            <span className="file-note">点击左侧“书架”管理或导入 PDF · 文件不会上传</span>
           </div>}
         </section>
 

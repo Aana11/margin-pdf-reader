@@ -16,14 +16,14 @@ async function retry(operation, attempts = 120, interval = 500) {
   throw lastError;
 }
 
-const targets = await retry(async () => {
+const target = await retry(async () => {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`);
   if (!response.ok) throw new Error(`CDP discovery failed: ${response.status}`);
   const payload = await response.json();
-  if (!Array.isArray(payload) || payload.length === 0) throw new Error('No Electron page target');
-  return payload;
+  const ready = Array.isArray(payload) ? payload.find((candidate) => candidate.url?.startsWith('margin://')) : null;
+  if (!ready) throw new Error('Margin renderer is not ready');
+  return ready;
 });
-const target = targets.find((candidate) => candidate.url?.startsWith('margin://')) || targets[0];
 const socket = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((resolve, reject) => {
   socket.addEventListener('open', resolve, { once: true });
@@ -70,11 +70,13 @@ try {
   const prepared = await evaluate('window.marginDesktop.modelPrepare()', true);
   console.log(JSON.stringify({ event: 'model-prepared', prepared }));
 
-  await evaluate(`(() => {
+  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
+  await retry(() => evaluate(`(() => {
     const name = ${JSON.stringify(book.name)};
     const row = [...document.querySelectorAll('.book-row')].find((candidate) => candidate.querySelector('.book-item strong')?.textContent === name);
     row?.querySelector('.book-item')?.click();
-  })()`);
+    return Boolean(row);
+  })()`).then((found) => { if (!found) throw new Error('Bookshelf dialog is not ready'); return found; }));
   await retry(async () => {
     const state = await evaluate(`({ page: document.querySelector('.page-label')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`);
     if (state.error) throw new Error(state.error);

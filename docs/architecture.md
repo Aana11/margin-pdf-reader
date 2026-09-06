@@ -18,12 +18,12 @@ An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Elec
 
 ## OCR and RAG pipeline
 
-1. PDF.js extracts selectable text page by page.
+1. PDF.js extracts selectable text with a bounded six-page concurrency window while preserving page order.
 2. If a page has no text and OCR is enabled, the renderer rasterizes it to a capped offscreen canvas and transfers a PNG to the main process.
-3. A single queued Tesseract.js worker recognizes simplified Chinese plus English, traditional Chinese plus English, or English. Language data ships with the application; no OCR image leaves the machine.
+3. A bounded pool of three Tesseract.js workers recognizes simplified Chinese plus English, traditional Chinese plus English, or English. Language data ships with the application; no OCR image leaves the machine.
 4. Text is normalized and split into overlapping, page-addressable chunks.
-5. The selected embedding provider generates vectors in bounded batches (4 for local Qwen, 16 for remote providers).
-6. Each completed batch is transferred as `Float32Array` and immediately appended to SQLite.
+5. The selected embedding provider generates vectors in bounded batches (8 for Vulkan Qwen, 4 for CPU Qwen, 16 for remote providers).
+6. Completed vectors are transferred as `Float32Array` and accumulated into SQLite transactions of at most 64 entries.
 7. Query search streams rows from SQLite, computes cosine similarity, and retains only the best K matches.
 8. When optional GLM-OCR deep reading is enabled, the renderer classifies retrieved text for formulas, code, tables, or an explicit deep-reading request. It rasterizes at most two unique candidates and sends them to the configured GLM-OCR endpoint.
 9. The current page, top-ranked chunks, and successful visual-recognition results are sent to the configured chat model only after the user asks a question.
@@ -48,13 +48,13 @@ Provider identity remains an invariant: an index opens only when its embedding p
 
 ## Embedding providers
 
-The built-in provider uses `Qwen/Qwen3-Embedding-4B`, produces 2560-dimensional embeddings, and runs the official Q4_K_M GGUF through a pinned llama.cpp sidecar bound only to `127.0.0.1`. The main process selects a Vulkan runtime when an NVIDIA GPU is detected and otherwise uses CPU; `MARGIN_RUNTIME_BACKEND` can override it. The sidecar exits after two idle minutes or an explicit unload request.
+The built-in provider uses `Qwen/Qwen3-Embedding-4B`, produces 2560-dimensional embeddings, and runs the official Q4_K_M GGUF through a pinned llama.cpp sidecar bound only to `127.0.0.1`. The main process selects a Vulkan runtime when an NVIDIA GPU is detected and otherwise uses CPU; `MARGIN_RUNTIME_BACKEND` can override it. Vulkan runs eight parallel slots with a larger token batch, while CPU remains at four slots to avoid thread oversubscription. The sidecar exits after two idle minutes or an explicit unload request.
 
 The model and llama.cpp runtime are optional downloaded resources rather than Git-tracked blobs. Downloads are resumable, checksum-verified, and stored below the Margin data root. The remote provider follows the OpenAI-compatible `/embeddings` contract; document chunks leave the machine only when the user selects that mode.
 
 ## Local state and privacy
 
-The managed PDF, catalog metadata, progress, OCR-derived index text, and SQLite vectors remain below the local Margin data root. Renderer preferences—including bookshelf collapse state, chat/embedding/GLM-OCR settings, custom system prompt, and per-book chat history—use Electron browser storage. Chat history is capped per book and removed when that book is deleted.
+The managed PDF, catalog metadata, progress, OCR-derived index text, and SQLite vectors remain below the local Margin data root. Renderer preferences—including chat/embedding/GLM-OCR settings, custom system prompt, and per-book chat history—use Electron browser storage. Chat history is capped per book and removed when that book is deleted.
 
 Chat and embedding credentials are separate because users may choose different vendors. They are stored in the Electron browser profile, not committed to Git, and are sent only to their configured endpoint.
 
@@ -63,6 +63,6 @@ Chat and embedding credentials are separate because users may choose different v
 - A vector index contains embeddings from exactly one provider identity and one fixed dimension.
 - Every match retains its PDF page number and source text.
 - Library removal deletes only the app-managed PDF, metadata, and indexes after explicit confirmation; the original import source is untouched.
-- OCR work is sequential to bound CPU and memory use.
+- OCR work is capped at three concurrent workers to improve scanned-book throughput without unbounded CPU or memory growth.
 - GLM-OCR is optional, query-time only, and limited to two retrieved pages per question.
 - Exact SQLite search targets individual large books; a future cross-library or million-chunk mode may require an ANN extension.

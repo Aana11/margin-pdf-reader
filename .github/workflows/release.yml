@@ -25,6 +25,9 @@ jobs:
       - run: npm run desktop:release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: npm run test:desktop
+      - run: npm run test:desktop:ocr
+      - run: npm run test:desktop:deep-reading
       - uses: softprops/action-gh-release@v2
         with:
           draft: false

@@ -19,7 +19,7 @@ contextBridge.exposeInMainWorld('marginDesktop', {
     ipcRenderer.on('model:progress', handler);
     return () => ipcRenderer.removeListener('model:progress', handler);
   },
-  ocrRecognize: (image, language) => ipcRenderer.invoke('ocr:recognize', { image, language }),
+  ocrRecognize: (image, language, page) => ipcRenderer.invoke('ocr:recognize', { image, language, page }),
   onOcrProgress: (listener) => {
     const handler = (_event, progress) => listener(progress);
     ipcRenderer.on('ocr:progress', handler);
