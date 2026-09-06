@@ -1,41 +1,58 @@
 # Architecture
 
-Margin is a local-first desktop PDF reader. The renderer owns PDF parsing, page rendering, text extraction, embedding inference, vector search, and chat orchestration. PDF bytes are never sent to a service unless a future, explicit feature says otherwise.
+Margin is a local-first Electron PDF reader. It separates untrusted document rendering from filesystem, OCR, model-sidecar, and index responsibilities while keeping every local operation behind a narrow preload API.
 
 ## Runtime boundaries
 
-- **Electron main process:** window lifecycle, local library persistence, and the llama.cpp sidecar. It does not receive model keys.
-- **Sandboxed renderer:** PDF.js, a Float32 in-memory vector index, and the reading UI. PDF canvases are windowed and released after leaving the viewport margin.
-- **Model providers:** small interfaces isolate chat and embedding vendors from the reader and index.
+- **Electron main process:** owns the managed library, `margin://` file protocol, Tesseract worker, SQLite indexes, logs, downloads, and llama.cpp sidecar. It never receives chat or remote-embedding API keys.
+- **Sandboxed renderer:** owns PDF.js rendering, text extraction, page virtualization, UI state, chat orchestration, and embedding-provider requests. `nodeIntegration` is disabled; context isolation and sandboxing are enabled.
+- **Model providers:** small interfaces isolate OpenAI-compatible chat/embedding services and the built-in Qwen embedding sidecar.
 
-The Electron renderer has `nodeIntegration` disabled, `contextIsolation` enabled, and sandboxing enabled. External navigation opens in the system browser.
+External navigation opens in the system browser. Filesystem access is restricted to validated IPC operations and app-owned book IDs.
 
-## RAG pipeline
+## Large-file PDF path
 
-1. PDF.js extracts text page by page.
-2. Text is normalized and split into overlapping, page-addressable chunks.
-3. The selected embedding provider generates normalized vectors.
-4. The local index ranks chunks with cosine similarity.
-5. The current page and top-ranked chunks are sent to the configured chat model.
+For a real disk file, the preload obtains its native path through Electron `webUtils` and sends only that path to the main process. The main process validates the absolute path, size, and `%PDF-` signature, then copies it directly into the managed library. Byte-transfer IPC remains only as a fallback for programmatically constructed `File` objects and tests.
 
-Search executes against an in-memory index. The Electron main process persists each completed index beside its book under the local Margin library and restores it only when the provider identity matches. PDF bytes, catalog metadata, reading progress, and indexes stay on the machine. A future storage migration can replace JSON vectors with SQLite without changing the provider or search boundary.
+An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Electron serves this local resource through its network stack, so PDF.js can fetch it without first loading the complete file into a renderer `ArrayBuffer`. Page canvases are windowed and released after leaving the viewport margin.
+
+## OCR and RAG pipeline
+
+1. PDF.js extracts selectable text page by page.
+2. If a page has no text and OCR is enabled, the renderer rasterizes it to a capped offscreen canvas and transfers a PNG to the main process.
+3. A single queued Tesseract.js worker recognizes simplified Chinese plus English, traditional Chinese plus English, or English. Language data ships with the application; no OCR image leaves the machine.
+4. Text is normalized and split into overlapping, page-addressable chunks.
+5. The selected embedding provider generates vectors in bounded batches (4 for local Qwen, 16 for remote providers).
+6. Each completed batch is transferred as `Float32Array` and immediately appended to SQLite.
+7. Query search streams rows from SQLite, computes cosine similarity, and retains only the best K matches.
+8. The current page and top-ranked chunks are sent to the configured chat model only after the user asks a question.
+
+OCR runs only when PDF.js finds no text layer. Its output is used for assistant context and retrieval; version 0.2.0 does not write an invisible selectable-text layer back into the PDF.
+
+## Index storage
+
+Each completed book index is stored beside the managed PDF as `index.sqlite`. Metadata records the schema version, provider identity, vector dimensions, completion state, and timestamps. Chunk rows contain page, ordinal, text, norm, and a little-endian Float32 BLOB.
+
+Builds write to `index.sqlite.building` and replace the previous database only after a successful commit and close. Stopping or failing a build removes the temporary database and preserves the last complete index. A version-1 `index.json` is migrated on first open; the JSON source is deleted only after the SQLite replacement succeeds.
+
+Provider identity remains an invariant: an index opens only when its embedding provider/model/version matches the current selection. Search stays in the main process so the renderer does not deserialize or retain every vector. Measured results and the reproducible command are in [`index-benchmark.md`](index-benchmark.md).
 
 ## Embedding providers
 
-The built-in provider uses `Qwen/Qwen3-Embedding-4B`, produces 2560-dimensional embeddings, and runs the official Q4_K_M GGUF through a pinned llama.cpp sidecar bound only to `127.0.0.1`. The main process selects a Vulkan runtime when an NVIDIA GPU is detected and otherwise uses CPU; `MARGIN_RUNTIME_BACKEND` can override that choice. The Electron main process owns the sidecar lifecycle, uses a 2048-token context and 512-token batches for this retrieval workload, and terminates the process after two idle minutes or an explicit unload request. The sandboxed renderer invokes a narrow, validated IPC method and never receives filesystem or sidecar network access. Document chunks are embedded as-is; queries receive a retrieval instruction prefix, matching Qwen's recommended asymmetric-retrieval usage.
+The built-in provider uses `Qwen/Qwen3-Embedding-4B`, produces 2560-dimensional embeddings, and runs the official Q4_K_M GGUF through a pinned llama.cpp sidecar bound only to `127.0.0.1`. The main process selects a Vulkan runtime when an NVIDIA GPU is detected and otherwise uses CPU; `MARGIN_RUNTIME_BACKEND` can override it. The sidecar exits after two idle minutes or an explicit unload request.
 
-The model is an optional application resource rather than a Git-tracked blob. `npm run model:bundle` and the in-app model manager perform resumable downloads from Hugging Face, ModelScope, or the domestic Hugging Face mirror, verify pinned SHA-256 values for both the model and llama.cpp runtime, and install them under the user's Margin data directory. The manager checks available disk space and supports pause, resume, opening the data directory, and uninstall. The Q4_K_M artifact is about 2.50 GB, so it is deliberately not part of ordinary CI or the source repository.
+The model and llama.cpp runtime are optional downloaded resources rather than Git-tracked blobs. Downloads are resumable, checksum-verified, and stored below the Margin data root. The remote provider follows the OpenAI-compatible `/embeddings` contract; document chunks leave the machine only when the user selects that mode.
 
-Indexing performs a model preflight. A missing runtime is reconstructed from the pinned, checksum-verified archive when possible; otherwise the renderer receives a component-specific error with the expected path instead of a combined “model or runtime missing” message.
+## Local state and privacy
 
-The remote provider follows the OpenAI-compatible `/embeddings` contract. Provider configuration belongs to the local user profile and must never be committed.
+The managed PDF, catalog metadata, progress, OCR-derived index text, and SQLite vectors remain below the local Margin data root. Renderer preferences—including bookshelf collapse state, model settings, custom system prompt, and per-book chat history—use Electron browser storage. Chat history is capped per book and removed when that book is deleted.
 
-Renderer-only preferences—including bookshelf collapse state, model settings, the custom system prompt, and per-book chat history—are persisted in browser storage. Chat history is capped per book and is removed when the corresponding library book is deleted; it never enters the PDF/vector-index directory or leaves the machine automatically.
+Chat and embedding credentials are separate because users may choose different vendors. They are stored in the Electron browser profile, not committed to Git, and are sent only to their configured endpoint.
 
 ## Deliberate constraints
 
-- A vector index may contain embeddings from exactly one provider/model/version.
+- A vector index contains embeddings from exactly one provider identity and one fixed dimension.
 - Every match retains its PDF page number and source text.
-- Library removal deletes the app-managed PDF copy and its saved vector index after explicit confirmation.
-- Scanned pages are reported as missing text until an OCR module is added.
-- Chat and embedding credentials remain separate because users may choose different vendors.
+- Library removal deletes only the app-managed PDF, metadata, and indexes after explicit confirmation; the original import source is untouched.
+- OCR work is sequential to bound CPU and memory use.
+- Exact SQLite search targets individual large books; a future cross-library or million-chunk mode may require an ANN extension.

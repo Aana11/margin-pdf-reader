@@ -21,4 +21,5 @@ jobs:
       - run: npm run lint
       - run: npm run lint:electron
       - run: npx tsc --noEmit
+      - run: npm run test:ocr
       - run: npm run build

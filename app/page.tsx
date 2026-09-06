@@ -1,8 +1,8 @@
 'use client';
 
 import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, BookOpen, Bot, FileText, HardDrive, History, Library, LoaderCircle, MessageSquareText, PanelLeftClose, PanelLeftOpen, Plus, Send, Settings2, Sparkles, Trash2, Upload } from 'lucide-react';
-import type { PDFDocumentProxy } from 'pdfjs-dist';
+import { ArrowDown, ArrowUp, BookOpen, Bot, FileText, HardDrive, History, Library, MessageSquareText, PanelLeftClose, PanelLeftOpen, Plus, Send, Settings2, Sparkles, Trash2, Upload } from 'lucide-react';
+import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist';
 // oxlint-disable-next-line import/default -- Vite's ?url loader provides this synthetic default export.
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { Button } from '@/components/ui/button';
@@ -14,7 +14,7 @@ import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { chunkPage } from '@/lib/rag/chunk';
 import { MemoryVectorIndex } from '@/lib/rag/memory-index';
 import { createEmbeddingProvider } from '@/lib/rag/providers';
-import type { EmbeddingProvider, EmbeddingProviderKind, RagChunk, StoredIndexEntry } from '@/lib/rag/types';
+import type { EmbeddingProvider, EmbeddingProviderKind, RagChunk, RagMatch } from '@/lib/rag/types';
 import type { LibraryEntry, ModelInstallStatus } from '@/types/electron';
 
 type Message = { role: 'user' | 'assistant'; content: string; page: number; createdAt?: string };
@@ -28,12 +28,15 @@ type ModelSettings = {
   embeddingEndpoint: string;
   embeddingModel: string;
   embeddingApiKey: string;
+  ocrMode: 'auto' | 'off';
+  ocrLanguage: 'eng' | 'chi_sim+eng' | 'chi_tra+eng';
 };
 const DEFAULT_SETTINGS: ModelSettings = {
   endpoint: 'https://api.openai.com/v1', model: 'gpt-5-mini', apiKey: '',
   systemPrompt: '你是一位严谨的中文阅读助手。优先依据当前页原文回答；原文不足时明确说明，不要捏造。回答简洁、有条理。',
   embeddingKind: 'local-qwen3-embedding-4b', embeddingEndpoint: 'https://api-inference.modelscope.cn/v1',
   embeddingModel: 'text-embedding-3-small', embeddingApiKey: '',
+  ocrMode: 'auto', ocrLanguage: 'chi_sim+eng',
 };
 const quickPrompts = ['总结本页', '解释核心概念', '列出关键结论'];
 const CHAT_HISTORY_KEY = 'margin-chat-history-v1';
@@ -54,6 +57,22 @@ function readChatHistory(): ChatHistoryRecord[] {
 
 function readShelfCollapsed() {
   return typeof window !== 'undefined' && localStorage.getItem('margin-bookshelf-collapsed') === 'true';
+}
+
+async function renderPageForOcr(pdfPage: PDFPageProxy): Promise<Uint8Array> {
+  const baseViewport = pdfPage.getViewport({ scale: 1 });
+  const scale = Math.max(1.5, Math.min(2.5, 2000 / Math.max(baseViewport.width, baseViewport.height)));
+  const viewport = pdfPage.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  const context = canvas.getContext('2d', { alpha: false });
+  if (!context) throw new Error('无法创建 OCR 页面画布');
+  await pdfPage.render({ canvas, canvasContext: context, viewport, background: '#ffffff' }).promise;
+  const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('无法编码 OCR 页面')), 'image/png'));
+  canvas.width = 1;
+  canvas.height = 1;
+  return new Uint8Array(await blob.arrayBuffer());
 }
 
 type PdfPageCanvasProps = {
@@ -147,6 +166,7 @@ export default function Home() {
   const embeddingProviderRef = useRef<EmbeddingProvider | null>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
+  const indexAbortRef = useRef(false);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [fileName, setFileName] = useState('');
   const [page, setPage] = useState(1);
@@ -314,13 +334,13 @@ export default function Home() {
     });
   }
 
-  async function loadPdf(data: ArrayBuffer | Uint8Array, name: string, book?: LibraryEntry) {
+  async function loadPdf(data: ArrayBuffer | Uint8Array | string, name: string, book?: LibraryEntry) {
     setLoadingPdf(true); setError('');
     try {
       const pdfJs = await import('pdfjs-dist');
       pdfJs.GlobalWorkerOptions.workerSrc = new URL(pdfWorkerUrl, window.location.href).toString();
-      const bytes = data instanceof Uint8Array ? new Uint8Array(data) : new Uint8Array(data);
-      const document = await pdfJs.getDocument({ data: bytes }).promise;
+      const source = typeof data === 'string' ? { url: data } : { data: data instanceof Uint8Array ? new Uint8Array(data) : new Uint8Array(data) };
+      const document = await pdfJs.getDocument(source).promise;
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       pageTextsRef.current.clear();
       setScanWarning('');
@@ -332,14 +352,14 @@ export default function Home() {
         const updated = await window.marginDesktop.libraryUpdate(book.id, { pageCount: document.numPages, lastPage: initialPage });
         setLibrary((current) => current.map((entry) => entry.id === updated.id ? updated : entry));
       }
-      if (book && window.marginDesktop?.libraryIndexLoad) {
+      if (book && window.marginDesktop?.libraryIndexOpen) {
         try {
           const provider = createConfiguredProvider();
-          const stored = await window.marginDesktop.libraryIndexLoad(book.id, provider.id) as StoredIndexEntry[] | null;
-          if (stored?.length) {
-            vectorIndexRef.current.restore(stored, provider.dimensions);
+          const stored = await window.marginDesktop.libraryIndexOpen(book.id, provider.id);
+          if (stored) {
             embeddingProviderRef.current = provider;
-            setIndexStatus('ready'); setIndexProgress(100); setIndexMessage(`已从本地恢复 ${stored.length} 个片段`);
+            const size = `${(stored.bytes / 1024 / 1024).toFixed(1)} MB`;
+            setIndexStatus('ready'); setIndexProgress(100); setIndexMessage(`${stored.migrated ? '旧 JSON 已迁移 · ' : ''}SQLite Float32 · ${stored.chunks} 个片段 · ${size}`);
           }
         } catch { /* A changed or incomplete provider simply requires rebuilding the index. */ }
       }
@@ -354,14 +374,13 @@ export default function Home() {
 
   async function openPdf(file?: File) {
     if (!file) return;
-    const data = await file.arrayBuffer();
     try {
-      if (window.marginDesktop?.libraryImport) {
-        const entry = await window.marginDesktop.libraryImport(file.name, data);
+      if (window.marginDesktop?.libraryImportFile) {
+        const entry = await window.marginDesktop.libraryImportFile(file);
         setLibrary((current) => [entry, ...current]);
-        await loadPdf(data, entry.name, entry);
+        await loadPdf(`margin://app/library/${entry.id}/document.pdf`, entry.name, entry);
       } else {
-        await loadPdf(data, file.name);
+        await loadPdf(await file.arrayBuffer(), file.name);
       }
     } catch (reason) {
       setError(`导入书架失败：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`);
@@ -371,9 +390,9 @@ export default function Home() {
   }
 
   async function openLibraryBook(book: LibraryEntry) {
-    if (!window.marginDesktop?.libraryRead || loadingPdf) return;
+    if (!window.marginDesktop || loadingPdf) return;
     try {
-      await loadPdf(await window.marginDesktop.libraryRead(book.id), book.name, book);
+      await loadPdf(`margin://app/library/${book.id}/document.pdf`, book.name, book);
     } catch (reason) {
       setError(`无法从书架打开：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`);
     }
@@ -475,8 +494,10 @@ export default function Home() {
 
   async function buildIndex() {
     if (!pdf || indexStatus === 'indexing') return;
+    indexAbortRef.current = false;
     setError(''); setIndexStatus('indexing'); setIndexProgress(0); setIndexMessage('正在提取 PDF 文本');
     let phase = 'starting';
+    let persistentBuildStarted = false;
     window.marginDesktop?.logEvent?.('index-started', {
       bookId: activeBookId,
       fileName,
@@ -504,34 +525,72 @@ export default function Home() {
       vectorIndexRef.current.clear();
       const allChunks: RagChunk[] = [];
       let emptyPages = 0;
+      let ocrPages = 0;
+      let ocrFailures = 0;
       for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+        if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
         const pdfPage = await pdf.getPage(pageNumber);
         const content = await pdfPage.getTextContent();
-        const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ');
-        if (!text.trim()) emptyPages += 1;
+        let text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim();
+        if (!text && settings.ocrMode === 'auto' && window.marginDesktop?.ocrRecognize) {
+          phase = 'ocr';
+          setIndexMessage(`正在 OCR：第 ${pageNumber} / ${pdf.numPages} 页`);
+          const unsubscribe = window.marginDesktop.onOcrProgress?.((progress) => setIndexMessage(`正在 OCR：第 ${pageNumber} / ${pdf.numPages} 页 · ${progress.progress}%`));
+          try {
+            const image = await renderPageForOcr(pdfPage);
+            const result = await window.marginDesktop.ocrRecognize(image, settings.ocrLanguage);
+            text = result.text;
+            if (text) {
+              ocrPages += 1;
+              pageTextsRef.current.set(pageNumber, text);
+              if (pageNumber === page) setPageText(text);
+            } else ocrFailures += 1;
+          } catch (reason) {
+            ocrFailures += 1;
+            window.marginDesktop?.logEvent?.('ocr-page-failed', { bookId: activeBookId, page: pageNumber, message: reason instanceof Error ? reason.message : String(reason) }, 'error');
+          } finally {
+            unsubscribe?.();
+          }
+        }
+        if (!text) emptyPages += 1;
         allChunks.push(...chunkPage(text, pageNumber));
         setIndexProgress(Math.round((pageNumber / pdf.numPages) * 35));
-        setIndexMessage(`正在提取文本：第 ${pageNumber} / ${pdf.numPages} 页`);
+        setIndexMessage(`正在提取文本：第 ${pageNumber} / ${pdf.numPages} 页${ocrPages ? ` · OCR ${ocrPages} 页` : ''}`);
       }
-      if (allChunks.length === 0) throw new Error('这个 PDF 没有可提取文本，可能是扫描件；需要 OCR 后才能建立索引。');
-      window.marginDesktop?.logEvent?.('index-text-extracted', { bookId: activeBookId, chunks: allChunks.length, emptyPages });
+      if (allChunks.length === 0) throw new Error(settings.ocrMode === 'off' ? '这个 PDF 没有可提取文本；请在模型设置中启用 OCR。' : 'OCR 完成，但没有识别出可索引文本。请尝试切换 OCR 语言或使用更清晰的扫描件。');
+      window.marginDesktop?.logEvent?.('index-text-extracted', { bookId: activeBookId, chunks: allChunks.length, emptyPages, ocrPages, ocrFailures });
       phase = 'embedding';
       // llama.cpp exposes four embedding slots; feeding all four together keeps the
       // model busy without increasing the resident model footprint.
       const batchSize = settings.embeddingKind === 'local-qwen3-embedding-4b' ? 4 : 16;
       for (let start = 0; start < allChunks.length; start += batchSize) {
-        await vectorIndexRef.current.add(allChunks.slice(start, start + batchSize), provider);
+        if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
+        const chunks = allChunks.slice(start, start + batchSize);
+        const vectors = await provider.embed(chunks.map((chunk) => chunk.text), 'document');
+        if (vectors.length !== chunks.length || !vectors[0]?.length) throw new Error('向量模型返回了无效批次');
+        if (activeBookId && window.marginDesktop?.libraryIndexStart && window.marginDesktop.libraryIndexAppend && window.marginDesktop.libraryIndexFinish) {
+          if (!persistentBuildStarted) {
+            await window.marginDesktop.libraryIndexStart(activeBookId, provider.id, vectors[0].length);
+            persistentBuildStarted = true;
+          }
+          await window.marginDesktop.libraryIndexAppend(activeBookId, chunks.map((chunk, index) => ({ ...chunk, vector: Float32Array.from(vectors[index]) })));
+        } else {
+          vectorIndexRef.current.addVectors(chunks, vectors);
+        }
         setIndexProgress(35 + Math.round((Math.min(start + batchSize, allChunks.length) / Math.max(allChunks.length, 1)) * 65));
         setIndexMessage(`正在生成向量：${Math.min(start + batchSize, allChunks.length)} / ${allChunks.length} 个片段`);
       }
-      setScanWarning(emptyPages > 0 ? `检测到 ${emptyPages} 页没有可提取文本；这些扫描页暂未进入索引。` : '');
-      if (activeBookId && window.marginDesktop?.libraryIndexSave) {
+      setScanWarning(emptyPages > 0 ? `${ocrPages > 0 ? `OCR 已识别 ${ocrPages} 页；` : ''}仍有 ${emptyPages} 页没有可提取文本。${ocrFailures ? ` ${ocrFailures} 页识别失败。` : ''}` : ocrPages > 0 ? `OCR 已识别并索引 ${ocrPages} 个扫描页。` : '');
+      let persistedInfo;
+      if (persistentBuildStarted && activeBookId && window.marginDesktop?.libraryIndexFinish) {
         phase = 'persistence';
-        setIndexMessage('正在保存本地索引');
-        await window.marginDesktop.libraryIndexSave(activeBookId, provider.id, vectorIndexRef.current.snapshot());
+        setIndexMessage('正在完成 SQLite 索引');
+        persistedInfo = await window.marginDesktop.libraryIndexFinish(activeBookId);
+        persistentBuildStarted = false;
         await refreshLibrary();
       }
-      setIndexStatus('ready'); setIndexProgress(100); setIndexMessage(`索引完成：${allChunks.length} 个片段${activeBookId ? '，已持久化' : ''}`);
+      const storageLabel = persistedInfo ? ` · SQLite ${(persistedInfo.bytes / 1024 / 1024).toFixed(1)} MB` : '';
+      setIndexStatus('ready'); setIndexProgress(100); setIndexMessage(`索引完成：${allChunks.length} 个片段${storageLabel}${ocrPages ? ` · OCR ${ocrPages} 页` : ''}`);
       window.marginDesktop?.logEvent?.('index-succeeded', {
         bookId: activeBookId,
         providerId: provider.id,
@@ -540,11 +599,21 @@ export default function Home() {
       });
       if (settings.embeddingKind === 'local-qwen3-embedding-4b') setModelStatus(await window.marginDesktop?.modelStatus?.() ?? modelStatus);
     } catch (reason) {
+      if (persistentBuildStarted && activeBookId) await window.marginDesktop?.libraryIndexCancel?.(activeBookId).catch(() => undefined);
       const message = reason instanceof Error ? reason.message.slice(0, 180) : '未知错误';
       window.marginDesktop?.logEvent?.('index-failed', { bookId: activeBookId, phase, message }, 'error');
-      setIndexStatus('error'); setIndexMessage(message);
-      setError(`建立索引失败：${message}`);
+      if (reason instanceof DOMException && reason.name === 'AbortError') {
+        setIndexStatus('idle'); setIndexProgress(0); setIndexMessage('索引已停止，原有索引未被覆盖');
+      } else {
+        setIndexStatus('error'); setIndexMessage(message);
+        setError(`建立索引失败：${message}`);
+      }
     }
+  }
+
+  function stopIndexing() {
+    indexAbortRef.current = true;
+    setIndexMessage('正在安全停止，当前步骤完成后退出…');
   }
 
   async function askAi(event?: SyntheticEvent<HTMLFormElement>, preset?: string) {
@@ -561,9 +630,13 @@ export default function Home() {
     // thinking indicator and the scroll area keeps the composer visible.
     setMessages((current) => [...current, userMessage, assistantMessage]);
     try {
-      const matches = indexStatus === 'ready' && embeddingProviderRef.current
-        ? await vectorIndexRef.current.search(prompt, embeddingProviderRef.current, 5)
-        : [];
+      let matches: RagMatch[] = [];
+      if (indexStatus === 'ready' && embeddingProviderRef.current) {
+        if (activeBookId && window.marginDesktop?.libraryIndexSearch) {
+          const [queryVector] = await embeddingProviderRef.current.embed([prompt], 'query');
+          matches = await window.marginDesktop.libraryIndexSearch(activeBookId, embeddingProviderRef.current.id, Float32Array.from(queryVector), 5);
+        } else matches = await vectorIndexRef.current.search(prompt, embeddingProviderRef.current, 5);
+      }
       const ragContext = matches.length
         ? matches.map((match) => `[第 ${match.page} 页，相似度 ${match.score.toFixed(2)}]\n${match.text}`).join('\n\n')
         : '（尚未建立全文向量索引）';
@@ -673,6 +746,13 @@ export default function Home() {
                 </div>
                 <Label htmlFor="api-key">API Key</Label><Input id="api-key" type="password" value={settings.apiKey} onChange={(e) => { setSettings({ ...settings, apiKey: e.target.value }); setChatModelList([]); setChatModelListError(''); }} placeholder="sk-..." />
                 <Label htmlFor="system-prompt">系统提示词</Label><Textarea id="system-prompt" className="system-prompt-input" value={settings.systemPrompt} onChange={(e) => setSettings({ ...settings, systemPrompt: e.target.value })} rows={5} placeholder={DEFAULT_SETTINGS.systemPrompt} />
+                <div className="settings-divider"><span>文档识别</span></div>
+                <Label htmlFor="ocr-mode">扫描页 OCR</Label>
+                <NativeSelect id="ocr-mode" className="w-full" value={settings.ocrMode} onChange={(e) => setSettings({ ...settings, ocrMode: e.target.value as ModelSettings['ocrMode'] })}>
+                  <NativeSelectOption value="auto">自动识别无文本页面</NativeSelectOption>
+                  <NativeSelectOption value="off">关闭 OCR</NativeSelectOption>
+                </NativeSelect>
+                {settings.ocrMode === 'auto' && <><Label htmlFor="ocr-language">OCR 语言</Label><NativeSelect id="ocr-language" className="w-full" value={settings.ocrLanguage} onChange={(e) => setSettings({ ...settings, ocrLanguage: e.target.value as ModelSettings['ocrLanguage'] })}><NativeSelectOption value="chi_sim+eng">简体中文 + English</NativeSelectOption><NativeSelectOption value="chi_tra+eng">繁体中文 + English</NativeSelectOption><NativeSelectOption value="eng">English</NativeSelectOption></NativeSelect><p className="settings-note">OCR 完全在本机运行，仅处理 PDF.js 无法提取文本的页面。首次使用会初始化随应用安装的 Tesseract 字库。</p></>}
                 <div className="settings-divider"><span>向量检索</span></div>
                 <Label htmlFor="embedding-kind">向量模型</Label>
                 <NativeSelect id="embedding-kind" className="w-full" value={settings.embeddingKind} onChange={(e) => setSettings({ ...settings, embeddingKind: e.target.value as EmbeddingProviderKind })}>
@@ -748,7 +828,7 @@ export default function Home() {
           </div></div>
           {pdf && <div className={`index-strip ${indexStatus}`}>
             <div><strong>{indexStatus === 'ready' ? '全文索引已就绪' : indexStatus === 'indexing' ? `正在建立索引 ${indexProgress}%` : indexStatus === 'error' ? '索引建立失败' : '尚未建立全文索引'}</strong><span title={indexMessage}>{indexMessage || (settings.embeddingKind === 'local-qwen3-embedding-4b' ? '本地 Qwen3-Embedding-4B · Q4_K_M' : settings.embeddingModel)}</span>{indexStatus === 'indexing' && <span className="index-progress"><i style={{ width: `${indexProgress}%` }} /></span>}</div>
-            <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" disabled={indexStatus === 'indexing'} onClick={() => void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? <LoaderCircle className="spin" /> : indexStatus === 'error' ? '重试' : '建立索引'}</Button>
+            <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" onClick={() => indexStatus === 'indexing' ? stopIndexing() : void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? '停止' : indexStatus === 'error' ? '重试' : '建立索引'}</Button>
           </div>}
           {scanWarning && <p className="scan-warning">{scanWarning}</p>}
           <div className="chat-area" ref={chatAreaRef} onScroll={handleChatScroll}>

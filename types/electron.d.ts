@@ -10,7 +10,8 @@ export type LibraryEntry = {
   indexProviderId: string | null;
 };
 
-export type StoredIndexEntry = { id: string; page: number; text: string; vector: number[] };
+export type StoredIndexEntry = { id: string; page: number; text: string; vector: number[] | Float32Array };
+export type IndexInfo = { format: 'sqlite-f32'; chunks: number; dimensions: number; bytes: number; migrated?: boolean };
 export type ModelInstallStatus = { installed: boolean; loaded: boolean; missing?: string[]; model: string; root: string; backend: 'cpu' | 'vulkan'; state: string; progress: number; message: string };
 
 declare global {
@@ -30,13 +31,20 @@ declare global {
       modelUnload?: () => Promise<ModelInstallStatus>;
       modelRemove?: () => Promise<ModelInstallStatus>;
       onModelProgress?: (listener: (progress: Omit<ModelInstallStatus, 'installed' | 'model' | 'root'>) => void) => () => void;
+      ocrRecognize?: (image: Uint8Array, language: 'eng' | 'chi_sim+eng' | 'chi_tra+eng') => Promise<{ text: string; confidence: number }>;
+      onOcrProgress?: (listener: (progress: { status: string; progress: number }) => void) => () => void;
       libraryList?: () => Promise<LibraryEntry[]>;
       libraryImport?: (name: string, data: ArrayBuffer) => Promise<LibraryEntry>;
+      libraryImportFile?: (file: File) => Promise<LibraryEntry>;
       libraryRead?: (id: string) => Promise<Uint8Array>;
       libraryRemove?: (id: string) => Promise<{ removed: string }>;
       libraryUpdate?: (id: string, changes: { pageCount?: number; lastPage?: number }) => Promise<LibraryEntry>;
-      libraryIndexSave?: (id: string, providerId: string, entries: StoredIndexEntry[]) => Promise<{ saved: boolean; chunks: number }>;
-      libraryIndexLoad?: (id: string, providerId: string) => Promise<StoredIndexEntry[] | null>;
+      libraryIndexOpen?: (id: string, providerId: string) => Promise<IndexInfo | null>;
+      libraryIndexStart?: (id: string, providerId: string, dimensions: number) => Promise<{ started: boolean; format: string; dimensions: number }>;
+      libraryIndexAppend?: (id: string, entries: StoredIndexEntry[]) => Promise<{ chunks: number }>;
+      libraryIndexFinish?: (id: string) => Promise<IndexInfo>;
+      libraryIndexCancel?: (id: string) => Promise<{ cancelled: boolean }>;
+      libraryIndexSearch?: (id: string, providerId: string, vector: number[] | Float32Array, limit: number) => Promise<Array<{ id: string; page: number; text: string; score: number }>>;
     };
   }
 }
