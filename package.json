@@ -1,6 +1,6 @@
 {
   "name": "margin-pdf-reader",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local-first AI PDF reader with offline and pluggable RAG",
   "author": "Margin contributors",
   "private": true,
@@ -20,6 +20,8 @@
     "test:desktop:embedding": "node scripts/smoke-desktop.mjs tmp/pdfs/margin-reader-smoke.pdf --embedding",
     "test:ocr": "node scripts/test-local-ocr.mjs",
     "test:desktop:ocr": "node scripts/smoke-ocr-index.mjs",
+    "test:desktop:deep-reading": "node scripts/smoke-deep-reading.mjs",
+    "test:deep-reading": "node scripts/test-deep-reading.mjs",
     "benchmark:index": "node scripts/benchmark-index-store.mjs",
     "diagnose:library-index": "node scripts/diagnose-library-index.mjs",
     "docs:screenshots": "node scripts/capture-readme-screenshots.mjs",

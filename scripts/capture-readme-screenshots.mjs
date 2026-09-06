@@ -2,12 +2,13 @@ import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-const executable = path.resolve('release', 'win-unpacked', 'Margin.exe');
+const executable = process.env.MARGIN_PACKAGED_APP || path.resolve('release', 'win-unpacked', 'Margin.exe');
 const pdfPath = path.resolve('tmp', 'pdfs', 'margin-reader-smoke.pdf');
 const outputDirectory = path.resolve('docs', 'images');
 const captureRoot = path.resolve('tmp', `readme-capture-${Date.now()}`);
 const port = 9555;
 const child = spawn(executable, [
+  '--disable-gpu',
   `--remote-debugging-port=${port}`,
   `--user-data-dir=${path.join(captureRoot, 'profile')}`,
 ], {
@@ -106,6 +107,12 @@ try {
         { role: 'assistant', content: '当前页展示了一个简洁的本地 PDF 阅读示例。阅读区与页码保持同步，左侧书架保存文档进度，右侧助手可结合当前页和全文索引回答问题。', page: 1, createdAt: now }
       ]
     }]));
+    localStorage.setItem('margin-ai-settings', JSON.stringify({
+      glmOcrMode: 'auto',
+      glmOcrEndpoint: 'http://127.0.0.1:11434/v1',
+      glmOcrModel: 'glm-ocr:latest',
+      glmOcrApiKey: ''
+    }));
     window.location.reload();
   })()`);
   await retry(async () => {
@@ -127,6 +134,8 @@ try {
     if (!visible) throw new Error('Settings dialog has not opened');
     return visible;
   });
+  await evaluate(`document.querySelector('#glm-ocr-mode')?.scrollIntoView({ block: 'center' })`);
+  await delay(200);
   await capture('model-settings.png');
   console.log(`Captured README screenshots in ${outputDirectory}`);
 } finally {

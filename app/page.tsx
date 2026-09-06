@@ -12,6 +12,8 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
 import { chunkPage } from '@/lib/rag/chunk';
+import { recognizeWithGlmOcr, selectDeepReadCandidates } from '@/lib/rag/deep-reading';
+import type { DeepReadMode } from '@/lib/rag/deep-reading';
 import { MemoryVectorIndex } from '@/lib/rag/memory-index';
 import { createEmbeddingProvider } from '@/lib/rag/providers';
 import type { EmbeddingProvider, EmbeddingProviderKind, RagChunk, RagMatch } from '@/lib/rag/types';
@@ -30,6 +32,10 @@ type ModelSettings = {
   embeddingApiKey: string;
   ocrMode: 'auto' | 'off';
   ocrLanguage: 'eng' | 'chi_sim+eng' | 'chi_tra+eng';
+  glmOcrMode: DeepReadMode;
+  glmOcrEndpoint: string;
+  glmOcrModel: string;
+  glmOcrApiKey: string;
 };
 const DEFAULT_SETTINGS: ModelSettings = {
   endpoint: 'https://api.openai.com/v1', model: 'gpt-5-mini', apiKey: '',
@@ -37,8 +43,9 @@ const DEFAULT_SETTINGS: ModelSettings = {
   embeddingKind: 'local-qwen3-embedding-4b', embeddingEndpoint: 'https://api-inference.modelscope.cn/v1',
   embeddingModel: 'text-embedding-3-small', embeddingApiKey: '',
   ocrMode: 'auto', ocrLanguage: 'chi_sim+eng',
+  glmOcrMode: 'off', glmOcrEndpoint: 'http://127.0.0.1:11434/v1', glmOcrModel: 'glm-ocr:latest', glmOcrApiKey: '',
 };
-const quickPrompts = ['总结本页', '解释核心概念', '列出关键结论'];
+const quickPrompts = ['总结本页', '解释核心概念', '精读本页公式/代码'];
 const CHAT_HISTORY_KEY = 'margin-chat-history-v1';
 
 function readSavedSettings(): ModelSettings {
@@ -59,7 +66,7 @@ function readShelfCollapsed() {
   return typeof window !== 'undefined' && localStorage.getItem('margin-bookshelf-collapsed') === 'true';
 }
 
-async function renderPageForOcr(pdfPage: PDFPageProxy): Promise<Uint8Array> {
+async function renderPageImage(pdfPage: PDFPageProxy, format: 'png' | 'jpeg' = 'png'): Promise<{ bytes: Uint8Array; mimeType: string }> {
   const baseViewport = pdfPage.getViewport({ scale: 1 });
   const scale = Math.max(1.5, Math.min(2.5, 2000 / Math.max(baseViewport.width, baseViewport.height)));
   const viewport = pdfPage.getViewport({ scale });
@@ -69,10 +76,11 @@ async function renderPageForOcr(pdfPage: PDFPageProxy): Promise<Uint8Array> {
   const context = canvas.getContext('2d', { alpha: false });
   if (!context) throw new Error('无法创建 OCR 页面画布');
   await pdfPage.render({ canvas, canvasContext: context, viewport, background: '#ffffff' }).promise;
-  const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('无法编码 OCR 页面')), 'image/png'));
+  const mimeType = format === 'jpeg' ? 'image/jpeg' : 'image/png';
+  const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('无法编码识别页面')), mimeType, format === 'jpeg' ? 0.92 : undefined));
   canvas.width = 1;
   canvas.height = 1;
-  return new Uint8Array(await blob.arrayBuffer());
+  return { bytes: new Uint8Array(await blob.arrayBuffer()), mimeType };
 }
 
 type PdfPageCanvasProps = {
@@ -167,6 +175,7 @@ export default function Home() {
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const indexAbortRef = useRef(false);
+  const deepReadCacheRef = useRef(new Map<string, string>());
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [fileName, setFileName] = useState('');
   const [page, setPage] = useState(1);
@@ -185,6 +194,7 @@ export default function Home() {
   const [activeBookId, setActiveBookId] = useState<string | null>(null);
   const [modelStatus, setModelStatus] = useState<ModelInstallStatus | null>(null);
   const [scanWarning, setScanWarning] = useState('');
+  const [deepReadStatus, setDeepReadStatus] = useState('');
   const [appVersion, setAppVersion] = useState('');
   const [chatModelList, setChatModelList] = useState<string[]>([]);
   const [chatModelListLoading, setChatModelListLoading] = useState(false);
@@ -343,6 +353,8 @@ export default function Home() {
       const document = await pdfJs.getDocument(source).promise;
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       pageTextsRef.current.clear();
+      deepReadCacheRef.current.clear();
+      setDeepReadStatus(settings.glmOcrMode === 'auto' ? 'GLM-OCR 已待命，将按需精读公式、代码与表格页' : '');
       setScanWarning('');
       setIndexStatus('idle'); setIndexProgress(0); setIndexMessage('');
       const initialPage = Math.min(document.numPages, Math.max(1, book?.lastPage || 1));
@@ -423,8 +435,8 @@ export default function Home() {
       });
       if (activeBookId === book.id) {
         await pdf?.destroy();
-        vectorIndexRef.current.clear(); embeddingProviderRef.current = null; pageTextsRef.current.clear();
-        setPdf(null); setFileName(''); setPage(1); setPageCount(0); setPageText(''); setActiveBookId(null); setMessages([]); setIndexStatus('idle'); setIndexProgress(0); setIndexMessage(''); setScanWarning('');
+        vectorIndexRef.current.clear(); embeddingProviderRef.current = null; pageTextsRef.current.clear(); deepReadCacheRef.current.clear();
+        setPdf(null); setFileName(''); setPage(1); setPageCount(0); setPageText(''); setActiveBookId(null); setMessages([]); setIndexStatus('idle'); setIndexProgress(0); setIndexMessage(''); setScanWarning(''); setDeepReadStatus('');
       }
     } catch (reason) {
       setError(`移除失败：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`);
@@ -439,11 +451,16 @@ export default function Home() {
     const vectorConfigChanged = previous.embeddingKind !== settings.embeddingKind
       || previous.embeddingEndpoint !== settings.embeddingEndpoint
       || previous.embeddingModel !== settings.embeddingModel;
+    const deepReadConfigChanged = previous.glmOcrMode !== settings.glmOcrMode
+      || previous.glmOcrEndpoint !== settings.glmOcrEndpoint
+      || previous.glmOcrModel !== settings.glmOcrModel;
     localStorage.setItem('margin-ai-settings', JSON.stringify(settings));
     if (vectorConfigChanged) {
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       setIndexStatus('idle'); setIndexProgress(0); setIndexMessage('向量模型配置已变化，请重新建立索引');
     }
+    if (deepReadConfigChanged) deepReadCacheRef.current.clear();
+    setDeepReadStatus(settings.glmOcrMode === 'auto' ? 'GLM-OCR 已待命，将按需精读公式、代码与表格页' : '');
   }
 
   async function fetchChatModelList() {
@@ -537,8 +554,8 @@ export default function Home() {
           setIndexMessage(`正在 OCR：第 ${pageNumber} / ${pdf.numPages} 页`);
           const unsubscribe = window.marginDesktop.onOcrProgress?.((progress) => setIndexMessage(`正在 OCR：第 ${pageNumber} / ${pdf.numPages} 页 · ${progress.progress}%`));
           try {
-            const image = await renderPageForOcr(pdfPage);
-            const result = await window.marginDesktop.ocrRecognize(image, settings.ocrLanguage);
+            const image = await renderPageImage(pdfPage);
+            const result = await window.marginDesktop.ocrRecognize(image.bytes, settings.ocrLanguage);
             text = result.text;
             if (text) {
               ocrPages += 1;
@@ -616,6 +633,32 @@ export default function Home() {
     setIndexMessage('正在安全停止，当前步骤完成后退出…');
   }
 
+  async function createDeepReadContext(matches: RagMatch[], prompt: string) {
+    if (!pdf || settings.glmOcrMode === 'off') return '';
+    const candidates = selectDeepReadCandidates(page, pageText, matches, prompt, 2);
+    if (candidates.length === 0) {
+      setDeepReadStatus('GLM-OCR 待命 · 本次未检测到复杂页面');
+      return '';
+    }
+    setDeepReadStatus(`GLM-OCR 正在精读第 ${candidates.map((candidate) => candidate.page).join('、')} 页…`);
+    const results: string[] = [];
+    for (const candidate of candidates) {
+      const cacheKey = `${activeBookId ?? fileName}:${candidate.page}:${candidate.task}:${settings.glmOcrEndpoint}:${settings.glmOcrModel}`;
+      let recognized = deepReadCacheRef.current.get(cacheKey);
+      if (!recognized) {
+        const pdfPage = await pdf.getPage(candidate.page);
+        const image = await renderPageImage(pdfPage, 'jpeg');
+        const result = await recognizeWithGlmOcr({ endpoint: settings.glmOcrEndpoint, model: settings.glmOcrModel, apiKey: settings.glmOcrApiKey }, image.bytes, image.mimeType, candidate.task);
+        recognized = result.text;
+        deepReadCacheRef.current.set(cacheKey, recognized);
+      }
+      results.push(`[GLM-OCR 精读第 ${candidate.page} 页 · ${candidate.reasons.join('、')}]\n${recognized.slice(0, 12000)}`);
+    }
+    setDeepReadStatus(`GLM-OCR 已精读 ${candidates.length} 页 · 结果已加入回答上下文`);
+    window.marginDesktop?.logEvent?.('glm-ocr-deep-read-succeeded', { bookId: activeBookId, pages: candidates.map((candidate) => candidate.page), tasks: candidates.map((candidate) => candidate.task) });
+    return results.join('\n\n');
+  }
+
   async function askAi(event?: SyntheticEvent<HTMLFormElement>, preset?: string) {
     event?.preventDefault();
     const prompt = (preset ?? question).trim();
@@ -637,6 +680,16 @@ export default function Home() {
           matches = await window.marginDesktop.libraryIndexSearch(activeBookId, embeddingProviderRef.current.id, Float32Array.from(queryVector), 5);
         } else matches = await vectorIndexRef.current.search(prompt, embeddingProviderRef.current, 5);
       }
+      let deepReadContext = '';
+      if (settings.glmOcrMode === 'auto') {
+        try {
+          deepReadContext = await createDeepReadContext(matches, prompt);
+        } catch (reason) {
+          const message = reason instanceof Error ? reason.message.slice(0, 160) : '未知错误';
+          setDeepReadStatus(`GLM-OCR 精读失败，已回退普通检索：${message}`);
+          window.marginDesktop?.logEvent?.('glm-ocr-deep-read-failed', { bookId: activeBookId, message }, 'error');
+        }
+      }
       const ragContext = matches.length
         ? matches.map((match) => `[第 ${match.page} 页，相似度 ${match.score.toFixed(2)}]\n${match.text}`).join('\n\n')
         : '（尚未建立全文向量索引）';
@@ -648,7 +701,7 @@ export default function Home() {
           messages: [
             { role: 'system', content: settings.systemPrompt.trim() || DEFAULT_SETTINGS.systemPrompt },
             ...messages.slice(-6).map(({ role, content }) => ({ role, content })),
-            { role: 'user', content: `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\n我的问题：${prompt}` },
+            { role: 'user', content: `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。\n\n我的问题：${prompt}` },
           ],
         }),
       });
@@ -753,6 +806,18 @@ export default function Home() {
                   <NativeSelectOption value="off">关闭 OCR</NativeSelectOption>
                 </NativeSelect>
                 {settings.ocrMode === 'auto' && <><Label htmlFor="ocr-language">OCR 语言</Label><NativeSelect id="ocr-language" className="w-full" value={settings.ocrLanguage} onChange={(e) => setSettings({ ...settings, ocrLanguage: e.target.value as ModelSettings['ocrLanguage'] })}><NativeSelectOption value="chi_sim+eng">简体中文 + English</NativeSelectOption><NativeSelectOption value="chi_tra+eng">繁体中文 + English</NativeSelectOption><NativeSelectOption value="eng">English</NativeSelectOption></NativeSelect><p className="settings-note">OCR 完全在本机运行，仅处理 PDF.js 无法提取文本的页面。首次使用会初始化随应用安装的 Tesseract 字库。</p></>}
+                <div className="settings-divider"><span>公式、代码与表格精读</span></div>
+                <Label htmlFor="glm-ocr-mode">精读模型</Label>
+                <NativeSelect id="glm-ocr-mode" className="w-full" value={settings.glmOcrMode} onChange={(e) => setSettings({ ...settings, glmOcrMode: e.target.value as DeepReadMode })}>
+                  <NativeSelectOption value="off">关闭（默认）</NativeSelectOption>
+                  <NativeSelectOption value="auto">GLM-OCR · 向量命中后按需精读</NativeSelectOption>
+                </NativeSelect>
+                {settings.glmOcrMode === 'auto' && <>
+                  <Label htmlFor="glm-ocr-endpoint">GLM-OCR 端点</Label><Input id="glm-ocr-endpoint" value={settings.glmOcrEndpoint} onChange={(e) => setSettings({ ...settings, glmOcrEndpoint: e.target.value })} placeholder="http://127.0.0.1:11434/v1" />
+                  <Label htmlFor="glm-ocr-model">模型名称</Label><Input id="glm-ocr-model" value={settings.glmOcrModel} onChange={(e) => setSettings({ ...settings, glmOcrModel: e.target.value })} placeholder="glm-ocr:latest" />
+                  <Label htmlFor="glm-ocr-key">API Key（本机可留空）</Label><Input id="glm-ocr-key" type="password" value={settings.glmOcrApiKey} onChange={(e) => setSettings({ ...settings, glmOcrApiKey: e.target.value })} placeholder="自托管服务通常可留空" />
+                  <p className="settings-note">支持 GLM-OCR 的 OpenAI-compatible 服务（Ollama、vLLM 或 SGLang）。系统最多把 2 个向量命中页作为图片送去精读；远程端点会接收这些页面。<a href="https://github.com/zai-org/GLM-OCR" target="_blank" rel="noreferrer">查看官方部署说明</a></p>
+                </>}
                 <div className="settings-divider"><span>向量检索</span></div>
                 <Label htmlFor="embedding-kind">向量模型</Label>
                 <NativeSelect id="embedding-kind" className="w-full" value={settings.embeddingKind} onChange={(e) => setSettings({ ...settings, embeddingKind: e.target.value as EmbeddingProviderKind })}>
@@ -831,6 +896,7 @@ export default function Home() {
             <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" onClick={() => indexStatus === 'indexing' ? stopIndexing() : void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? '停止' : indexStatus === 'error' ? '重试' : '建立索引'}</Button>
           </div>}
           {scanWarning && <p className="scan-warning">{scanWarning}</p>}
+          {pdf && settings.glmOcrMode === 'auto' && <p className={deepReadStatus.includes('失败') ? 'deep-read-status error' : 'deep-read-status'}><Sparkles />{deepReadStatus || 'GLM-OCR 已待命 · 复杂页面将自动精读'}</p>}
           <div className="chat-area" ref={chatAreaRef} onScroll={handleChatScroll}>
             {messages.length === 0 ? <div className="chat-welcome"><MessageSquareText /><h3>我会跟着你的页码</h3><p>{pdf ? '直接提问，我会优先根据当前页原文解释。' : '打开 PDF 后，这里会自动获取你当前阅读的页面。'}</p></div> :
               <div className="messages" aria-live="polite">{messages.map((message, index) => {
@@ -842,7 +908,7 @@ export default function Home() {
             {error && <p className="error-message">{error}</p>}
             <div className="quick-prompts">{quickPrompts.map((prompt) => <button key={prompt} onClick={() => void askAi(undefined, prompt)} disabled={!pdf || asking}>{prompt}</button>)}</div>
             <form className="composer" onSubmit={(event) => void askAi(event)}><Textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void askAi(); } }} disabled={!pdf || asking} placeholder={pdf ? `针对第 ${page} 页提问…` : '请先打开 PDF'} aria-label="输入问题" /><Button type="submit" size="icon-lg" disabled={!pdf || !question.trim() || asking} aria-label="发送"><Send /></Button></form>
-            <p className="privacy-note">当前页文本仅在你提问时发送给已配置的模型。</p>
+            <p className="privacy-note">当前页文本仅在提问时发送；启用远程 GLM-OCR 后，最多 2 个命中页图片也会发送。</p>
           </div>
         </aside>
       </div>

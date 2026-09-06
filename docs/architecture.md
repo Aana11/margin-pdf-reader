@@ -25,9 +25,18 @@ An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Elec
 5. The selected embedding provider generates vectors in bounded batches (4 for local Qwen, 16 for remote providers).
 6. Each completed batch is transferred as `Float32Array` and immediately appended to SQLite.
 7. Query search streams rows from SQLite, computes cosine similarity, and retains only the best K matches.
-8. The current page and top-ranked chunks are sent to the configured chat model only after the user asks a question.
+8. When optional GLM-OCR deep reading is enabled, the renderer classifies retrieved text for formulas, code, tables, or an explicit deep-reading request. It rasterizes at most two unique candidates and sends them to the configured GLM-OCR endpoint.
+9. The current page, top-ranked chunks, and successful visual-recognition results are sent to the configured chat model only after the user asks a question.
 
-OCR runs only when PDF.js finds no text layer. Its output is used for assistant context and retrieval; version 0.2.0 does not write an invisible selectable-text layer back into the PDF.
+Tesseract OCR runs only when PDF.js finds no text layer. Its output is used for assistant context and retrieval; Margin does not write an invisible selectable-text layer back into the PDF.
+
+## Optional GLM-OCR deep reading
+
+GLM-OCR is a query-time precision layer, not a replacement for the embedding index. Vector search first supplies semantically relevant, page-addressable candidates. A deterministic classifier then chooses the official `Formula Recognition:`, `Table Recognition:`, or `Text Recognition:` task. User phrases such as “精读”, “公式”, “代码”, or “表格” explicitly request the same path.
+
+The integration uses an OpenAI-compatible multimodal `/chat/completions` endpoint, so users may run the official model through Ollama, vLLM, or SGLang. It is disabled by default, sends at most two JPEG page images per question, runs sequentially, and caches results by book/page/task/endpoint/model for the current session. A recognition error is logged and degrades to ordinary RAG instead of failing the chat request.
+
+GLM-OCR weights and its inference framework are not packaged by Margin. This keeps the installer bounded and avoids imposing a GPU, Python, or Ollama runtime on readers who do not use precision recognition. Users control whether the endpoint is local or remote; the settings UI warns that a remote service receives selected page images.
 
 ## Index storage
 
@@ -45,7 +54,7 @@ The model and llama.cpp runtime are optional downloaded resources rather than Gi
 
 ## Local state and privacy
 
-The managed PDF, catalog metadata, progress, OCR-derived index text, and SQLite vectors remain below the local Margin data root. Renderer preferences—including bookshelf collapse state, model settings, custom system prompt, and per-book chat history—use Electron browser storage. Chat history is capped per book and removed when that book is deleted.
+The managed PDF, catalog metadata, progress, OCR-derived index text, and SQLite vectors remain below the local Margin data root. Renderer preferences—including bookshelf collapse state, chat/embedding/GLM-OCR settings, custom system prompt, and per-book chat history—use Electron browser storage. Chat history is capped per book and removed when that book is deleted.
 
 Chat and embedding credentials are separate because users may choose different vendors. They are stored in the Electron browser profile, not committed to Git, and are sent only to their configured endpoint.
 
@@ -55,4 +64,5 @@ Chat and embedding credentials are separate because users may choose different v
 - Every match retains its PDF page number and source text.
 - Library removal deletes only the app-managed PDF, metadata, and indexes after explicit confirmation; the original import source is untouched.
 - OCR work is sequential to bound CPU and memory use.
+- GLM-OCR is optional, query-time only, and limited to two retrieved pages per question.
 - Exact SQLite search targets individual large books; a future cross-library or million-chunk mode may require an ANN extension.

@@ -80,6 +80,7 @@ button, input, textarea { font: inherit; }
 .index-strip.ready { background: #eff8f5; }.index-strip.error { background: #fff3f1; }.index-strip.error strong { color: #a3443c; }.index-strip.error span { color: #95635e; }
 .index-strip .index-progress { width: 100%; height: 4px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: #dbe5e4; }.index-strip .index-progress i { display: block; height: 100%; border-radius: inherit; background: #3ca697; transition: width .2s ease; }
 .scan-warning { margin: 0; padding: 7px 16px; border-bottom: 1px solid #eadfbd; background: #fff8e8; color: #8a6a27; font-size: 11px; line-height: 1.5; }
+.deep-read-status { display: flex; align-items: center; gap: 6px; margin: 0; padding: 7px 16px; border-bottom: 1px solid #d8e5e3; background: #f0f8f7; color: #337b72; font-size: 11px; line-height: 1.5; }.deep-read-status svg { width: 13px; height: 13px; flex: 0 0 auto; }.deep-read-status.error { border-bottom-color: #ead8d5; background: #fff3f1; color: #a3443c; }
 .chat-area { flex: 1; min-height: 0; overflow-y: auto; padding: 22px 18px; }
 .chat-welcome { max-width: 270px; margin: 17vh auto 0; text-align: center; }.chat-welcome > svg { width: 25px; color: #50a99e; }
 .chat-welcome h3 { margin: 14px 0 8px; font-family: Georgia, "Songti SC", serif; font-size: 19px; font-weight: 500; }.chat-welcome p { margin: 0; color: #77818b; font-size: 13px; line-height: 1.7; }
@@ -96,6 +97,7 @@ button, input, textarea { font: inherit; }
 .settings-dialog { max-width: 560px; max-height: calc(100vh - 48px); overflow-y: auto; padding: 22px; }.settings-fields { display: grid; grid-template-columns: 105px 1fr; align-items: center; gap: 13px; margin: 10px 0; }.settings-fields label { font-size: 13px; }.settings-dialog code { color: #2b8076; font-size: 12px; }.system-prompt-input { min-height: 104px; resize: vertical; font-size: 13px; line-height: 1.55; }
 .settings-divider { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; margin-top: 5px; color: #6f7d83; font-size: 12px; font-weight: 700; }.settings-divider::after { content: ''; height: 1px; flex: 1; background: #e1e6e8; }
 .settings-note { grid-column: 2; margin: -5px 0 2px; color: #849094; font-size: 11px; line-height: 1.55; }
+.settings-note a { margin-left: 4px; color: #2d8176; text-decoration: underline; text-underline-offset: 2px; }
 .model-field { display: flex; flex-direction: column; gap: 8px; }.model-field-row { display: flex; align-items: center; gap: 8px; }.model-field-row .native-select { flex: 1; }.field-error { margin: 0; color: #a43d34; font-size: 11px; }
 .model-manager { grid-column: 1 / -1; padding: 12px; border: 1px solid #dce5e5; border-radius: 10px; background: #f7faf9; }
 .model-manager-status { display: flex; align-items: center; gap: 10px; }.model-manager-status > div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.model-manager-status strong { color: #34484a; font-size: 12px; }.model-manager-status small { overflow: hidden; color: #849094; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
