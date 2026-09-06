@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   platform: process.platform,
   isDesktop: true,
   appInfo: () => ipcRenderer.invoke('app:info'),
+  openLogs: () => ipcRenderer.invoke('logs:open'),
+  logEvent: (event, details = {}, level = 'info') => ipcRenderer.send('log:renderer', { event, details, level }),
   embed: (texts) => ipcRenderer.invoke('embedding:embed', texts),
   modelStatus: () => ipcRenderer.invoke('embedding:status'),
   modelPrepare: () => ipcRenderer.invoke('model:prepare'),
@@ -24,4 +26,11 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   libraryUpdate: (id, changes) => ipcRenderer.invoke('library:update', id, changes),
   libraryIndexSave: (id, providerId, entries) => ipcRenderer.invoke('library:index-save', id, providerId, entries),
   libraryIndexLoad: (id, providerId) => ipcRenderer.invoke('library:index-load', id, providerId),
+});
+
+window.addEventListener('error', (event) => {
+  ipcRenderer.send('log:renderer', { event: 'window-error', level: 'error', details: { message: event.message, filename: event.filename, line: event.lineno, column: event.colno } });
+});
+window.addEventListener('unhandledrejection', (event) => {
+  ipcRenderer.send('log:renderer', { event: 'unhandled-rejection', level: 'error', details: { message: event.reason instanceof Error ? event.reason.message : String(event.reason) } });
 });

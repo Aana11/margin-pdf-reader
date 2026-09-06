@@ -6,12 +6,13 @@ Margin 是一个本地优先的极简 AI PDF 阅读器：导入 PDF、自动跟�
 
 - Electron Windows 桌面壳，PDF 解析与页面文本提取均在本机完成
 - 连续纵向滚动阅读，滚动位置实时同步当前页；离开视口的页面会释放 Canvas
-- 本地书架保存 PDF、阅读进度与向量索引，并支持彻底移除本地副本
+- 本地书架保存 PDF、阅读进度与向量索引，可收纳为最左侧窄栏，并支持彻底移除本地副本
 - 当前页自动同步到 AI 上下文
 - 向量索引在内存中检索并持久化到书籍目录，结果保留原始页码
 - 内置 `Qwen/Qwen3-Embedding-4B` 官方 Q4_K_M GGUF 模型适配器
 - 应用内模型管理器支持空间检查、断点续传、暂停/继续、打开目录与卸载
-- 自定义 OpenAI-compatible 对话与向量端点、模型名和独立 API Key
+- 阅读助手按书籍在本机保留提问历史，可恢复对话并跳回提问页
+- 自定义 OpenAI-compatible 对话与向量端点、模型名、系统提示词和独立 API Key
 - Hugging Face 下载失败时自动回退 ModelScope，并校验模型 SHA-256
 
 ## 开发
@@ -40,7 +41,7 @@ npm run model:bundle
 npm run desktop:release:bundled
 ```
 
-下载顺序为 Hugging Face → ModelScope → Hugging Face 国内镜像，模型与 llama.cpp Windows CPU 运行时都会验证固定 SHA-256。低内存设备建议先使用自定义 OpenAI-compatible 向量端点。GitHub 自动发布的是不含模型资源的轻量程序壳；模型安装在独立用户目录中。
+下载顺序为 Hugging Face → ModelScope → Hugging Face 国内镜像，模型与 llama.cpp Windows 运行时都会验证固定 SHA-256。有 NVIDIA GPU 时应用优先安装 Vulkan 运行时，否则使用 CPU 运行时；也可通过 `MARGIN_RUNTIME_BACKEND=cpu` 强制使用 CPU。低内存设备建议先使用自定义 OpenAI-compatible 向量端点。GitHub 自动发布的是不含模型资源的轻量程序壳；模型安装在独立用户目录中。
 
 首次启动可在“模型设置”中直接下载本地模型。未完成的下载会保留为断点文件；暂停或应用退出后再次点击“继续下载”即可恢复。
 

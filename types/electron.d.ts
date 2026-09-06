@@ -11,14 +11,16 @@ export type LibraryEntry = {
 };
 
 export type StoredIndexEntry = { id: string; page: number; text: string; vector: number[] };
-export type ModelInstallStatus = { installed: boolean; loaded: boolean; missing?: string[]; model: string; root: string; state: string; progress: number; message: string };
+export type ModelInstallStatus = { installed: boolean; loaded: boolean; missing?: string[]; model: string; root: string; backend: 'cpu' | 'vulkan'; state: string; progress: number; message: string };
 
 declare global {
   interface Window {
     marginDesktop?: {
       platform: string;
       isDesktop: boolean;
-      appInfo?: () => Promise<{ version: string; packaged: boolean }>;
+      appInfo?: () => Promise<{ version: string; packaged: boolean; logPath: string }>;
+      openLogs?: () => Promise<{ opened: boolean; path: string }>;
+      logEvent?: (event: string, details?: Record<string, unknown>, level?: 'info' | 'error') => void;
       embed?: (texts: string[]) => Promise<number[][]>;
       modelStatus?: () => Promise<ModelInstallStatus>;
       modelPrepare?: () => Promise<ModelInstallStatus>;

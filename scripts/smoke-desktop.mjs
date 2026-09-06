@@ -62,6 +62,7 @@ async function evaluate(expression, awaitPromise = false) {
 
 try {
   await command('Runtime.enable');
+  await evaluate(`document.querySelector('[aria-label="展开本地书架"]')?.click()`);
   const pdfBase64 = (await readFile(pdfPath)).toString('base64');
   await evaluate(`(() => {
     const bytes = Uint8Array.from(atob('${pdfBase64}'), character => character.charCodeAt(0));
@@ -104,6 +105,28 @@ try {
     return entries[0];
   }, 30, 500);
 
+  await evaluate(`document.querySelector('[aria-label="模型设置"]')?.click()`);
+  const settingsControls = await retry(async () => {
+    const state = await evaluate(`({
+      hasSystemPrompt: Boolean(document.querySelector('#system-prompt')),
+      promptValue: document.querySelector('#system-prompt')?.value || ''
+    })`);
+    if (!state.hasSystemPrompt || !state.promptValue.includes('阅读助手')) throw new Error('Custom system prompt control is unavailable');
+    return state;
+  });
+  await evaluate(`(() => {
+    const input = document.querySelector('#system-prompt');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(input, '自定义冒烟测试提示词');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await delay(100);
+  await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.includes('保存配置'))?.click()`);
+  const savedPrompt = await evaluate(`JSON.parse(localStorage.getItem('margin-ai-settings') || '{}').systemPrompt || ''`);
+  if (savedPrompt !== '自定义冒烟测试提示词') throw new Error('Custom system prompt did not persist');
+  await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' });
+  await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' });
+
   const modelStatus = await evaluate(`window.marginDesktop.modelStatus()`, true);
   let embeddingDimensions = null;
   let indexStatus = null;
@@ -111,9 +134,14 @@ try {
   let modelReleased = null;
   let persisted = null;
   if (testEmbedding) {
-    const vectors = await evaluate(`window.marginDesktop.embed(['A short PDF retrieval passage.'])`, true);
+    const vectors = await evaluate(`window.marginDesktop.embed([
+      'A short PDF retrieval passage.',
+      'A second passage for the local batch.',
+      '第三个用于批量向量测试的中文片段。',
+      'Fourth local embedding test passage.'
+    ])`, true);
     embeddingDimensions = vectors?.[0]?.length ?? 0;
-    if (embeddingDimensions !== 2560) throw new Error(`Unexpected embedding dimensions: ${embeddingDimensions}`);
+    if (vectors?.length !== 4 || vectors.some((vector) => vector.length !== 2560)) throw new Error(`Unexpected batched embeddings: ${vectors?.length} x ${embeddingDimensions}`);
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.includes('建立索引'))?.click()`);
     indexStatus = await retry(async () => {
       const state = await evaluate(`({
@@ -127,7 +155,30 @@ try {
     modelLoaded = await evaluate(`window.marginDesktop.modelStatus()`, true);
     if (!modelLoaded?.loaded) throw new Error('Local model process is not reported as loaded');
   }
+  const historySeed = await evaluate(`(async () => {
+    const book = (await window.marginDesktop.libraryList())[0];
+    localStorage.setItem('margin-chat-history-v1', JSON.stringify([{ bookId: book.id, bookName: book.name, updatedAt: new Date().toISOString(), messages: [
+      { role: 'user', content: '冒烟测试提问', page: 2, createdAt: new Date().toISOString() },
+      { role: 'assistant', content: '冒烟测试回答', page: 2, createdAt: new Date().toISOString() }
+    ] }]));
+    document.querySelector('[aria-label="收起本地书架"]')?.click();
+    return { bookId: book.id };
+  })()`, true);
+  await retry(async () => {
+    const collapsed = await evaluate(`document.querySelector('.workspace')?.classList.contains('shelf-collapsed')`);
+    if (!collapsed) throw new Error('Bookshelf did not collapse');
+    return collapsed;
+  });
   await evaluate(`window.location.reload()`);
+  const persistedUi = await retry(async () => {
+    const state = await evaluate(`({
+      collapsed: document.querySelector('.workspace')?.classList.contains('shelf-collapsed'),
+      hasExpand: Boolean(document.querySelector('[aria-label="展开本地书架"]'))
+    })`);
+    if (!state.collapsed || !state.hasExpand) throw new Error('Collapsed bookshelf state did not persist');
+    return state;
+  });
+  await evaluate(`document.querySelector('[aria-label="展开本地书架"]')?.click()`);
   persisted = await retry(async () => {
     const shelf = await evaluate(`({
       name: document.querySelector('.book-item strong')?.textContent || '',
@@ -136,6 +187,14 @@ try {
     if (!shelf.name.includes('margin-reader-smoke') || (testEmbedding && !shelf.indexed)) throw new Error('Bookshelf state has not persisted yet');
     return shelf;
   }, 120, 500);
+  await evaluate(`document.querySelector('[aria-label="提问历史"]')?.click()`);
+  const persistedHistory = await retry(async () => {
+    const text = await evaluate(`document.querySelector('.history-item')?.textContent || ''`);
+    if (!text.includes('冒烟测试提问') || !text.includes('第 2 页')) throw new Error('Question history did not persist');
+    return text;
+  });
+  await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' });
+  await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' });
   await evaluate(`document.querySelector('.book-item')?.click()`);
   const reopened = await retry(async () => {
     const state = await evaluate(`({
@@ -154,11 +213,11 @@ try {
   }
   await evaluate(`(() => { window.confirm = () => true; document.querySelector('.book-remove')?.click(); })()`);
   const removed = await retry(async () => {
-    const state = await evaluate(`({ books: document.querySelectorAll('.book-item').length, hasPdf: Boolean(document.querySelector('.pdf-pages')) })`);
-    if (state.books !== 0 || state.hasPdf) throw new Error('Book removal has not completed yet');
+    const state = await evaluate(`({ books: document.querySelectorAll('.book-item').length, hasPdf: Boolean(document.querySelector('.pdf-pages')), history: JSON.parse(localStorage.getItem('margin-chat-history-v1') || '[]').length })`);
+    if (state.books !== 0 || state.hasPdf || state.history !== 0) throw new Error('Book removal or history cleanup has not completed yet');
     return true;
   }, 60, 500);
-  console.log(JSON.stringify({ pageOne, pageTwo, modelStatus, embeddingDimensions, indexStatus, modelLoaded, modelReleased, persisted, reopened, removed }));
+  console.log(JSON.stringify({ pageOne, pageTwo, settingsControls, savedPrompt, modelStatus, embeddingDimensions, indexStatus, modelLoaded, modelReleased, historySeed, persistedUi, persisted, persistedHistory, reopened, removed }));
 } finally {
   await Promise.race([command('Browser.close').catch(() => undefined), delay(2_000)]);
   socket.close();
