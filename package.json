@@ -18,6 +18,7 @@
     "model:bundle": "node scripts/bundle-qwen3.mjs",
     "test:desktop": "node scripts/smoke-desktop.mjs tmp/pdfs/margin-reader-smoke.pdf",
     "test:desktop:embedding": "node scripts/smoke-desktop.mjs tmp/pdfs/margin-reader-smoke.pdf --embedding",
+    "diagnose:library-index": "node scripts/diagnose-library-index.mjs",
     "lint": "oxlint app lib scripts",
     "lint:electron": "node --check electron/main.cjs && node --check electron/preload.cjs",
     "format": "oxfmt"

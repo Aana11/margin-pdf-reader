@@ -1,8 +1,8 @@
-import type { EmbeddingProvider, RagChunk, RagMatch } from './types';
+import type { EmbeddingProvider, RagChunk, RagMatch, StoredIndexEntry } from './types';
 
-type IndexedChunk = RagChunk & { vector: number[] };
+type MemoryIndexEntry = RagChunk & { vector: Float32Array };
 
-function cosineSimilarity(a: number[], b: number[]): number {
+function cosineSimilarity(a: ArrayLike<number>, b: ArrayLike<number>): number {
   if (a.length !== b.length || a.length === 0) return 0;
   let dot = 0;
   let normA = 0;
@@ -16,16 +16,28 @@ function cosineSimilarity(a: number[], b: number[]): number {
 }
 
 export class MemoryVectorIndex {
-  private entries: IndexedChunk[] = [];
+  private entries: MemoryIndexEntry[] = [];
 
   get size() { return this.entries.length; }
   clear() { this.entries = []; }
+
+  snapshot(): StoredIndexEntry[] {
+    return this.entries.map((entry) => ({ ...entry, vector: Array.from(entry.vector) }));
+  }
+
+  restore(entries: StoredIndexEntry[], expectedDimensions: number | null): void {
+    if (!Array.isArray(entries) || entries.some((entry) => !entry || typeof entry.id !== 'string' || !Number.isInteger(entry.page) || typeof entry.text !== 'string' || !Array.isArray(entry.vector) || entry.vector.some((value) => !Number.isFinite(value)))) {
+      throw new Error('Stored vector index is invalid');
+    }
+    if (expectedDimensions && entries.some((entry) => entry.vector.length !== expectedDimensions)) throw new Error('Stored vector dimensions do not match provider');
+    this.entries = entries.map((entry) => ({ ...entry, vector: Float32Array.from(entry.vector) }));
+  }
 
   async add(chunks: RagChunk[], provider: EmbeddingProvider): Promise<void> {
     if (chunks.length === 0) return;
     const vectors = await provider.embed(chunks.map((chunk) => chunk.text), 'document');
     if (vectors.length !== chunks.length) throw new Error('Embedding provider returned an unexpected vector count');
-    this.entries.push(...chunks.map((chunk, index) => ({ ...chunk, vector: vectors[index] })));
+    this.entries.push(...chunks.map((chunk, index) => ({ ...chunk, vector: Float32Array.from(vectors[index]) })));
   }
 
   async search(query: string, provider: EmbeddingProvider, limit = 5): Promise<RagMatch[]> {
