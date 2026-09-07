@@ -2,6 +2,26 @@
 
 All notable changes to Margin are documented here.
 
+## [0.2.5] - 2026-09-07
+
+### Added
+
+- Resumable SQLite index checkpoints preserve extracted/OCR page text and completed vectors across pause, app exit, or failure. Re-indexing with another vector provider reuses compatible cached page text.
+- Built-in Ollama management for GLM-OCR: runtime/service/model detection, install link, service auto-start, model pull/preload progress, native vision requests, and explicit memory release.
+- Safe Markdown rendering for assistant answers, including GFM tables/code and KaTeX for inline and display LaTeX formulas.
+- Adaptive extraction and OCR concurrency based on available logical processors.
+
+### Changed
+
+- Index progress is monotonically increasing within a run; concurrent worker status can no longer move the progress bar backwards.
+- Removed the reading toolbar/banner. The detected current page appears briefly in a centered overlay at the bottom while scrolling.
+- Ollama GLM-OCR calls now use the official native `/api/generate` image contract from the Electron main process, avoiding renderer CORS failures. vLLM, SGLang, and remote services retain the OpenAI-compatible path.
+- “Stop” is now a safe pause: the `.building` SQLite checkpoint remains available for continuation instead of being deleted.
+
+### Fixed
+
+- Replaced the opaque `Failed to fetch` GLM-OCR fallback with actionable diagnostics for missing Ollama, stopped services, absent models, invalid endpoints, and timeouts.
+
 ## [0.2.4] - 2026-09-06
 
 ### Added

@@ -18,9 +18,9 @@ An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Elec
 
 ## OCR and RAG pipeline
 
-1. PDF.js extracts selectable text with a bounded six-page concurrency window while preserving page order.
+1. PDF.js extracts selectable text with an adaptive two-to-eight-page concurrency window while preserving page order.
 2. If a page has no text and OCR is enabled, the renderer rasterizes it to a capped offscreen canvas and transfers a PNG to the main process.
-3. A bounded pool of three Tesseract.js workers recognizes simplified Chinese plus English, traditional Chinese plus English, or English. Language data ships with the application; no OCR image leaves the machine.
+3. A bounded pool of one to four Tesseract.js workers (selected from the logical processor count) recognizes simplified Chinese plus English, traditional Chinese plus English, or English. Language data ships with the application; no OCR image leaves the machine.
 4. Text is normalized and split into overlapping, page-addressable chunks.
 5. The selected embedding provider generates vectors in bounded batches (8 for Vulkan Qwen, 4 for CPU Qwen, 16 for remote providers).
 6. Completed vectors are transferred as `Float32Array` and accumulated into SQLite transactions of at most 64 entries.
@@ -34,15 +34,15 @@ Tesseract OCR runs only when PDF.js finds no text layer. Its output is used for 
 
 GLM-OCR is a query-time precision layer, not a replacement for the embedding index. Vector search first supplies semantically relevant, page-addressable candidates. A deterministic classifier then chooses the official `Formula Recognition:`, `Table Recognition:`, or `Text Recognition:` task. User phrases such as “精读”, “公式”, “代码”, or “表格” explicitly request the same path.
 
-The integration uses an OpenAI-compatible multimodal `/chat/completions` endpoint, so users may run the official model through Ollama, vLLM, or SGLang. It is disabled by default, sends at most two JPEG page images per question, runs sequentially, and caches results by book/page/task/endpoint/model for the current session. A recognition error is logged and degrades to ordinary RAG instead of failing the chat request.
+GLM requests cross the context-isolated preload bridge and execute in the Electron main process, avoiding renderer CORS restrictions. Ollama mode follows the official native `/api/generate` vision contract; vLLM, SGLang, and remote providers use multimodal `/chat/completions`. The feature is disabled by default, sends at most two JPEG page images per question, runs sequentially, and caches results by book/page/task/provider/endpoint/model for the current session. A recognition error is logged with an actionable service/runtime/model diagnosis and degrades to ordinary RAG instead of failing the chat request.
 
-GLM-OCR weights and its inference framework are not packaged by Margin. This keeps the installer bounded and avoids imposing a GPU, Python, or Ollama runtime on readers who do not use precision recognition. Users control whether the endpoint is local or remote; the settings UI warns that a remote service receives selected page images.
+GLM-OCR weights and Ollama are not packaged by Margin. The settings UI detects an installed Ollama runtime and running service, opens the official installer when absent, starts `ollama serve` when allowed, streams `/api/pull` progress, preloads the model, and can unload it with `keep_alive: 0`. Existing user-managed services are not terminated. Users control whether the endpoint is local or remote; the settings UI warns that a remote service receives selected page images.
 
 ## Index storage
 
 Each completed book index is stored beside the managed PDF as `index.sqlite`. Metadata records the schema version, provider identity, vector dimensions, completion state, and timestamps. Chunk rows contain page, ordinal, text, norm, and a little-endian Float32 BLOB.
 
-Builds write to `index.sqlite.building` and replace the previous database only after a successful commit and close. Stopping or failing a build removes the temporary database and preserves the last complete index. A version-1 `index.json` is migrated on first open; the JSON source is deleted only after the SQLite replacement succeeds.
+Builds write to `index.sqlite.building` and replace the previous database only after a successful commit and close. The building database contains page-text checkpoints (including whether text came from PDF.js or OCR) and completed vector rows. Pause, process exit, and recoverable failure close but retain this database; the next compatible run resumes missing pages/chunks. A completed index also retains page text so changing only the vector provider can reuse compatible OCR work. A version-1 `index.json` is migrated on first open; the JSON source is deleted only after the SQLite replacement succeeds.
 
 Provider identity remains an invariant: an index opens only when its embedding provider/model/version matches the current selection. Search stays in the main process so the renderer does not deserialize or retain every vector. Measured results and the reproducible command are in [`index-benchmark.md`](index-benchmark.md).
 

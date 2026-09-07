@@ -25,6 +25,16 @@ contextBridge.exposeInMainWorld('marginDesktop', {
     ipcRenderer.on('ocr:progress', handler);
     return () => ipcRenderer.removeListener('ocr:progress', handler);
   },
+  glmOcrStatus: (config) => ipcRenderer.invoke('glm:status', config),
+  glmOcrPrepare: (config) => ipcRenderer.invoke('glm:prepare', config),
+  glmOcrRecognize: (payload) => ipcRenderer.invoke('glm:recognize', payload),
+  glmOcrUnload: (config) => ipcRenderer.invoke('glm:unload', config),
+  glmOcrOpenInstall: () => ipcRenderer.invoke('glm:open-install'),
+  onGlmOcrProgress: (listener) => {
+    const handler = (_event, progress) => listener(progress);
+    ipcRenderer.on('glm:progress', handler);
+    return () => ipcRenderer.removeListener('glm:progress', handler);
+  },
   libraryList: () => ipcRenderer.invoke('library:list'),
   libraryImport: (name, data) => ipcRenderer.invoke('library:import', { name, data }),
   libraryImportFile: async (file) => {
@@ -36,7 +46,8 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   libraryRemove: (id) => ipcRenderer.invoke('library:remove', id),
   libraryUpdate: (id, changes) => ipcRenderer.invoke('library:update', id, changes),
   libraryIndexOpen: (id, providerId) => ipcRenderer.invoke('library:index-open', id, providerId),
-  libraryIndexStart: (id, providerId, dimensions) => ipcRenderer.invoke('library:index-start', id, providerId, dimensions),
+  libraryIndexStart: (id, providerId, dimensions, buildKey) => ipcRenderer.invoke('library:index-start', id, providerId, dimensions, buildKey),
+  libraryIndexSavePages: (id, entries) => ipcRenderer.invoke('library:index-save-pages', id, entries),
   libraryIndexAppend: (id, entries) => ipcRenderer.invoke('library:index-append', id, entries),
   libraryIndexFinish: (id) => ipcRenderer.invoke('library:index-finish', id),
   libraryIndexCancel: (id) => ipcRenderer.invoke('library:index-cancel', id),

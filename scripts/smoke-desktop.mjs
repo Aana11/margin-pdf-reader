@@ -85,15 +85,17 @@ try {
   await command('DOM.setFileInputFiles', { files: [pdfPath], nodeId: fileInput.nodeId });
   const pageOne = await retry(async () => {
     const state = await evaluate(`({
-      page: document.querySelector('.page-label')?.textContent || '',
+      page: document.querySelector('.page-scroll-indicator')?.textContent || '',
       canvasWidth: document.querySelector('canvas')?.width || 0,
       canvasCount: document.querySelectorAll('.pdf-page canvas').length,
       scrollHeight: document.querySelector('.canvas-wrap')?.scrollHeight || 0,
       clientHeight: document.querySelector('.canvas-wrap')?.clientHeight || 0,
+      hasReadingBanner: Boolean(document.querySelector('.reader-toolbar')),
+      hasPageIndicator: Boolean(document.querySelector('.page-scroll-indicator')),
       error: document.querySelector('.error-message')?.textContent || ''
     })`);
     if (state.error) throw new Error(state.error);
-    if (!state.page.includes('1 / 2') || state.canvasWidth <= 1 || state.canvasCount !== 2 || state.scrollHeight <= state.clientHeight) throw new Error(`Page 1 or scroll region has not rendered yet: ${JSON.stringify(state)}`);
+    if (!state.page.includes('1 / 2') || state.canvasWidth <= 1 || state.canvasCount !== 2 || state.scrollHeight <= state.clientHeight || state.hasReadingBanner || !state.hasPageIndicator) throw new Error(`Page 1 or scroll region has not rendered yet: ${JSON.stringify(state)}`);
     return state;
   }, 120, 500);
   for (let index = 0; index < 4; index += 1) {
@@ -102,11 +104,12 @@ try {
   }
   const pageTwo = await retry(async () => {
     const state = await evaluate(`({
-      page: document.querySelector('.page-label')?.textContent || '',
+      page: document.querySelector('.page-scroll-indicator')?.textContent || '',
       synced: document.querySelector('.ai-heading p')?.textContent || '',
-      canvasWidth: document.querySelector('.pdf-page[data-page="2"] canvas')?.width || 0
+      canvasWidth: document.querySelector('.pdf-page[data-page="2"] canvas')?.width || 0,
+      indicatorVisible: document.querySelector('.page-scroll-indicator')?.classList.contains('visible') || false
     })`);
-    if (!state.page.includes('2 / 2') || !state.synced.includes('2') || state.canvasWidth <= 1) throw new Error('Page 2 has not rendered yet');
+    if (!state.page.includes('2 / 2') || !state.synced.includes('2') || state.canvasWidth <= 1 || !state.indicatorVisible) throw new Error('Page 2 has not rendered yet');
     return state;
   }, 120, 500);
   const ocrImageBase64 = (await readFile(path.resolve('docs', 'images', 'reader-overview.png'))).toString('base64');
@@ -216,7 +219,7 @@ try {
   await evaluate(`document.querySelector('.book-item')?.click()`);
   const reopened = await retry(async () => {
     const state = await evaluate(`({
-      page: document.querySelector('.page-label')?.textContent || '',
+      page: document.querySelector('.page-scroll-indicator')?.textContent || '',
       canvasWidth: document.querySelector('.pdf-page[data-page="2"] canvas')?.width || 0,
       index: document.querySelector('.index-strip strong')?.textContent || '',
       error: document.querySelector('.error-message')?.textContent || ''
