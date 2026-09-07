@@ -2,6 +2,20 @@
 
 All notable changes to Margin are documented here.
 
+## [0.2.6] - 2026-09-08
+
+### Added
+
+- Application-managed GLM-OCR using the official community GGUF main model and multimodal projector through the same pinned llama.cpp runtime used by local embeddings.
+- Resumable, checksum-verified GLM-OCR download with pause/continue, model-folder access, explicit memory release, and uninstall controls.
+- Automatic migration from the former default Ollama setting to the managed local provider; existing Ollama and OpenAI-compatible endpoints remain available as advanced options.
+
+### Changed
+
+- Local GLM-OCR no longer requires users to install Ollama or Python. Margin starts a loopback-only sidecar on demand and stops it after five idle minutes.
+- The embedding and GLM-OCR sidecars now release one another before startup, avoiding simultaneous GPU-memory pressure.
+- Updated the shared llama.cpp CPU/Vulkan runtime to build `b10516`, with a version marker that repairs outdated local runtimes automatically.
+
 ## [0.2.5] - 2026-09-07
 
 ### Added

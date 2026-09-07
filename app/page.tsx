@@ -50,14 +50,18 @@ const DEFAULT_SETTINGS: ModelSettings = {
   embeddingKind: 'local-qwen3-embedding-4b', embeddingEndpoint: 'https://api-inference.modelscope.cn/v1',
   embeddingModel: 'text-embedding-3-small', embeddingApiKey: '',
   ocrMode: 'auto', ocrLanguage: 'chi_sim+eng',
-  glmOcrMode: 'off', glmOcrProvider: 'ollama', glmOcrEndpoint: 'http://127.0.0.1:11434', glmOcrModel: 'glm-ocr:latest', glmOcrApiKey: '', glmOcrAutoStart: true,
+  glmOcrMode: 'off', glmOcrProvider: 'managed', glmOcrEndpoint: '', glmOcrModel: 'ggml-org/GLM-OCR-GGUF', glmOcrApiKey: '', glmOcrAutoStart: true,
 };
 const quickPrompts = ['总结本页', '解释核心概念', '精读本页公式/代码'];
 const CHAT_HISTORY_KEY = 'margin-chat-history-v1';
 
 function readSavedSettings(): ModelSettings {
   if (typeof window === 'undefined') return DEFAULT_SETTINGS;
-  try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem('margin-ai-settings') ?? '{}') }; }
+  try {
+    const saved = JSON.parse(localStorage.getItem('margin-ai-settings') ?? '{}');
+    const migrated = localStorage.getItem('margin-settings-schema') === '2' ? saved : { ...saved, glmOcrProvider: 'managed', glmOcrEndpoint: '', glmOcrModel: 'ggml-org/GLM-OCR-GGUF' };
+    return { ...DEFAULT_SETTINGS, ...migrated };
+  }
   catch { return DEFAULT_SETTINGS; }
 }
 
@@ -214,6 +218,7 @@ export default function Home() {
   const indexProgressRef = useRef(0);
   const pageIndicatorTimerRef = useRef<number | null>(null);
   const deepReadCacheRef = useRef(new Map<string, string>());
+  const activeBookIdRef = useRef<string | null>(null);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [fileName, setFileName] = useState('');
   const [page, setPage] = useState(1);
@@ -436,7 +441,8 @@ export default function Home() {
       setScanWarning('');
       setIndexStatus('idle'); setIndexProgress(0); setIndexMessage(''); setHasIndexCheckpoint(false);
       const initialPage = Math.min(document.numPages, Math.max(1, book?.lastPage || 1));
-      setPdf(document); setFileName(name); setPageCount(document.numPages); setPage(initialPage); setActiveBookId(book?.id || null);
+      activeBookIdRef.current = book?.id || null;
+      setPdf(document); setFileName(name); setPageCount(document.numPages); setPage(initialPage); setActiveBookId(activeBookIdRef.current);
       setMessages(book ? chatHistory.find((entry) => entry.bookId === book.id)?.messages ?? [] : []);
       if (book && window.marginDesktop?.libraryUpdate) {
         const updated = await window.marginDesktop.libraryUpdate(book.id, { pageCount: document.numPages, lastPage: initialPage });
@@ -513,10 +519,12 @@ export default function Home() {
         localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(next));
         return next;
       });
-      if (activeBookId === book.id) {
-        await pdf?.destroy();
+      window.marginDesktop?.logEvent?.('library-remove-ui', { bookId: book.id, activeBookId, activeBookIdRef: activeBookIdRef.current, fileName, bookName: book.name });
+      if (activeBookIdRef.current === book.id || activeBookId === book.id || fileName === book.name) {
         vectorIndexRef.current.clear(); embeddingProviderRef.current = null; pageTextsRef.current.clear(); deepReadCacheRef.current.clear();
+        activeBookIdRef.current = null;
         setPdf(null); setFileName(''); setPage(1); setPageCount(0); setPageText(''); setActiveBookId(null); setMessages([]); setIndexStatus('idle'); setIndexProgress(0); setIndexMessage(''); setScanWarning(''); setDeepReadStatus('');
+        void pdf?.destroy().catch(() => undefined);
       }
     } catch (reason) {
       setError(`移除失败：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`);
@@ -536,6 +544,7 @@ export default function Home() {
       || previous.glmOcrEndpoint !== settings.glmOcrEndpoint
       || previous.glmOcrModel !== settings.glmOcrModel;
     localStorage.setItem('margin-ai-settings', JSON.stringify(settings));
+    localStorage.setItem('margin-settings-schema', '2');
     if (vectorConfigChanged) {
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       setIndexStatus('idle'); setIndexProgress(0); setIndexMessage('向量模型配置已变化，请重新建立索引');
@@ -606,6 +615,12 @@ export default function Home() {
     if (!window.marginDesktop?.glmOcrUnload) return;
     try { setGlmOcrStatus(await window.marginDesktop.glmOcrUnload(glmConfig())); }
     catch (reason) { setError(`释放 GLM-OCR 失败：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`); }
+  }
+
+  async function removeGlmModel() {
+    if (!window.marginDesktop?.glmOcrRemove || !window.confirm('确认卸载本地 GLM-OCR？向量索引和阅读记录不会被删除。')) return;
+    setGlmOcrStatus(await window.marginDesktop.glmOcrRemove(glmConfig()));
+    deepReadCacheRef.current.clear();
   }
 
   async function buildIndex() {
@@ -1017,20 +1032,22 @@ export default function Home() {
                 {settings.glmOcrMode === 'auto' && <>
                   <Label htmlFor="glm-ocr-provider">运行方式</Label><NativeSelect id="glm-ocr-provider" className="w-full" value={settings.glmOcrProvider} onChange={(e) => {
                     const provider = e.target.value as GlmOcrProvider;
-                    setSettings({ ...settings, glmOcrProvider: provider, glmOcrEndpoint: provider === 'ollama' ? 'http://127.0.0.1:11434' : settings.glmOcrEndpoint });
-                  }}><NativeSelectOption value="ollama">本机 Ollama（可自动启停）</NativeSelectOption><NativeSelectOption value="openai-compatible">vLLM / SGLang / 远程兼容端点</NativeSelectOption></NativeSelect>
-                  <Label htmlFor="glm-ocr-endpoint">GLM-OCR 端点</Label><Input id="glm-ocr-endpoint" value={settings.glmOcrEndpoint} onChange={(e) => setSettings({ ...settings, glmOcrEndpoint: e.target.value })} placeholder={settings.glmOcrProvider === 'ollama' ? 'http://127.0.0.1:11434' : 'http://127.0.0.1:8080/v1'} />
-                  <Label htmlFor="glm-ocr-model">模型名称</Label><Input id="glm-ocr-model" value={settings.glmOcrModel} onChange={(e) => setSettings({ ...settings, glmOcrModel: e.target.value })} placeholder="glm-ocr:latest" />
+                    setSettings({ ...settings, glmOcrProvider: provider, glmOcrEndpoint: provider === 'managed' ? '' : provider === 'ollama' ? 'http://127.0.0.1:11434' : settings.glmOcrEndpoint, glmOcrModel: provider === 'managed' ? 'ggml-org/GLM-OCR-GGUF' : provider === 'ollama' ? 'glm-ocr:latest' : settings.glmOcrModel });
+                  }}><NativeSelectOption value="managed">应用托管本地模型（推荐）</NativeSelectOption><NativeSelectOption value="openai-compatible">vLLM / SGLang / 远程兼容端点</NativeSelectOption><NativeSelectOption value="ollama">已有 Ollama 服务（高级）</NativeSelectOption></NativeSelect>
+                  {settings.glmOcrProvider !== 'managed' && <><Label htmlFor="glm-ocr-endpoint">GLM-OCR 端点</Label><Input id="glm-ocr-endpoint" value={settings.glmOcrEndpoint} onChange={(e) => setSettings({ ...settings, glmOcrEndpoint: e.target.value })} placeholder={settings.glmOcrProvider === 'ollama' ? 'http://127.0.0.1:11434' : 'http://127.0.0.1:8080/v1'} />
+                  <Label htmlFor="glm-ocr-model">模型名称</Label><Input id="glm-ocr-model" value={settings.glmOcrModel} onChange={(e) => setSettings({ ...settings, glmOcrModel: e.target.value })} placeholder="glm-ocr:latest" /></>}
                   {settings.glmOcrProvider === 'openai-compatible' && <><Label htmlFor="glm-ocr-key">API Key（本机可留空）</Label><Input id="glm-ocr-key" type="password" value={settings.glmOcrApiKey} onChange={(e) => setSettings({ ...settings, glmOcrApiKey: e.target.value })} placeholder="自托管服务通常可留空" /></>}
-                  {settings.glmOcrProvider === 'ollama' && <><Label htmlFor="glm-auto-start">自动开启</Label><label className="checkbox-field"><input id="glm-auto-start" type="checkbox" checked={settings.glmOcrAutoStart} onChange={(event) => setSettings({ ...settings, glmOcrAutoStart: event.target.checked })} />提问需要精读时自动启动 Ollama 服务</label></>}
-                  <p className="settings-note">Ollama 使用官方推荐的原生 <code>/api/generate</code> 视觉接口；vLLM/SGLang 使用 <code>/v1/chat/completions</code>。系统最多发送 2 个候选页。<a href="https://github.com/zai-org/GLM-OCR" target="_blank" rel="noreferrer">查看官方部署说明</a></p>
-                  {settings.glmOcrProvider === 'ollama' && <div className="model-manager glm-manager">
-                    <div className="model-manager-status"><span className={glmOcrStatus?.modelLoaded ? 'status-dot online' : 'status-dot'} /><div><strong>{glmOcrStatus?.modelLoaded ? 'GLM-OCR 已载入内存' : glmOcrStatus?.modelInstalled ? 'GLM-OCR 已准备好' : glmOcrStatus?.runtimeInstalled ? 'Ollama 已安装，模型未准备' : '这台电脑尚未安装 Ollama'}</strong><small>{glmOcrStatus?.message || '安装 Ollama 后可由 Margin 自动启动并管理 glm-ocr:latest'}</small></div></div>
-                    {glmOcrStatus && ['starting', 'downloading', 'loading'].includes(glmOcrStatus.state) && <div className="model-progress"><i style={{ width: `${glmOcrStatus.progress}%` }} /></div>}
+                  {settings.glmOcrProvider !== 'openai-compatible' && <><Label htmlFor="glm-auto-start">自动开启</Label><label className="checkbox-field"><input id="glm-auto-start" type="checkbox" checked={settings.glmOcrAutoStart} onChange={(event) => setSettings({ ...settings, glmOcrAutoStart: event.target.checked })} />提问需要精读时自动载入模型</label></>}
+                  <p className="settings-note">推荐模式使用与向量模型一致的应用托管 llama.cpp 运行时，无需安装 Ollama 或 Python；模型约 1.4 GB，按需下载。系统最多精读 2 个候选页。<a href="https://github.com/zai-org/GLM-OCR" target="_blank" rel="noreferrer">查看 GLM-OCR</a></p>
+                  {settings.glmOcrProvider !== 'openai-compatible' && <div className="model-manager glm-manager">
+                    <div className="model-manager-status"><span className={glmOcrStatus?.modelLoaded ? 'status-dot online' : 'status-dot'} /><div><strong>{glmOcrStatus?.modelLoaded ? 'GLM-OCR 已载入内存' : glmOcrStatus?.modelInstalled ? 'GLM-OCR 已准备好' : glmOcrStatus?.state === 'paused' ? '下载已暂停' : settings.glmOcrProvider === 'managed' ? '尚未安装本地 GLM-OCR' : glmOcrStatus?.runtimeInstalled ? 'Ollama 已安装，模型未准备' : '系统未检测到 Ollama'}</strong><small>{glmOcrStatus?.message || (settings.glmOcrProvider === 'managed' ? 'Margin 自动管理 GGUF 模型、多模态投影器和运行时' : '仅供已经配置 Ollama 的高级用户使用')}</small></div></div>
+                    {glmOcrStatus && ['checking', 'starting', 'downloading', 'installing', 'loading'].includes(glmOcrStatus.state) && <div className="model-progress"><i style={{ width: `${glmOcrStatus.progress}%` }} /></div>}
                     <div className="model-manager-actions">
-                      {!glmOcrStatus?.runtimeInstalled && <Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.glmOcrOpenInstall?.()}>安装 Ollama</Button>}
-                      <Button size="sm" variant="outline" onClick={() => void prepareGlmModel()} disabled={['starting', 'downloading', 'loading'].includes(glmOcrStatus?.state || '')}>{glmOcrStatus?.modelInstalled ? '启动并载入' : '准备模型'}</Button>
+                      {settings.glmOcrProvider === 'ollama' && !glmOcrStatus?.runtimeInstalled && <Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.glmOcrOpenInstall?.()}>Ollama 下载页</Button>}
+                      {settings.glmOcrProvider === 'managed' && glmOcrStatus?.state === 'downloading' && <Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.glmOcrPause?.()}>暂停</Button>}
+                      {glmOcrStatus?.state !== 'downloading' && <Button size="sm" variant="outline" onClick={() => void prepareGlmModel()} disabled={['starting', 'loading', 'installing', 'checking'].includes(glmOcrStatus?.state || '')}>{glmOcrStatus?.modelInstalled ? '启动并载入' : glmOcrStatus?.state === 'paused' ? '继续下载' : '下载并安装'}</Button>}
                       {glmOcrStatus?.modelLoaded && <Button size="sm" variant="ghost" onClick={() => void releaseGlmModel()}>释放显存</Button>}
+                      {settings.glmOcrProvider === 'managed' && glmOcrStatus?.modelInstalled && <><Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.glmOcrOpenFolder?.()}>打开目录</Button><Button size="sm" variant="ghost" onClick={() => void removeGlmModel()}>卸载</Button></>}
                     </div>
                   </div>}
                 </>}
