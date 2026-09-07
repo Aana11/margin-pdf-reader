@@ -12,7 +12,11 @@ export type LibraryEntry = {
 
 export type StoredIndexEntry = { id: string; page: number; text: string; vector: number[] | Float32Array };
 export type IndexInfo = { format: 'sqlite-f32'; chunks: number; dimensions: number; bytes: number; migrated?: boolean };
+export type IndexCheckpoint = { started: boolean; format: 'sqlite-f32'; resumed: boolean; dimensions: number; chunks: number; pages: Array<{ page: number; text: string; source: 'pdf' | 'ocr' }>; completedChunkIds: string[] };
 export type ModelInstallStatus = { installed: boolean; loaded: boolean; missing?: string[]; model: string; root: string; backend: 'cpu' | 'vulkan'; state: string; progress: number; message: string };
+export type GlmOcrProvider = 'ollama' | 'openai-compatible';
+export type GlmOcrStatus = { provider: GlmOcrProvider; runtimeInstalled: boolean; serviceRunning: boolean | null; modelInstalled: boolean | null; modelLoaded: boolean | null; state: string; progress: number; message: string; error?: string };
+export type GlmOcrConfig = { provider: GlmOcrProvider; endpoint: string; model: string; apiKey: string; autoStart: boolean };
 
 declare global {
   interface Window {
@@ -33,6 +37,12 @@ declare global {
       onModelProgress?: (listener: (progress: Omit<ModelInstallStatus, 'installed' | 'model' | 'root'>) => void) => () => void;
       ocrRecognize?: (image: Uint8Array, language: 'eng' | 'chi_sim+eng' | 'chi_tra+eng', page?: number) => Promise<{ text: string; confidence: number }>;
       onOcrProgress?: (listener: (progress: { page: number; status: string; progress: number }) => void) => () => void;
+      glmOcrStatus?: (config: GlmOcrConfig) => Promise<GlmOcrStatus>;
+      glmOcrPrepare?: (config: GlmOcrConfig) => Promise<GlmOcrStatus>;
+      glmOcrRecognize?: (payload: GlmOcrConfig & { image: Uint8Array; mimeType: string; task: 'text' | 'formula' | 'table' }) => Promise<{ text: string; task: 'text' | 'formula' | 'table' }>;
+      glmOcrUnload?: (config: GlmOcrConfig) => Promise<GlmOcrStatus>;
+      glmOcrOpenInstall?: () => Promise<{ opened: boolean }>;
+      onGlmOcrProgress?: (listener: (progress: Partial<GlmOcrStatus>) => void) => () => void;
       libraryList?: () => Promise<LibraryEntry[]>;
       libraryImport?: (name: string, data: ArrayBuffer) => Promise<LibraryEntry>;
       libraryImportFile?: (file: File) => Promise<LibraryEntry>;
@@ -40,10 +50,11 @@ declare global {
       libraryRemove?: (id: string) => Promise<{ removed: string }>;
       libraryUpdate?: (id: string, changes: { pageCount?: number; lastPage?: number }) => Promise<LibraryEntry>;
       libraryIndexOpen?: (id: string, providerId: string) => Promise<IndexInfo | null>;
-      libraryIndexStart?: (id: string, providerId: string, dimensions: number) => Promise<{ started: boolean; format: string; dimensions: number }>;
+      libraryIndexStart?: (id: string, providerId: string, dimensions?: number, buildKey?: string) => Promise<IndexCheckpoint>;
+      libraryIndexSavePages?: (id: string, entries: Array<{ page: number; text: string; source: 'pdf' | 'ocr' }>) => Promise<{ pages: number }>;
       libraryIndexAppend?: (id: string, entries: StoredIndexEntry[]) => Promise<{ chunks: number }>;
       libraryIndexFinish?: (id: string) => Promise<IndexInfo>;
-      libraryIndexCancel?: (id: string) => Promise<{ cancelled: boolean }>;
+      libraryIndexCancel?: (id: string) => Promise<{ cancelled: boolean; resumable?: boolean }>;
       libraryIndexSearch?: (id: string, providerId: string, vector: number[] | Float32Array, limit: number) => Promise<Array<{ id: string; page: number; text: string; score: number }>>;
     };
   }

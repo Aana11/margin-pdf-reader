@@ -78,7 +78,7 @@ try {
     return Boolean(row);
   })()`).then((found) => { if (!found) throw new Error('Bookshelf dialog is not ready'); return found; }));
   await retry(async () => {
-    const state = await evaluate(`({ page: document.querySelector('.page-label')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`);
+    const state = await evaluate(`({ page: document.querySelector('.page-scroll-indicator')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`);
     if (state.error) throw new Error(state.error);
     if (!state.page.includes(`/ ${book.pageCount}`)) throw new Error(`PDF has not opened: ${state.page}`);
     return state;

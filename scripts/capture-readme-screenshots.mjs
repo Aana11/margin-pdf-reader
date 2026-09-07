@@ -68,7 +68,7 @@ async function evaluate(expression, awaitPromise = false) {
 }
 
 async function capture(fileName) {
-  const result = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false, fromSurface: true });
+  const result = await command('Page.captureScreenshot', { format: 'jpeg', quality: 88, captureBeyondViewport: false, fromSurface: true });
   await writeFile(path.join(outputDirectory, fileName), Buffer.from(result.data, 'base64'));
 }
 
@@ -89,7 +89,7 @@ try {
   })()`);
   const book = await retry(async () => {
     const state = await evaluate(`(async () => ({
-      page: document.querySelector('.page-label')?.textContent || '',
+      page: document.querySelector('.page-scroll-indicator')?.textContent || '',
       entries: await window.marginDesktop.libraryList()
     }))()`, true);
     if (!state.entries.some((entry) => entry.name.includes('Margin-Reader-Demo')) || !state.page.includes('1 / 2')) throw new Error('Demo PDF has not opened');
@@ -108,9 +108,11 @@ try {
     }]));
     localStorage.setItem('margin-ai-settings', JSON.stringify({
       glmOcrMode: 'auto',
-      glmOcrEndpoint: 'http://127.0.0.1:11434/v1',
+      glmOcrProvider: 'ollama',
+      glmOcrEndpoint: 'http://127.0.0.1:11434',
       glmOcrModel: 'glm-ocr:latest',
-      glmOcrApiKey: ''
+      glmOcrApiKey: '',
+      glmOcrAutoStart: true
     }));
     window.location.reload();
   })()`);
@@ -122,11 +124,11 @@ try {
   await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
   await evaluate(`document.querySelector('.book-item')?.click()`);
   await retry(async () => {
-    const state = await evaluate(`({ page: document.querySelector('.page-label')?.textContent || '', messages: document.querySelectorAll('.message').length })`);
+    const state = await evaluate(`({ page: document.querySelector('.page-scroll-indicator')?.textContent || '', messages: document.querySelectorAll('.message').length })`);
     if (!state.page.includes('1 / 2') || state.messages !== 2) throw new Error('Demo reader has not restored');
     return state;
   });
-  await capture('reader-overview.png');
+  await capture('reader-overview.jpg');
 
   await evaluate(`document.querySelector('[aria-label="模型设置"]')?.click()`);
   await retry(async () => {
@@ -136,7 +138,7 @@ try {
   });
   await evaluate(`document.querySelector('#glm-ocr-mode')?.scrollIntoView({ block: 'center' })`);
   await delay(200);
-  await capture('model-settings.png');
+  await capture('model-settings.jpg');
   console.log(`Captured README screenshots in ${outputDirectory}`);
 } finally {
   await Promise.race([command('Browser.close').catch(() => undefined), delay(2_000)]);

@@ -9,7 +9,7 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { Readable, Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
-const { appendIndexBatch, cancelIndexBuild, finishIndexBuild, openIndex, searchIndex, startIndexBuild } = require('./index-store.cjs');
+const { appendIndexBatch, finishIndexBuild, getIndexCheckpoint, openIndex, pauseIndexBuild, saveIndexPages, searchIndex, startIndexBuild } = require('./index-store.cjs');
 
 const isDevelopment = !app.isPackaged;
 const embeddingModel = 'Qwen/Qwen3-Embedding-4B';
@@ -31,11 +31,13 @@ let modelDownloadController;
 let modelInstallState = { state: 'idle', progress: 0, message: '' };
 let runtimeRepairPromise;
 let logQueue = Promise.resolve();
-const OCR_WORKER_COUNT = 3;
+const OCR_WORKER_COUNT = Math.max(1, Math.min(4, Math.floor(os.cpus().length / 4)));
 let ocrWorkerLanguage;
 let ocrWorkerSlots = [];
 let ocrPoolSetupPromise;
 const indexBuilds = new Map();
+let ollamaProcess;
+let glmPreparePromise;
 
 app.setName('Margin');
 
@@ -474,8 +476,217 @@ async function getModelStatus() {
   return { installed: false, loaded: false, missing, model: embeddingModel, root: dataRoot(), backend: runtimeBackend, ...modelInstallState };
 }
 
+const glmTaskPrompts = {
+  text: 'Text Recognition:',
+  formula: 'Formula Recognition:',
+  table: 'Table Recognition:',
+};
+
+function assertGlmConfig(payload) {
+  const provider = payload?.provider === 'ollama' ? 'ollama' : 'openai-compatible';
+  const endpoint = String(payload?.endpoint || '').trim().replace(/\/+$/, '');
+  const model = String(payload?.model || '').trim();
+  if (!endpoint || !model) throw new Error('GLM-OCR 端点和模型名称不能为空');
+  const url = new URL(endpoint);
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('GLM-OCR 端点必须使用 HTTP 或 HTTPS');
+  return { provider, endpoint, model, apiKey: String(payload?.apiKey || '').trim(), autoStart: payload?.autoStart !== false };
+}
+
+function ollamaBaseUrl(endpoint) {
+  const url = new URL(endpoint);
+  url.pathname = url.pathname.replace(/\/(?:v1|api\/generate)\/?$/, '') || '/';
+  url.search = '';
+  url.hash = '';
+  return url.toString().replace(/\/+$/, '');
+}
+
+function findOllamaExecutable() {
+  const located = spawnSync('where.exe', ['ollama.exe'], { windowsHide: true, encoding: 'utf8', timeout: 3_000 });
+  const fromPath = located.status === 0 ? located.stdout.split(/\r?\n/).find(Boolean)?.trim() : '';
+  const candidates = [
+    fromPath,
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'Ollama', 'ollama.exe'),
+    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Ollama', 'ollama.exe'),
+  ].filter(Boolean);
+  return candidates.find((candidate) => require('node:fs').existsSync(candidate)) || null;
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeout = 5_000) {
+  try {
+    const response = await fetch(url, { ...options, signal: AbortSignal.timeout(timeout) });
+    const text = await response.text();
+    let payload;
+    try { payload = text ? JSON.parse(text) : {}; } catch { payload = { message: text }; }
+    if (!response.ok) throw new Error(payload?.error || payload?.message || `HTTP ${response.status}`);
+    return payload;
+  } catch (error) {
+    const code = error?.cause?.code || error?.code;
+    if (code === 'ECONNREFUSED' || error?.name === 'TimeoutError') throw new Error('无法连接 GLM-OCR 服务；请确认服务已启动且端口正确');
+    if (error?.message === 'fetch failed' || code) throw new Error(`无法访问 GLM-OCR 端点${code ? `（${code}）` : ''}；请检查地址、网络和服务状态`);
+    throw error;
+  }
+}
+
+async function getGlmStatus(config) {
+  if (config.provider !== 'ollama') return { provider: config.provider, runtimeInstalled: true, serviceRunning: null, modelInstalled: null, modelLoaded: null, state: 'remote', progress: 0, message: '外部 OpenAI-compatible 服务由你自行管理' };
+  const executable = findOllamaExecutable();
+  const baseUrl = ollamaBaseUrl(config.endpoint);
+  try {
+    const [tags, running] = await Promise.all([
+      fetchJsonWithTimeout(`${baseUrl}/api/tags`),
+      fetchJsonWithTimeout(`${baseUrl}/api/ps`).catch(() => ({ models: [] })),
+    ]);
+    const names = Array.isArray(tags.models) ? tags.models.flatMap((item) => [item.name, item.model].filter(Boolean)) : [];
+    const loadedNames = Array.isArray(running.models) ? running.models.flatMap((item) => [item.name, item.model].filter(Boolean)) : [];
+    const expectedNames = new Set([config.model, config.model.includes(':') ? config.model : `${config.model}:latest`]);
+    const modelInstalled = names.some((name) => expectedNames.has(name));
+    const modelLoaded = loadedNames.some((name) => expectedNames.has(name));
+    return { provider: 'ollama', runtimeInstalled: Boolean(executable), serviceRunning: true, modelInstalled, modelLoaded, state: modelLoaded ? 'loaded' : modelInstalled ? 'ready' : 'missing-model', progress: 0, message: modelLoaded ? 'GLM-OCR 已载入内存' : modelInstalled ? 'GLM-OCR 已安装，可按需自动载入' : `尚未下载 ${config.model}` };
+  } catch (error) {
+    return { provider: 'ollama', runtimeInstalled: Boolean(executable), serviceRunning: false, modelInstalled: false, modelLoaded: false, state: executable ? 'stopped' : 'missing-runtime', progress: 0, message: executable ? 'Ollama 服务未启动' : '未安装 Ollama；请先安装后再准备模型', error: error.message };
+  }
+}
+
+async function ensureOllamaService(config) {
+  const current = await getGlmStatus(config);
+  if (current.serviceRunning) return current;
+  const executable = findOllamaExecutable();
+  if (!executable) throw new Error('未检测到 Ollama。请在模型设置中点击“安装 Ollama”，安装后再准备 GLM-OCR');
+  if (ollamaProcess?.exitCode === null) return current;
+  ollamaProcess = spawn(executable, ['serve'], { windowsHide: true, stdio: 'ignore' });
+  ollamaProcess.once('exit', () => { ollamaProcess = undefined; });
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const status = await getGlmStatus(config);
+    if (status.serviceRunning) return status;
+  }
+  throw new Error('Ollama 已启动，但本地服务在 20 秒内没有就绪');
+}
+
+function publishGlmState(sender, changes) {
+  if (sender && !sender.isDestroyed()) sender.send('glm:progress', changes);
+}
+
+async function pullOllamaModel(config, sender) {
+  const baseUrl = ollamaBaseUrl(config.endpoint);
+  let response;
+  try {
+    response = await fetch(`${baseUrl}/api/pull`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: config.model, stream: true }),
+    });
+  } catch (error) {
+    const code = error?.cause?.code || error?.code;
+    throw new Error(`无法连接 Ollama 下载模型${code ? `（${code}）` : ''}；请检查本地服务和网络`);
+  }
+  if (!response.ok || !response.body) throw new Error((await response.text()) || `下载 GLM-OCR 失败 (${response.status})`);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const item = JSON.parse(line);
+      if (item.error) throw new Error(item.error);
+      const progress = item.total > 0 ? Math.min(99, Math.round((item.completed / item.total) * 100)) : 0;
+      publishGlmState(sender, { state: 'downloading', progress, message: item.status || `正在下载 ${config.model}` });
+    }
+    if (done) break;
+  }
+}
+
+async function prepareGlm(config, sender) {
+  if (config.provider !== 'ollama') return getGlmStatus(config);
+  if (glmPreparePromise) return glmPreparePromise;
+  glmPreparePromise = (async () => {
+    publishGlmState(sender, { state: 'starting', progress: 0, message: '正在启动 Ollama 服务' });
+    let status = await ensureOllamaService(config);
+    if (!status.modelInstalled) {
+      publishGlmState(sender, { state: 'downloading', progress: 0, message: `正在下载 ${config.model}` });
+      await pullOllamaModel(config, sender);
+    }
+    publishGlmState(sender, { state: 'loading', progress: 99, message: '正在载入 GLM-OCR' });
+    const baseUrl = ollamaBaseUrl(config.endpoint);
+    await fetchJsonWithTimeout(`${baseUrl}/api/generate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: config.model, prompt: '', stream: false, keep_alive: '10m' }),
+    }, 120_000);
+    status = await getGlmStatus(config);
+    publishGlmState(sender, { ...status, state: 'loaded', progress: 100, message: 'GLM-OCR 已载入内存' });
+    await logEvent('info', 'glm-ocr.prepared', { model: config.model, endpoint: config.endpoint });
+    return status;
+  })().finally(() => { glmPreparePromise = undefined; });
+  return glmPreparePromise;
+}
+
+async function recognizeGlm(payload) {
+  const config = assertGlmConfig(payload);
+  const image = payload?.image;
+  const task = glmTaskPrompts[payload?.task] ? payload.task : 'text';
+  if (!ArrayBuffer.isView(image) || image.byteLength === 0 || image.byteLength > 20 * 1024 * 1024) throw new Error('GLM-OCR 页面图像无效或过大');
+  const startedAt = Date.now();
+  try {
+    let result;
+    if (config.provider === 'ollama') {
+      const status = config.autoStart ? await ensureOllamaService(config) : await getGlmStatus(config);
+      if (!status.serviceRunning) throw new Error('Ollama 服务未启动；请启用自动启动或在设置中点击“准备模型”');
+      if (!status.modelInstalled) throw new Error(`尚未下载 ${config.model}；请在模型设置中点击“准备模型”`);
+      result = await fetchJsonWithTimeout(`${ollamaBaseUrl(config.endpoint)}/api/generate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: config.model, prompt: glmTaskPrompts[task], images: [Buffer.from(image.buffer, image.byteOffset, image.byteLength).toString('base64')], stream: false, keep_alive: '10m', options: { temperature: 0 } }),
+      }, 180_000);
+      result = String(result.response || '').trim();
+    } else {
+      const endpoint = config.endpoint.endsWith('/chat/completions') ? config.endpoint : `${config.endpoint}/chat/completions`;
+      const headers = { 'Content-Type': 'application/json' };
+      if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+      const mimeType = typeof payload.mimeType === 'string' ? payload.mimeType : 'image/jpeg';
+      const body = {
+        model: config.model, temperature: 0, max_tokens: 4096, stream: false,
+        messages: [{ role: 'user', content: [
+          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${Buffer.from(image.buffer, image.byteOffset, image.byteLength).toString('base64')}` } },
+          { type: 'text', text: glmTaskPrompts[task] },
+        ] }],
+      };
+      const response = await fetchJsonWithTimeout(endpoint, { method: 'POST', headers, body: JSON.stringify(body) }, 180_000);
+      const content = response.choices?.[0]?.message?.content;
+      result = (typeof content === 'string' ? content : Array.isArray(content) ? content.map((item) => item.text || '').join('\n') : '').trim();
+    }
+    if (!result) throw new Error('GLM-OCR 未返回识别结果');
+    await logEvent('info', 'glm-ocr.request-succeeded', { provider: config.provider, model: config.model, task, elapsedMs: Date.now() - startedAt });
+    return { text: result, task };
+  } catch (error) {
+    await logEvent('error', 'glm-ocr.request-failed', { provider: config.provider, model: config.model, task, elapsedMs: Date.now() - startedAt, error: describeError(error) });
+    throw error;
+  }
+}
+
 ipcMain.handle('embedding:status', getModelStatus);
 ipcMain.handle('app:info', () => ({ version: app.getVersion(), packaged: app.isPackaged, logPath: logFile() }));
+ipcMain.handle('glm:status', (_event, payload) => getGlmStatus(assertGlmConfig(payload)));
+ipcMain.handle('glm:prepare', (event, payload) => prepareGlm(assertGlmConfig(payload), event.sender));
+ipcMain.handle('glm:recognize', (_event, payload) => recognizeGlm(payload));
+ipcMain.handle('glm:unload', async (_event, payload) => {
+  const config = assertGlmConfig(payload);
+  if (config.provider !== 'ollama') return getGlmStatus(config);
+  const status = await getGlmStatus(config);
+  if (status.serviceRunning && status.modelInstalled) {
+    await fetchJsonWithTimeout(`${ollamaBaseUrl(config.endpoint)}/api/generate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: config.model, prompt: '', stream: false, keep_alive: 0 }),
+    }, 30_000);
+  }
+  return getGlmStatus(config);
+});
+ipcMain.handle('glm:open-install', async () => {
+  await shell.openExternal('https://ollama.com/download/windows');
+  return { opened: true };
+});
 ipcMain.handle('model:prepare', async (event) => {
   await logEvent('info', 'model.prepare-started', { modelPath: modelFile(), runtimePath: runtimeFile(), runtimeMarker: runtimeMarker(), backend: runtimeBackend, executablePath: process.execPath });
   try {
@@ -629,6 +840,9 @@ ipcMain.handle('library:read', async (_event, id) => new Uint8Array(await readFi
 
 ipcMain.handle('library:remove', async (_event, id) => {
   const bookId = assertBookId(id);
+  const build = indexBuilds.get(bookId);
+  if (build) pauseIndexBuild(build);
+  indexBuilds.delete(bookId);
   await rm(bookDirectory(bookId), { recursive: true, force: true });
   return updateCatalog((catalog) => {
     const index = catalog.findIndex((candidate) => candidate.id === bookId);
@@ -653,13 +867,20 @@ ipcMain.handle('library:index-open', async (_event, id, providerId) => {
   return result;
 });
 
-ipcMain.handle('library:index-start', (_event, id, providerId, dimensions) => {
+ipcMain.handle('library:index-start', (_event, id, providerId, dimensions = 0, buildKey = providerId) => {
   const bookId = assertBookId(id);
   const existing = indexBuilds.get(bookId);
-  if (existing) cancelIndexBuild(existing);
-  const build = startIndexBuild(bookDirectory(bookId), providerId, dimensions);
+  if (existing) pauseIndexBuild(existing);
+  const build = startIndexBuild(bookDirectory(bookId), providerId, dimensions, buildKey);
   indexBuilds.set(bookId, build);
-  return { started: true, format: 'sqlite-f32', dimensions };
+  return { started: true, format: 'sqlite-f32', ...getIndexCheckpoint(build) };
+});
+
+ipcMain.handle('library:index-save-pages', (_event, id, entries) => {
+  const bookId = assertBookId(id);
+  const build = indexBuilds.get(bookId);
+  if (!build) throw new Error('Vector index build has not started');
+  return { pages: saveIndexPages(build, entries) };
 });
 
 ipcMain.handle('library:index-append', (_event, id, entries) => {
@@ -691,9 +912,9 @@ ipcMain.handle('library:index-finish', async (_event, id) => {
 ipcMain.handle('library:index-cancel', (_event, id) => {
   const bookId = assertBookId(id);
   const build = indexBuilds.get(bookId);
-  if (build) cancelIndexBuild(build);
+  if (build) pauseIndexBuild(build);
   indexBuilds.delete(bookId);
-  return { cancelled: Boolean(build) };
+  return { cancelled: Boolean(build), resumable: Boolean(build) };
 });
 
 ipcMain.handle('library:index-search', (_event, id, providerId, vector, limit) => {
@@ -757,7 +978,7 @@ app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(
 app.on('before-quit', () => {
   stopSidecar();
   stopOcrWorker();
-  for (const build of indexBuilds.values()) cancelIndexBuild(build);
+  for (const build of indexBuilds.values()) pauseIndexBuild(build);
   indexBuilds.clear();
 });
 process.on('uncaughtException', (error) => { void logEvent('error', 'process.uncaught-exception', { error: describeError(error) }); });

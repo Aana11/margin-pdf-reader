@@ -1,8 +1,13 @@
 'use client';
 
 import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, BookOpen, Bot, FileText, HardDrive, History, Library, MessageSquareText, Plus, Send, Settings2, Sparkles, Trash2, Upload } from 'lucide-react';
+import { BookOpen, Bot, FileText, HardDrive, History, Library, MessageSquareText, Plus, Send, Settings2, Sparkles, Trash2, Upload } from 'lucide-react';
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist';
+import ReactMarkdown from 'react-markdown';
+import rehypeKatex from 'rehype-katex';
+import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import 'katex/dist/katex.min.css';
 // oxlint-disable-next-line import/default -- Vite's ?url loader provides this synthetic default export.
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { Button } from '@/components/ui/button';
@@ -17,7 +22,7 @@ import type { DeepReadMode } from '@/lib/rag/deep-reading';
 import { MemoryVectorIndex } from '@/lib/rag/memory-index';
 import { createEmbeddingProvider } from '@/lib/rag/providers';
 import type { EmbeddingProvider, EmbeddingProviderKind, RagChunk, RagMatch } from '@/lib/rag/types';
-import type { LibraryEntry, ModelInstallStatus } from '@/types/electron';
+import type { GlmOcrConfig, GlmOcrProvider, GlmOcrStatus, LibraryEntry, ModelInstallStatus } from '@/types/electron';
 
 type Message = { role: 'user' | 'assistant'; content: string; page: number; createdAt?: string };
 type ChatHistoryRecord = { bookId: string; bookName: string; messages: Message[]; updatedAt: string };
@@ -33,9 +38,11 @@ type ModelSettings = {
   ocrMode: 'auto' | 'off';
   ocrLanguage: 'eng' | 'chi_sim+eng' | 'chi_tra+eng';
   glmOcrMode: DeepReadMode;
+  glmOcrProvider: GlmOcrProvider;
   glmOcrEndpoint: string;
   glmOcrModel: string;
   glmOcrApiKey: string;
+  glmOcrAutoStart: boolean;
 };
 const DEFAULT_SETTINGS: ModelSettings = {
   endpoint: 'https://api.openai.com/v1', model: 'gpt-5-mini', apiKey: '',
@@ -43,7 +50,7 @@ const DEFAULT_SETTINGS: ModelSettings = {
   embeddingKind: 'local-qwen3-embedding-4b', embeddingEndpoint: 'https://api-inference.modelscope.cn/v1',
   embeddingModel: 'text-embedding-3-small', embeddingApiKey: '',
   ocrMode: 'auto', ocrLanguage: 'chi_sim+eng',
-  glmOcrMode: 'off', glmOcrEndpoint: 'http://127.0.0.1:11434/v1', glmOcrModel: 'glm-ocr:latest', glmOcrApiKey: '',
+  glmOcrMode: 'off', glmOcrProvider: 'ollama', glmOcrEndpoint: 'http://127.0.0.1:11434', glmOcrModel: 'glm-ocr:latest', glmOcrApiKey: '', glmOcrAutoStart: true,
 };
 const quickPrompts = ['总结本页', '解释核心概念', '精读本页公式/代码'];
 const CHAT_HISTORY_KEY = 'margin-chat-history-v1';
@@ -81,6 +88,19 @@ async function mapWithConcurrency<T>(count: number, concurrency: number, task: (
     }
   }));
   return results;
+}
+
+function getIndexConcurrency() {
+  const threads = typeof navigator === 'undefined' ? 8 : Math.max(1, navigator.hardwareConcurrency || 8);
+  return {
+    text: Math.max(2, Math.min(8, Math.ceil(threads / 2))),
+    ocr: Math.max(1, Math.min(4, Math.floor(threads / 4))),
+  };
+}
+
+function MarkdownMessage({ content }: { content: string }) {
+  const normalized = content.replace(/\\\[([\s\S]*?)\\\]/g, (_, formula: string) => `$$${formula}$$`).replace(/\\\((.+?)\\\)/g, (_, formula: string) => `$${formula}$`);
+  return <div className="message-content"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a> }}>{normalized}</ReactMarkdown></div>;
 }
 
 async function renderPageImage(pdfPage: PDFPageProxy, format: 'png' | 'jpeg' = 'png'): Promise<{ bytes: Uint8Array; mimeType: string }> {
@@ -178,7 +198,6 @@ function PdfPageCanvas({ pdf, pageNumber, activePage, onText, onError }: PdfPage
 
   return <div ref={shellRef} className="pdf-page" style={{ aspectRatio: pageRatio }} data-page={pageNumber} aria-label={`PDF 第 ${pageNumber} 页`}>
     <canvas ref={canvasRef} />
-    <span className="pdf-page-number">{pageNumber}</span>
   </div>;
 }
 
@@ -192,6 +211,8 @@ export default function Home() {
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const indexAbortRef = useRef(false);
+  const indexProgressRef = useRef(0);
+  const pageIndicatorTimerRef = useRef<number | null>(null);
   const deepReadCacheRef = useRef(new Map<string, string>());
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [fileName, setFileName] = useState('');
@@ -206,10 +227,12 @@ export default function Home() {
   const [indexStatus, setIndexStatus] = useState<'idle' | 'indexing' | 'ready' | 'error'>('idle');
   const [indexProgress, setIndexProgress] = useState(0);
   const [indexMessage, setIndexMessage] = useState('');
+  const [hasIndexCheckpoint, setHasIndexCheckpoint] = useState(false);
   const [settings, setSettings] = useState<ModelSettings>(readSavedSettings);
   const [library, setLibrary] = useState<LibraryEntry[]>([]);
   const [activeBookId, setActiveBookId] = useState<string | null>(null);
   const [modelStatus, setModelStatus] = useState<ModelInstallStatus | null>(null);
+  const [glmOcrStatus, setGlmOcrStatus] = useState<GlmOcrStatus | null>(null);
   const [scanWarning, setScanWarning] = useState('');
   const [deepReadStatus, setDeepReadStatus] = useState('');
   const [appVersion, setAppVersion] = useState('');
@@ -217,7 +240,28 @@ export default function Home() {
   const [chatModelListLoading, setChatModelListLoading] = useState(false);
   const [chatModelListError, setChatModelListError] = useState('');
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [showPageIndicator, setShowPageIndicator] = useState(false);
   const [chatHistory, setChatHistory] = useState<ChatHistoryRecord[]>(readChatHistory);
+
+  const glmConfig = useCallback((): GlmOcrConfig => ({
+    provider: settings.glmOcrProvider,
+    endpoint: settings.glmOcrEndpoint,
+    model: settings.glmOcrModel,
+    apiKey: settings.glmOcrApiKey,
+    autoStart: settings.glmOcrAutoStart,
+  }), [settings.glmOcrApiKey, settings.glmOcrAutoStart, settings.glmOcrEndpoint, settings.glmOcrModel, settings.glmOcrProvider]);
+
+  const revealPageIndicator = useCallback(() => {
+    setShowPageIndicator(true);
+    if (pageIndicatorTimerRef.current !== null) window.clearTimeout(pageIndicatorTimerRef.current);
+    pageIndicatorTimerRef.current = window.setTimeout(() => setShowPageIndicator(false), 900);
+  }, []);
+
+  const advanceIndexProgress = useCallback((next: number) => {
+    const bounded = Math.min(100, Math.max(indexProgressRef.current, Math.round(next)));
+    indexProgressRef.current = bounded;
+    setIndexProgress(bounded);
+  }, []);
 
   const saveChatHistory = useCallback((bookId: string, bookName: string, nextMessages: Message[]) => {
     if (!bookId || nextMessages.length === 0) return;
@@ -235,7 +279,8 @@ export default function Home() {
     if (!container || !pageElement) return;
     container.scrollTo({ top: Math.max(0, pageElement.offsetTop - 18), behavior });
     setPage(target);
-  }, []);
+    revealPageIndicator();
+  }, [revealPageIndicator]);
 
   const handlePageText = useCallback((pageNumber: number, text: string) => {
     pageTextsRef.current.set(pageNumber, text);
@@ -260,6 +305,29 @@ export default function Home() {
     return bridge.onModelProgress?.((progress) => {
       setModelStatus((current) => current ? { ...current, ...progress } : current);
     });
+  }, []);
+
+  useEffect(() => {
+    const bridge = window.marginDesktop;
+    if (settings.glmOcrMode !== 'auto' || !bridge?.glmOcrStatus) { window.queueMicrotask(() => setGlmOcrStatus(null)); return; }
+    let cancelled = false;
+    window.queueMicrotask(() => void bridge.glmOcrStatus?.(glmConfig()).then((status) => { if (!cancelled) setGlmOcrStatus(status); }).catch((reason) => {
+      if (!cancelled) setGlmOcrStatus({ provider: settings.glmOcrProvider, runtimeInstalled: false, serviceRunning: false, modelInstalled: false, modelLoaded: false, state: 'error', progress: 0, message: reason instanceof Error ? reason.message : '无法检测 GLM-OCR' });
+    }));
+    const unsubscribe = bridge.onGlmOcrProgress?.((progress) => setGlmOcrStatus((current) => ({
+      provider: settings.glmOcrProvider,
+      runtimeInstalled: current?.runtimeInstalled ?? false,
+      serviceRunning: current?.serviceRunning ?? false,
+      modelInstalled: current?.modelInstalled ?? false,
+      modelLoaded: current?.modelLoaded ?? false,
+      state: current?.state ?? 'idle', progress: current?.progress ?? 0, message: current?.message ?? '',
+      ...progress,
+    })));
+    return () => { cancelled = true; unsubscribe?.(); };
+  }, [glmConfig, settings.glmOcrMode, settings.glmOcrProvider]);
+
+  useEffect(() => () => {
+    if (pageIndicatorTimerRef.current !== null) window.clearTimeout(pageIndicatorTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -366,7 +434,7 @@ export default function Home() {
       deepReadCacheRef.current.clear();
       setDeepReadStatus(settings.glmOcrMode === 'auto' ? 'GLM-OCR 已待命，将按需精读公式、代码与表格页' : '');
       setScanWarning('');
-      setIndexStatus('idle'); setIndexProgress(0); setIndexMessage('');
+      setIndexStatus('idle'); setIndexProgress(0); setIndexMessage(''); setHasIndexCheckpoint(false);
       const initialPage = Math.min(document.numPages, Math.max(1, book?.lastPage || 1));
       setPdf(document); setFileName(name); setPageCount(document.numPages); setPage(initialPage); setActiveBookId(book?.id || null);
       setMessages(book ? chatHistory.find((entry) => entry.bookId === book.id)?.messages ?? [] : []);
@@ -464,6 +532,7 @@ export default function Home() {
       || previous.embeddingEndpoint !== settings.embeddingEndpoint
       || previous.embeddingModel !== settings.embeddingModel;
     const deepReadConfigChanged = previous.glmOcrMode !== settings.glmOcrMode
+      || previous.glmOcrProvider !== settings.glmOcrProvider
       || previous.glmOcrEndpoint !== settings.glmOcrEndpoint
       || previous.glmOcrModel !== settings.glmOcrModel;
     localStorage.setItem('margin-ai-settings', JSON.stringify(settings));
@@ -521,10 +590,30 @@ export default function Home() {
     setModelStatus(await window.marginDesktop.modelUnload());
   }
 
+  async function prepareGlmModel() {
+    if (!window.marginDesktop?.glmOcrPrepare) return;
+    setError('');
+    try {
+      setGlmOcrStatus(await window.marginDesktop.glmOcrPrepare(glmConfig()));
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : '无法准备 GLM-OCR';
+      setError(`GLM-OCR 准备失败：${detail.slice(0, 180)}`);
+      if (glmOcrStatus) setGlmOcrStatus({ ...glmOcrStatus, state: 'error', message: detail });
+    }
+  }
+
+  async function releaseGlmModel() {
+    if (!window.marginDesktop?.glmOcrUnload) return;
+    try { setGlmOcrStatus(await window.marginDesktop.glmOcrUnload(glmConfig())); }
+    catch (reason) { setError(`释放 GLM-OCR 失败：${reason instanceof Error ? reason.message.slice(0, 160) : '未知错误'}`); }
+  }
+
   async function buildIndex() {
     if (!pdf || indexStatus === 'indexing') return;
     indexAbortRef.current = false;
-    setError(''); setIndexStatus('indexing'); setIndexProgress(0); setIndexMessage('正在提取 PDF 文本');
+    const startingProgress = hasIndexCheckpoint ? indexProgressRef.current : 0;
+    indexProgressRef.current = startingProgress;
+    setError(''); setIndexStatus('indexing'); setIndexProgress(startingProgress); setIndexMessage('正在提取 PDF 文本');
     let phase = 'starting';
     let persistentBuildStarted = false;
     const indexStartedAt = new Date().getTime();
@@ -533,6 +622,7 @@ export default function Home() {
     let embeddingElapsedMs = 0;
     let persistenceElapsedMs = 0;
     let runtimeBackend = modelStatus?.backend;
+    const concurrency = getIndexConcurrency();
     window.marginDesktop?.logEvent?.('index-started', {
       bookId: activeBookId,
       fileName,
@@ -561,20 +651,37 @@ export default function Home() {
       embeddingProviderRef.current = provider;
       vectorIndexRef.current.clear();
       const allChunks: RagChunk[] = [];
+      const buildKey = `ocr:${settings.ocrMode}:${settings.ocrLanguage}|chunks:1200:180`;
+      let cachedPages = new Map<number, { pageNumber: number; text: string; source: 'pdf' | 'ocr' }>();
+      let completedChunkIds = new Set<string>();
+      let resumedChunks = 0;
+      if (activeBookId && window.marginDesktop?.libraryIndexStart && window.marginDesktop.libraryIndexAppend && window.marginDesktop.libraryIndexFinish) {
+        const checkpoint = await window.marginDesktop.libraryIndexStart(activeBookId, provider.id, 0, buildKey);
+        persistentBuildStarted = true;
+        cachedPages = new Map(checkpoint.pages.map((entry) => [entry.page, { pageNumber: entry.page, text: entry.text, source: entry.source }]));
+        completedChunkIds = new Set(checkpoint.completedChunkIds);
+        resumedChunks = checkpoint.chunks;
+        if (checkpoint.resumed && (checkpoint.pages.length > 0 || checkpoint.chunks > 0)) setIndexMessage(`已恢复检查点：${checkpoint.pages.length} 页文本 · ${checkpoint.chunks} 个向量`);
+        setHasIndexCheckpoint(checkpoint.resumed && (checkpoint.pages.length > 0 || checkpoint.chunks > 0));
+      }
       let emptyPages = 0;
-      let ocrPages = 0;
+      let ocrPages = [...cachedPages.values()].filter((entry) => entry.source === 'ocr').length;
       let ocrFailures = 0;
       const extractionStartedAt = new Date().getTime();
-      let extractedPages = 0;
-      const extracted = await mapWithConcurrency(pdf.numPages, 6, async (pageNumber) => {
+      let extractedPages = cachedPages.size;
+      advanceIndexProgress((extractedPages / pdf.numPages) * 10);
+      const extracted = await mapWithConcurrency(pdf.numPages, concurrency.text, async (pageNumber) => {
         if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
+        const cached = cachedPages.get(pageNumber);
+        if (cached) return cached;
         const pdfPage = await pdf.getPage(pageNumber);
         const content = await pdfPage.getTextContent();
         const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim();
         extractedPages += 1;
-        setIndexProgress(Math.round((extractedPages / pdf.numPages) * 10));
+        advanceIndexProgress(Math.round((extractedPages / pdf.numPages) * 10));
         setIndexMessage(`正在并发提取文本：${extractedPages} / ${pdf.numPages} 页`);
-        return { pageNumber, text };
+        if (text && activeBookId) await window.marginDesktop?.libraryIndexSavePages?.(activeBookId, [{ page: pageNumber, text, source: 'pdf' }]);
+        return { pageNumber, text, source: 'pdf' as const };
       });
       const ocrCandidates = extracted.filter((entry) => !entry.text);
       if (ocrCandidates.length > 0 && settings.ocrMode === 'auto' && window.marginDesktop?.ocrRecognize) {
@@ -585,11 +692,11 @@ export default function Home() {
           const elapsedSeconds = Math.max((new Date().getTime() - ocrStartedAt) / 1000, 0.001);
           const pagesPerMinute = (ocrCompleted / elapsedSeconds) * 60;
           const remaining = ocrCompleted > 0 ? formatRemaining(((ocrCandidates.length - ocrCompleted) / pagesPerMinute) * 60) : '';
-          setIndexMessage(`3 路 OCR：${ocrCompleted} / ${ocrCandidates.length} 页${pagesPerMinute > 0 ? ` · ${pagesPerMinute.toFixed(1)} 页/分钟` : ''}${remaining ? ` · ${remaining}` : ''}${detail}`);
+          setIndexMessage(`${concurrency.ocr} 路 OCR：${ocrCompleted} / ${ocrCandidates.length} 页${pagesPerMinute > 0 ? ` · ${pagesPerMinute.toFixed(1)} 页/分钟` : ''}${remaining ? ` · ${remaining}` : ''}${detail}`);
         };
-        const unsubscribe = window.marginDesktop.onOcrProgress?.((progress) => updateOcrMessage(progress.page ? ` · 第 ${progress.page} 页 ${progress.progress}%` : ''));
+        const unsubscribe = window.marginDesktop.onOcrProgress?.(() => updateOcrMessage(` · ${concurrency.ocr} 个页面并行处理中`));
         try {
-          await mapWithConcurrency(ocrCandidates.length, 3, async (candidateNumber) => {
+          await mapWithConcurrency(ocrCandidates.length, concurrency.ocr, async (candidateNumber) => {
             if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
             const candidate = ocrCandidates[candidateNumber - 1];
             const pageNumber = candidate.pageNumber;
@@ -600,15 +707,17 @@ export default function Home() {
               candidate.text = result.text;
               if (result.text) {
                 ocrPages += 1;
+                candidate.source = 'ocr';
                 pageTextsRef.current.set(pageNumber, result.text);
                 if (pageNumber === page) setPageText(result.text);
+                if (activeBookId) await window.marginDesktop?.libraryIndexSavePages?.(activeBookId, [{ page: pageNumber, text: result.text, source: 'ocr' }]);
               } else ocrFailures += 1;
             } catch (reason) {
               ocrFailures += 1;
               window.marginDesktop?.logEvent?.('ocr-page-failed', { bookId: activeBookId, page: pageNumber, message: reason instanceof Error ? reason.message : String(reason) }, 'error');
             }
             ocrCompleted += 1;
-            setIndexProgress(10 + Math.round((ocrCompleted / ocrCandidates.length) * 25));
+            advanceIndexProgress(10 + Math.round((ocrCompleted / ocrCandidates.length) * 25));
             updateOcrMessage();
             return candidate;
           });
@@ -622,40 +731,43 @@ export default function Home() {
         const { pageNumber, text } = extractedPage;
         if (!text) emptyPages += 1;
         allChunks.push(...chunkPage(text, pageNumber));
-        setIndexProgress(35);
+        advanceIndexProgress(35);
         setIndexMessage(`正在整理文本：第 ${pageNumber} / ${pdf.numPages} 页${ocrPages ? ` · OCR ${ocrPages} 页` : ''}`);
       }
       extractionElapsedMs = new Date().getTime() - extractionStartedAt;
       if (allChunks.length === 0) throw new Error(settings.ocrMode === 'off' ? '这个 PDF 没有可提取文本；请在模型设置中启用 OCR。' : 'OCR 完成，但没有识别出可索引文本。请尝试切换 OCR 语言或使用更清晰的扫描件。');
-      window.marginDesktop?.logEvent?.('index-text-extracted', { bookId: activeBookId, chunks: allChunks.length, emptyPages, ocrPages, ocrFailures, elapsedMs: Math.round(extractionElapsedMs), ocrElapsedMs: Math.round(ocrElapsedMs), textConcurrency: 6, ocrConcurrency: 3 });
+      window.marginDesktop?.logEvent?.('index-text-extracted', { bookId: activeBookId, chunks: allChunks.length, emptyPages, ocrPages, ocrFailures, elapsedMs: Math.round(extractionElapsedMs), ocrElapsedMs: Math.round(ocrElapsedMs), textConcurrency: concurrency.text, ocrConcurrency: concurrency.ocr });
       phase = 'embedding';
       // Vulkan has enough parallelism for eight llama.cpp slots. CPU stays at four
       // to avoid oversubscription; remote providers use their existing larger batch.
       const batchSize = settings.embeddingKind === 'local-qwen3-embedding-4b' ? (runtimeBackend === 'vulkan' ? 8 : 4) : 16;
       const embeddingStartedAt = new Date().getTime();
       const pendingEntries: Array<RagChunk & { vector: Float32Array }> = [];
-      for (let start = 0; start < allChunks.length; start += batchSize) {
+      const chunksToEmbed = allChunks.filter((chunk) => !completedChunkIds.has(chunk.id));
+      const alreadyCompleted = allChunks.length - chunksToEmbed.length;
+      if (alreadyCompleted > 0) {
+        advanceIndexProgress(35 + (alreadyCompleted / allChunks.length) * 64);
+        setIndexMessage(`从检查点继续：已完成 ${alreadyCompleted} / ${allChunks.length} 个向量`);
+      }
+      for (let start = 0; start < chunksToEmbed.length; start += batchSize) {
         if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
-        const chunks = allChunks.slice(start, start + batchSize);
+        const chunks = chunksToEmbed.slice(start, start + batchSize);
         const vectors = await provider.embed(chunks.map((chunk) => chunk.text), 'document');
         if (vectors.length !== chunks.length || !vectors[0]?.length) throw new Error('向量模型返回了无效批次');
-        if (activeBookId && window.marginDesktop?.libraryIndexStart && window.marginDesktop.libraryIndexAppend && window.marginDesktop.libraryIndexFinish) {
-          if (!persistentBuildStarted) {
-            await window.marginDesktop.libraryIndexStart(activeBookId, provider.id, vectors[0].length);
-            persistentBuildStarted = true;
-          }
+        if (activeBookId && persistentBuildStarted && window.marginDesktop?.libraryIndexAppend) {
           pendingEntries.push(...chunks.map((chunk, index) => ({ ...chunk, vector: Float32Array.from(vectors[index]) })));
-          if (pendingEntries.length >= 64 || start + batchSize >= allChunks.length) {
+          if (pendingEntries.length >= 64 || start + batchSize >= chunksToEmbed.length) {
             await window.marginDesktop.libraryIndexAppend(activeBookId, pendingEntries.splice(0, pendingEntries.length));
           }
         } else {
           vectorIndexRef.current.addVectors(chunks, vectors);
         }
-        const completed = Math.min(start + batchSize, allChunks.length);
+        const completedNow = Math.min(start + batchSize, chunksToEmbed.length);
+        const completed = alreadyCompleted + completedNow;
         const elapsedSeconds = Math.max((new Date().getTime() - embeddingStartedAt) / 1000, 0.001);
-        const chunksPerSecond = completed / elapsedSeconds;
-        const remaining = formatRemaining((allChunks.length - completed) / chunksPerSecond);
-        setIndexProgress(35 + Math.round((completed / Math.max(allChunks.length, 1)) * 64));
+        const chunksPerSecond = completedNow / elapsedSeconds;
+        const remaining = formatRemaining((chunksToEmbed.length - completedNow) / chunksPerSecond);
+        advanceIndexProgress(35 + Math.round((completed / Math.max(allChunks.length, 1)) * 64));
         setIndexMessage(`正在生成向量：${completed} / ${allChunks.length} · ${chunksPerSecond.toFixed(1)} 片段/秒${remaining ? ` · ${remaining}` : ''}`);
       }
       embeddingElapsedMs = new Date().getTime() - embeddingStartedAt;
@@ -671,11 +783,12 @@ export default function Home() {
         await refreshLibrary();
       }
       const storageLabel = persistedInfo ? ` · SQLite ${(persistedInfo.bytes / 1024 / 1024).toFixed(1)} MB` : '';
-      setIndexStatus('ready'); setIndexProgress(100); setIndexMessage(`索引完成：${allChunks.length} 个片段${storageLabel}${ocrPages ? ` · OCR ${ocrPages} 页` : ''}`);
+      advanceIndexProgress(100); setHasIndexCheckpoint(false); setIndexStatus('ready'); setIndexMessage(`索引完成：${allChunks.length} 个片段${storageLabel}${ocrPages ? ` · OCR ${ocrPages} 页` : ''}`);
       window.marginDesktop?.logEvent?.('index-succeeded', {
         bookId: activeBookId,
         providerId: provider.id,
         chunks: allChunks.length,
+        resumedChunks,
         persisted: Boolean(activeBookId),
         batchSize,
         runtimeBackend,
@@ -691,7 +804,7 @@ export default function Home() {
       const message = reason instanceof Error ? reason.message.slice(0, 180) : '未知错误';
       window.marginDesktop?.logEvent?.('index-failed', { bookId: activeBookId, phase, message }, 'error');
       if (reason instanceof DOMException && reason.name === 'AbortError') {
-        setIndexStatus('idle'); setIndexProgress(0); setIndexMessage('索引已停止，原有索引未被覆盖');
+        setHasIndexCheckpoint(true); setIndexStatus('idle'); setIndexMessage(`索引已暂停在 ${indexProgressRef.current}%，可从已有进度继续`);
       } else {
         setIndexStatus('error'); setIndexMessage(message);
         setError(`建立索引失败：${message}`);
@@ -701,7 +814,7 @@ export default function Home() {
 
   function stopIndexing() {
     indexAbortRef.current = true;
-    setIndexMessage('正在安全停止，当前步骤完成后退出…');
+    setIndexMessage('正在安全暂停，当前步骤完成后退出…');
   }
 
   async function createDeepReadContext(matches: RagMatch[], prompt: string) {
@@ -714,12 +827,14 @@ export default function Home() {
     setDeepReadStatus(`GLM-OCR 正在精读第 ${candidates.map((candidate) => candidate.page).join('、')} 页…`);
     const results: string[] = [];
     for (const candidate of candidates) {
-      const cacheKey = `${activeBookId ?? fileName}:${candidate.page}:${candidate.task}:${settings.glmOcrEndpoint}:${settings.glmOcrModel}`;
+      const cacheKey = `${activeBookId ?? fileName}:${candidate.page}:${candidate.task}:${settings.glmOcrProvider}:${settings.glmOcrEndpoint}:${settings.glmOcrModel}`;
       let recognized = deepReadCacheRef.current.get(cacheKey);
       if (!recognized) {
         const pdfPage = await pdf.getPage(candidate.page);
         const image = await renderPageImage(pdfPage, 'jpeg');
-        const result = await recognizeWithGlmOcr({ endpoint: settings.glmOcrEndpoint, model: settings.glmOcrModel, apiKey: settings.glmOcrApiKey }, image.bytes, image.mimeType, candidate.task);
+        const result = window.marginDesktop?.glmOcrRecognize
+          ? await window.marginDesktop.glmOcrRecognize({ ...glmConfig(), image: image.bytes, mimeType: image.mimeType, task: candidate.task })
+          : await recognizeWithGlmOcr({ endpoint: settings.glmOcrEndpoint, model: settings.glmOcrModel, apiKey: settings.glmOcrApiKey }, image.bytes, image.mimeType, candidate.task);
         recognized = result.text;
         deepReadCacheRef.current.set(cacheKey, recognized);
       }
@@ -772,7 +887,7 @@ export default function Home() {
           messages: [
             { role: 'system', content: settings.systemPrompt.trim() || DEFAULT_SETTINGS.systemPrompt },
             ...messages.slice(-6).map(({ role, content }) => ({ role, content })),
-            { role: 'user', content: `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。\n\n我的问题：${prompt}` },
+            { role: 'user', content: `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。行内公式使用 $...$，独立公式使用 $$...$$，以便阅读器渲染。\n\n我的问题：${prompt}` },
           ],
         }),
       });
@@ -900,10 +1015,24 @@ export default function Home() {
                   <NativeSelectOption value="auto">GLM-OCR · 向量命中后按需精读</NativeSelectOption>
                 </NativeSelect>
                 {settings.glmOcrMode === 'auto' && <>
-                  <Label htmlFor="glm-ocr-endpoint">GLM-OCR 端点</Label><Input id="glm-ocr-endpoint" value={settings.glmOcrEndpoint} onChange={(e) => setSettings({ ...settings, glmOcrEndpoint: e.target.value })} placeholder="http://127.0.0.1:11434/v1" />
+                  <Label htmlFor="glm-ocr-provider">运行方式</Label><NativeSelect id="glm-ocr-provider" className="w-full" value={settings.glmOcrProvider} onChange={(e) => {
+                    const provider = e.target.value as GlmOcrProvider;
+                    setSettings({ ...settings, glmOcrProvider: provider, glmOcrEndpoint: provider === 'ollama' ? 'http://127.0.0.1:11434' : settings.glmOcrEndpoint });
+                  }}><NativeSelectOption value="ollama">本机 Ollama（可自动启停）</NativeSelectOption><NativeSelectOption value="openai-compatible">vLLM / SGLang / 远程兼容端点</NativeSelectOption></NativeSelect>
+                  <Label htmlFor="glm-ocr-endpoint">GLM-OCR 端点</Label><Input id="glm-ocr-endpoint" value={settings.glmOcrEndpoint} onChange={(e) => setSettings({ ...settings, glmOcrEndpoint: e.target.value })} placeholder={settings.glmOcrProvider === 'ollama' ? 'http://127.0.0.1:11434' : 'http://127.0.0.1:8080/v1'} />
                   <Label htmlFor="glm-ocr-model">模型名称</Label><Input id="glm-ocr-model" value={settings.glmOcrModel} onChange={(e) => setSettings({ ...settings, glmOcrModel: e.target.value })} placeholder="glm-ocr:latest" />
-                  <Label htmlFor="glm-ocr-key">API Key（本机可留空）</Label><Input id="glm-ocr-key" type="password" value={settings.glmOcrApiKey} onChange={(e) => setSettings({ ...settings, glmOcrApiKey: e.target.value })} placeholder="自托管服务通常可留空" />
-                  <p className="settings-note">支持 GLM-OCR 的 OpenAI-compatible 服务（Ollama、vLLM 或 SGLang）。系统最多把 2 个向量命中页作为图片送去精读；远程端点会接收这些页面。<a href="https://github.com/zai-org/GLM-OCR" target="_blank" rel="noreferrer">查看官方部署说明</a></p>
+                  {settings.glmOcrProvider === 'openai-compatible' && <><Label htmlFor="glm-ocr-key">API Key（本机可留空）</Label><Input id="glm-ocr-key" type="password" value={settings.glmOcrApiKey} onChange={(e) => setSettings({ ...settings, glmOcrApiKey: e.target.value })} placeholder="自托管服务通常可留空" /></>}
+                  {settings.glmOcrProvider === 'ollama' && <><Label htmlFor="glm-auto-start">自动开启</Label><label className="checkbox-field"><input id="glm-auto-start" type="checkbox" checked={settings.glmOcrAutoStart} onChange={(event) => setSettings({ ...settings, glmOcrAutoStart: event.target.checked })} />提问需要精读时自动启动 Ollama 服务</label></>}
+                  <p className="settings-note">Ollama 使用官方推荐的原生 <code>/api/generate</code> 视觉接口；vLLM/SGLang 使用 <code>/v1/chat/completions</code>。系统最多发送 2 个候选页。<a href="https://github.com/zai-org/GLM-OCR" target="_blank" rel="noreferrer">查看官方部署说明</a></p>
+                  {settings.glmOcrProvider === 'ollama' && <div className="model-manager glm-manager">
+                    <div className="model-manager-status"><span className={glmOcrStatus?.modelLoaded ? 'status-dot online' : 'status-dot'} /><div><strong>{glmOcrStatus?.modelLoaded ? 'GLM-OCR 已载入内存' : glmOcrStatus?.modelInstalled ? 'GLM-OCR 已准备好' : glmOcrStatus?.runtimeInstalled ? 'Ollama 已安装，模型未准备' : '这台电脑尚未安装 Ollama'}</strong><small>{glmOcrStatus?.message || '安装 Ollama 后可由 Margin 自动启动并管理 glm-ocr:latest'}</small></div></div>
+                    {glmOcrStatus && ['starting', 'downloading', 'loading'].includes(glmOcrStatus.state) && <div className="model-progress"><i style={{ width: `${glmOcrStatus.progress}%` }} /></div>}
+                    <div className="model-manager-actions">
+                      {!glmOcrStatus?.runtimeInstalled && <Button size="sm" variant="outline" onClick={() => void window.marginDesktop?.glmOcrOpenInstall?.()}>安装 Ollama</Button>}
+                      <Button size="sm" variant="outline" onClick={() => void prepareGlmModel()} disabled={['starting', 'downloading', 'loading'].includes(glmOcrStatus?.state || '')}>{glmOcrStatus?.modelInstalled ? '启动并载入' : '准备模型'}</Button>
+                      {glmOcrStatus?.modelLoaded && <Button size="sm" variant="ghost" onClick={() => void releaseGlmModel()}>释放显存</Button>}
+                    </div>
+                  </div>}
                 </>}
                 <div className="settings-divider"><span>向量检索</span></div>
                 <Label htmlFor="embedding-kind">向量模型</Label>
@@ -937,17 +1066,10 @@ export default function Home() {
       <div className="workspace">
         <section className="reader-panel" aria-label="PDF 阅读区">
           {pdf ? <>
-            <div className="reader-toolbar">
-              <span className="page-label">正在阅读 <strong>{page}</strong> / {pageCount}</span>
-              <div className="page-controls">
-                <Button variant="ghost" size="icon" disabled={page <= 1} onClick={() => scrollToPage(Math.max(1, page - 1))} aria-label="上一页"><ArrowUp /></Button>
-                <label className="page-jump">第 <input type="number" min={1} max={pageCount} value={page} onChange={(event) => scrollToPage(Math.min(pageCount, Math.max(1, Number(event.target.value))))} /> 页</label>
-                <Button variant="ghost" size="icon" disabled={page >= pageCount} onClick={() => scrollToPage(Math.min(pageCount, page + 1))} aria-label="下一页"><ArrowDown /></Button>
-              </div>
-            </div>
-            <div ref={readerScrollRef} className="canvas-wrap"><div className="pdf-pages">
+            <div ref={readerScrollRef} className="canvas-wrap" onScroll={revealPageIndicator}><div className="pdf-pages">
               {Array.from({ length: pageCount }, (_, index) => <PdfPageCanvas key={index + 1} pdf={pdf} pageNumber={index + 1} activePage={page} onText={handlePageText} onError={handleRenderError} />)}
             </div></div>
+            <div className={showPageIndicator ? 'page-scroll-indicator visible' : 'page-scroll-indicator'} aria-live="polite">{page} / {pageCount}</div>
           </> : <div className="empty-state">
             <div className="empty-icon"><Upload /></div><p className="eyebrow">私密 · 本地阅读</p>
             <h1>打开一本 PDF，<br />开始深度阅读。</h1>
@@ -970,7 +1092,7 @@ export default function Home() {
           </div></div>
           {pdf && <div className={`index-strip ${indexStatus}`}>
             <div><strong>{indexStatus === 'ready' ? '全文索引已就绪' : indexStatus === 'indexing' ? `正在建立索引 ${indexProgress}%` : indexStatus === 'error' ? '索引建立失败' : '尚未建立全文索引'}</strong><span title={indexMessage}>{indexMessage || (settings.embeddingKind === 'local-qwen3-embedding-4b' ? '本地 Qwen3-Embedding-4B · Q4_K_M' : settings.embeddingModel)}</span>{indexStatus === 'indexing' && <span className="index-progress"><i style={{ width: `${indexProgress}%` }} /></span>}</div>
-            <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" onClick={() => indexStatus === 'indexing' ? stopIndexing() : void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? '停止' : indexStatus === 'error' ? '重试' : '建立索引'}</Button>
+            <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" onClick={() => indexStatus === 'indexing' ? stopIndexing() : void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? '暂停' : indexStatus === 'error' ? '重试' : hasIndexCheckpoint ? '继续索引' : '建立索引'}</Button>
           </div>}
           {scanWarning && <p className="scan-warning">{scanWarning}</p>}
           {pdf && settings.glmOcrMode === 'auto' && <p className={deepReadStatus.includes('失败') ? 'deep-read-status error' : 'deep-read-status'}><Sparkles />{deepReadStatus || 'GLM-OCR 已待命 · 复杂页面将自动精读'}</p>}
@@ -978,7 +1100,7 @@ export default function Home() {
             {messages.length === 0 ? <div className="chat-welcome"><MessageSquareText /><h3>我会跟着你的页码</h3><p>{pdf ? '直接提问，我会优先根据当前页原文解释。' : '打开 PDF 后，这里会自动获取你当前阅读的页面。'}</p></div> :
               <div className="messages" aria-live="polite">{messages.map((message, index) => {
                 const thinking = message.role === 'assistant' && !message.content && asking && index === messages.length - 1;
-                return <div className={`message ${message.role}`} key={`${message.page}-${index}`}><span>{message.role === 'assistant' ? <Bot /> : `P.${message.page}`}</span>{thinking ? <p className="thinking"><i /><i /><i /></p> : <p>{message.content}</p>}</div>;
+                return <div className={`message ${message.role}`} key={`${message.page}-${index}`}><span>{message.role === 'assistant' ? <Bot /> : `P.${message.page}`}</span>{thinking ? <p className="thinking"><i /><i /><i /></p> : message.role === 'assistant' ? <MarkdownMessage content={message.content} /> : <p>{message.content}</p>}</div>;
               })}</div>}
           </div>
           <div className="composer-wrap">

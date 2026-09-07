@@ -14,6 +14,10 @@ function validateDimensions(dimensions) {
   if (!Number.isInteger(dimensions) || dimensions <= 0 || dimensions > 65_536) throw new Error('Invalid vector dimensions');
 }
 
+function validateBuildKey(buildKey) {
+  if (typeof buildKey !== 'string' || buildKey.length === 0 || buildKey.length > 1_000) throw new Error('Invalid index build key');
+}
+
 function vectorValues(vector) {
   if (vector instanceof Float32Array) return vector;
   if (Array.isArray(vector) && vector.every(Number.isFinite)) return Float32Array.from(vector);
@@ -49,11 +53,26 @@ function readMetadata(database) {
   return Object.fromEntries(database.prepare('SELECT key, value FROM metadata').all().map((row) => [row.key, row.value]));
 }
 
-function startIndexBuild(directory, providerId, dimensions) {
+function startIndexBuild(directory, providerId, dimensions = 0, buildKey = providerId) {
   validateProviderId(providerId);
-  validateDimensions(dimensions);
+  if (dimensions !== 0) validateDimensions(dimensions);
+  validateBuildKey(buildKey);
   mkdirSync(directory, { recursive: true });
   const temporaryFile = path.join(directory, `${SQLITE_FILE}.building`);
+  if (existsSync(temporaryFile)) {
+    let existing;
+    try {
+      existing = new DatabaseSync(temporaryFile, { timeout: 5_000 });
+      const metadata = readMetadata(existing);
+      if (Number(metadata.version) === INDEX_VERSION && metadata.complete === '0' && metadata.providerId === providerId && metadata.buildKey === buildKey) {
+        const storedDimensions = Number(metadata.dimensions || 0);
+        if (storedDimensions !== 0) validateDimensions(storedDimensions);
+        const count = Number(existing.prepare('SELECT COUNT(*) AS count FROM chunks').get().count);
+        return { database: existing, directory, temporaryFile, providerId, buildKey, dimensions: storedDimensions, count, closed: false, resumed: true };
+      }
+    } catch { /* Incompatible or corrupt checkpoints are replaced below. */ }
+    try { existing?.close(); } catch { /* Ignore close errors for corrupt checkpoints. */ }
+  }
   rmSync(temporaryFile, { force: true });
   const database = new DatabaseSync(temporaryFile, { timeout: 5_000 });
   database.exec(`
@@ -69,14 +88,46 @@ function startIndexBuild(directory, providerId, dimensions) {
       vector BLOB NOT NULL,
       norm REAL NOT NULL
     );
+    CREATE TABLE pages (
+      page INTEGER PRIMARY KEY,
+      text TEXT NOT NULL,
+      source TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
     CREATE INDEX chunks_page ON chunks(page);
   `);
-  writeMetadata(database, { version: INDEX_VERSION, providerId, dimensions, createdAt: new Date().toISOString(), complete: 0, chunks: 0 });
-  return { database, directory, temporaryFile, providerId, dimensions, count: 0, closed: false };
+  writeMetadata(database, { version: INDEX_VERSION, providerId, buildKey, dimensions, createdAt: new Date().toISOString(), complete: 0, chunks: 0 });
+  let copiedPages = 0;
+  const completedFile = path.join(directory, SQLITE_FILE);
+  if (existsSync(completedFile)) {
+    const completed = new DatabaseSync(completedFile, { readOnly: true, timeout: 5_000 });
+    try {
+      const metadata = readMetadata(completed);
+      const hasPages = completed.prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'pages'").get();
+      if (metadata.buildKey === buildKey && hasPages) {
+        const insert = database.prepare('INSERT INTO pages (page, text, source, updated_at) VALUES (?, ?, ?, ?)');
+        database.exec('BEGIN IMMEDIATE');
+        for (const row of completed.prepare('SELECT page, text, source, updated_at FROM pages ORDER BY page').iterate()) {
+          insert.run(row.page, row.text, row.source, row.updated_at);
+          copiedPages += 1;
+        }
+        database.exec('COMMIT');
+      }
+    } catch {
+      try { database.exec('ROLLBACK'); } catch { /* No active copy transaction. */ }
+    } finally { completed.close(); }
+  }
+  return { database, directory, temporaryFile, providerId, buildKey, dimensions, count: 0, closed: false, resumed: copiedPages > 0 };
 }
 
 function appendIndexBatch(build, entries) {
   if (!build || build.closed || !Array.isArray(entries) || entries.length === 0 || entries.length > 64) throw new Error('Invalid vector index batch');
+  const firstVector = vectorValues(entries[0]?.vector);
+  if (build.dimensions === 0) {
+    validateDimensions(firstVector.length);
+    build.dimensions = firstVector.length;
+    writeMetadata(build.database, { dimensions: build.dimensions });
+  }
   const insert = build.database.prepare('INSERT INTO chunks (ordinal, id, page, text, vector, norm) VALUES (?, ?, ?, ?, ?, ?)');
   build.database.exec('BEGIN IMMEDIATE');
   try {
@@ -92,6 +143,34 @@ function appendIndexBatch(build, entries) {
     throw error;
   }
   return build.count;
+}
+
+function saveIndexPages(build, entries) {
+  if (!build || build.closed || !Array.isArray(entries) || entries.length === 0 || entries.length > 64) throw new Error('Invalid index page batch');
+  const upsert = build.database.prepare('INSERT OR REPLACE INTO pages (page, text, source, updated_at) VALUES (?, ?, ?, ?)');
+  build.database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const entry of entries) {
+      if (!entry || !Number.isInteger(entry.page) || entry.page <= 0 || typeof entry.text !== 'string' || entry.text.length > 200_000 || !['pdf', 'ocr'].includes(entry.source)) throw new Error('Invalid index page checkpoint');
+      upsert.run(entry.page, entry.text, entry.source, new Date().toISOString());
+    }
+    build.database.exec('COMMIT');
+  } catch (error) {
+    build.database.exec('ROLLBACK');
+    throw error;
+  }
+  return build.database.prepare('SELECT COUNT(*) AS count FROM pages').get().count;
+}
+
+function getIndexCheckpoint(build) {
+  if (!build || build.closed) throw new Error('Index checkpoint is not open');
+  return {
+    resumed: Boolean(build.resumed),
+    dimensions: build.dimensions,
+    chunks: build.count,
+    pages: build.database.prepare('SELECT page, text, source FROM pages ORDER BY page').all(),
+    completedChunkIds: build.database.prepare('SELECT id FROM chunks ORDER BY ordinal').all().map((row) => row.id),
+  };
 }
 
 function finishIndexBuild(build) {
@@ -112,6 +191,13 @@ function cancelIndexBuild(build) {
   if (!build.closed) build.database.close();
   build.closed = true;
   rmSync(build.temporaryFile, { force: true });
+}
+
+function pauseIndexBuild(build) {
+  if (!build || build.closed) return;
+  writeMetadata(build.database, { dimensions: build.dimensions, chunks: build.count, updatedAt: new Date().toISOString() });
+  build.database.close();
+  build.closed = true;
 }
 
 function inspectIndex(directory, providerId) {
@@ -183,9 +269,12 @@ module.exports = {
   appendIndexBatch,
   cancelIndexBuild,
   finishIndexBuild,
+  getIndexCheckpoint,
   inspectIndex,
   migrateLegacyIndex,
   openIndex,
   searchIndex,
+  saveIndexPages,
   startIndexBuild,
+  pauseIndexBuild,
 };

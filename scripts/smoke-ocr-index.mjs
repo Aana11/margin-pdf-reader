@@ -132,7 +132,7 @@ try {
     input.dispatchEvent(new Event('change', { bubbles: true }));
   })()`);
   await retry(async () => {
-    const state = await evaluate(`({ page: document.querySelector('.page-label')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`);
+    const state = await evaluate(`({ page: document.querySelector('.page-scroll-indicator')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`);
     if (state.error) throw new Error(state.error);
     if (!state.page.includes('1 / 3')) throw new Error('Scanned PDF has not opened');
     return state;
