@@ -113,7 +113,7 @@ try {
   }), 180);
   await evaluate(`(() => { const input = document.querySelector('[aria-label="输入问题"]'); const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set; setter.call(input, '请精读向量命中页中的公式并解释'); input.dispatchEvent(new Event('input', { bubbles: true })); })()`);
   await evaluate(`document.querySelector('[aria-label="发送"]')?.click()`);
-  const ui = await retry(() => evaluate(`({ answer: [...document.querySelectorAll('.message.assistant p')].at(-1)?.textContent || '', formulaRendered: Boolean(document.querySelector('.message.assistant .katex')), status: document.querySelector('.deep-read-status')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`).then((state) => {
+  const ui = await retry(() => evaluate(`({ answer: [...document.querySelectorAll('.message.assistant .message-content')].at(-1)?.textContent || '', formulaRendered: Boolean(document.querySelector('.message.assistant .katex')), status: document.querySelector('.deep-read-status')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`).then((state) => {
     if (state.error) throw new Error(state.error);
     if (!state.answer.includes('GLM-OCR')) throw new Error('Answer not ready');
     return state;
