@@ -68,7 +68,11 @@ async function openDialog(triggerLabel, expectedText) {
   return retry(async () => {
     const state = await evaluate(`(() => {
       const dialog = document.querySelector('[role="dialog"]');
-      if (dialog) return { open: true, text: dialog.textContent || '' };
+      if (dialog) {
+        const text = dialog.textContent || '';
+        if (!text.includes(${JSON.stringify(expectedText)})) dialog.querySelector('[data-slot="dialog-close"]')?.click();
+        return { open: text.includes(${JSON.stringify(expectedText)}), text };
+      }
       document.querySelector('[aria-label="${triggerLabel}"]')?.click();
       return { open: false, text: '' };
     })()`);
@@ -117,7 +121,7 @@ try {
     const image = Uint8Array.from(atob('${ocrImageBase64}'), character => character.charCodeAt(0));
     return window.marginDesktop.ocrRecognize(image, 'chi_sim+eng');
   })()`, true);
-  if (!/Second Page/i.test(ocrResult?.text || '') || !/NEBULA-BETA/i.test(ocrResult?.text || '')) throw new Error(`Packaged OCR failed: ${ocrResult?.text?.slice(0, 200) || 'no text'}`);
+  if (!/Margin PDF Reader/i.test(ocrResult?.text || '') || !/ORCHID[- ]ALPHA/i.test(ocrResult?.text || '')) throw new Error(`Packaged OCR failed: ${ocrResult?.text?.slice(0, 200) || 'no text'}`);
   await retry(async () => {
     const entries = await evaluate(`window.marginDesktop.libraryList()`, true);
     if (entries?.[0]?.lastPage !== 2) throw new Error('Reading progress has not persisted yet');

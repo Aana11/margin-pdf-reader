@@ -92,6 +92,7 @@ try {
   const pdf = scannedPdf(Buffer.from(screenshot.data, 'base64'), 1200, 1600);
 
   await command('Page.reload');
+  await delay(1_000);
   await retry(async () => {
     if (!await evaluate(`Boolean(document.querySelector('[aria-label="模型设置"]'))`)) throw new Error('Margin did not reload');
     return true;
@@ -107,6 +108,7 @@ try {
     }));
     window.location.reload();
   })()`);
+  await delay(1_000);
   await retry(async () => {
     if (!await evaluate(`Boolean(document.querySelector('input[type="file"]'))`)) throw new Error('Margin settings did not reload');
     return true;

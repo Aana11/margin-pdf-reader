@@ -29,6 +29,9 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   glmOcrPrepare: (config) => ipcRenderer.invoke('glm:prepare', config),
   glmOcrRecognize: (payload) => ipcRenderer.invoke('glm:recognize', payload),
   glmOcrUnload: (config) => ipcRenderer.invoke('glm:unload', config),
+  glmOcrPause: () => ipcRenderer.invoke('glm:pause'),
+  glmOcrOpenFolder: () => ipcRenderer.invoke('glm:open-folder'),
+  glmOcrRemove: (config) => ipcRenderer.invoke('glm:remove', config),
   glmOcrOpenInstall: () => ipcRenderer.invoke('glm:open-install'),
   onGlmOcrProgress: (listener) => {
     const handler = (_event, progress) => listener(progress);

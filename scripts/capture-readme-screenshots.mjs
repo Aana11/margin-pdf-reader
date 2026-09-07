@@ -106,11 +106,12 @@ try {
         { role: 'assistant', content: '当前页展示了一个简洁的本地 PDF 阅读示例。阅读区与页码保持同步，左侧书架保存文档进度，右侧助手可结合当前页和全文索引回答问题。', page: 1, createdAt: now }
       ]
     }]));
+    localStorage.setItem('margin-settings-schema', '2');
     localStorage.setItem('margin-ai-settings', JSON.stringify({
       glmOcrMode: 'auto',
-      glmOcrProvider: 'ollama',
-      glmOcrEndpoint: 'http://127.0.0.1:11434',
-      glmOcrModel: 'glm-ocr:latest',
+      glmOcrProvider: 'managed',
+      glmOcrEndpoint: '',
+      glmOcrModel: 'ggml-org/GLM-OCR-GGUF',
       glmOcrApiKey: '',
       glmOcrAutoStart: true
     }));

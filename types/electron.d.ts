@@ -14,7 +14,7 @@ export type StoredIndexEntry = { id: string; page: number; text: string; vector:
 export type IndexInfo = { format: 'sqlite-f32'; chunks: number; dimensions: number; bytes: number; migrated?: boolean };
 export type IndexCheckpoint = { started: boolean; format: 'sqlite-f32'; resumed: boolean; dimensions: number; chunks: number; pages: Array<{ page: number; text: string; source: 'pdf' | 'ocr' }>; completedChunkIds: string[] };
 export type ModelInstallStatus = { installed: boolean; loaded: boolean; missing?: string[]; model: string; root: string; backend: 'cpu' | 'vulkan'; state: string; progress: number; message: string };
-export type GlmOcrProvider = 'ollama' | 'openai-compatible';
+export type GlmOcrProvider = 'managed' | 'ollama' | 'openai-compatible';
 export type GlmOcrStatus = { provider: GlmOcrProvider; runtimeInstalled: boolean; serviceRunning: boolean | null; modelInstalled: boolean | null; modelLoaded: boolean | null; state: string; progress: number; message: string; error?: string };
 export type GlmOcrConfig = { provider: GlmOcrProvider; endpoint: string; model: string; apiKey: string; autoStart: boolean };
 
@@ -41,6 +41,9 @@ declare global {
       glmOcrPrepare?: (config: GlmOcrConfig) => Promise<GlmOcrStatus>;
       glmOcrRecognize?: (payload: GlmOcrConfig & { image: Uint8Array; mimeType: string; task: 'text' | 'formula' | 'table' }) => Promise<{ text: string; task: 'text' | 'formula' | 'table' }>;
       glmOcrUnload?: (config: GlmOcrConfig) => Promise<GlmOcrStatus>;
+      glmOcrPause?: () => Promise<{ paused: boolean }>;
+      glmOcrOpenFolder?: () => Promise<{ opened: boolean }>;
+      glmOcrRemove?: (config: GlmOcrConfig) => Promise<GlmOcrStatus>;
       glmOcrOpenInstall?: () => Promise<{ opened: boolean }>;
       onGlmOcrProgress?: (listener: (progress: Partial<GlmOcrStatus>) => void) => () => void;
       libraryList?: () => Promise<LibraryEntry[]>;

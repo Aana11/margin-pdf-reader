@@ -17,7 +17,7 @@ const modelDirectory = 'Qwen3-Embedding-4B-GGUF';
 const modelName = 'Qwen3-Embedding-4B-Q4_K_M.gguf';
 const modelRevision = 'f4602530db1d980e16da9d7d3a70294cf5c190be';
 const runtimeVersion = 'b10516';
-const gpuRuntimeVersion = 'b9637';
+const gpuRuntimeVersion = 'b10516';
 const forcedRuntimeBackend = process.env.MARGIN_RUNTIME_BACKEND;
 const runtimeBackend = ['cpu', 'vulkan'].includes(forcedRuntimeBackend)
   ? forcedRuntimeBackend
@@ -38,6 +38,15 @@ let ocrPoolSetupPromise;
 const indexBuilds = new Map();
 let ollamaProcess;
 let glmPreparePromise;
+let glmSidecarPromise;
+let glmSidecarProcess;
+let glmSidecarIdleTimer;
+let glmDownloadController;
+let glmInstallState = { state: 'idle', progress: 0, message: '' };
+
+const glmManagedModel = 'ggml-org/GLM-OCR-GGUF';
+const glmManagedModelName = 'GLM-OCR-Q8_0.gguf';
+const glmManagedProjectorName = 'mmproj-GLM-OCR-Q8_0.gguf';
 
 app.setName('Margin');
 
@@ -162,11 +171,57 @@ function runtimeFile() {
 }
 
 function runtimeArchive() {
-  return path.join(dataRoot(), 'downloads', runtimeBackend === 'vulkan' ? `llama-${gpuRuntimeVersion}-bin-win-vulkan-x64.zip` : `llama-${runtimeVersion}-win-cpu-x64.zip`);
+  return path.join(dataRoot(), 'downloads', runtimeBackend === 'vulkan' ? `llama-${gpuRuntimeVersion}-bin-win-vulkan-x64.zip` : `llama-${runtimeVersion}-bin-win-cpu-x64.zip`);
 }
 
 function runtimeMarker() {
   return runtimeBackend === 'vulkan' ? path.join(path.dirname(runtimeFile()), 'ggml-vulkan.dll') : runtimeFile();
+}
+
+function runtimeStampFile() {
+  return path.join(path.dirname(runtimeFile()), '.margin-runtime-version');
+}
+
+function expectedRuntimeStamp() {
+  return `${runtimeBackend}:${runtimeBackend === 'vulkan' ? gpuRuntimeVersion : runtimeVersion}`;
+}
+
+async function isRuntimeCurrent() {
+  if (!await exists(runtimeFile()) || !await exists(runtimeMarker())) return false;
+  return readFile(runtimeStampFile(), 'utf8').then((value) => value.trim() === expectedRuntimeStamp()).catch(() => false);
+}
+
+function glmModelFile() {
+  return path.join(dataRoot(), 'models', 'GLM-OCR', glmManagedModelName);
+}
+
+function glmProjectorFile() {
+  return path.join(dataRoot(), 'models', 'GLM-OCR', glmManagedProjectorName);
+}
+
+function glmModelResources() {
+  return [
+    {
+      name: 'GLM-OCR Q8_0',
+      output: glmModelFile(),
+      size: 950433408,
+      sha256: '45bc244a6446aff850521dc41f18bc8d7105ad5f0c2c8c28af04e7cc4f4d50b1',
+      urls: [
+        `https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main/${glmManagedModelName}`,
+        `https://hf-mirror.com/ggml-org/GLM-OCR-GGUF/resolve/main/${glmManagedModelName}`,
+      ],
+    },
+    {
+      name: 'GLM-OCR 多模态投影器',
+      output: glmProjectorFile(),
+      size: 484403648,
+      sha256: '9c4b58e33e316ed142eb5dcb41abec3844d3e6e5dc361ffb782c3fa9d175141f',
+      urls: [
+        `https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main/${glmManagedProjectorName}`,
+        `https://hf-mirror.com/ggml-org/GLM-OCR-GGUF/resolve/main/${glmManagedProjectorName}`,
+      ],
+    },
+  ];
 }
 
 function modelResources() {
@@ -185,11 +240,10 @@ function modelResources() {
     runtimeBackend === 'vulkan' ? {
       name: `llama.cpp ${gpuRuntimeVersion} Vulkan GPU`,
       output: runtimeArchive(),
-      size: 38556528,
-      sha256: 'a353945604cffdac3d0d6da6392de78ca565a531a6f2ff3521f44b9b7c6e553f',
+      size: 34861181,
+      sha256: '530f57d2a874ce017827c1e5a926812b9d5de4667248575d1372b1c0acf94d83',
       urls: [
         `https://github.com/ggml-org/llama.cpp/releases/download/${gpuRuntimeVersion}/llama-${gpuRuntimeVersion}-bin-win-vulkan-x64.zip`,
-        `https://hf-mirror.com/limnmn/llama.cpp-${gpuRuntimeVersion}-Windows-Runtime/resolve/main/llama-${gpuRuntimeVersion}-bin-win-vulkan-x64.zip`,
       ],
     } : {
       name: `llama.cpp ${runtimeVersion} CPU`,
@@ -212,7 +266,7 @@ function publishModelState(sender, changes) {
   if (sender && !sender.isDestroyed()) sender.send('model:progress', modelInstallState);
 }
 
-async function downloadResource(resource, sender, resourceIndex, signal) {
+async function downloadResource(resource, sender, resourceIndex, signal, resourceCount = 2, publish = publishModelState) {
   const temporary = `${resource.output}.download`;
   await mkdir(path.dirname(resource.output), { recursive: true });
   for (const url of resource.urls) {
@@ -227,10 +281,10 @@ async function downloadResource(resource, sender, resourceIndex, signal) {
         transform(chunk, _encoding, done) {
           received += chunk.length;
           const resourceProgress = Math.min(1, received / resource.size);
-          const percent = Math.round(((resourceIndex + resourceProgress) / 2) * 95);
+          const percent = Math.round(((resourceIndex + resourceProgress) / resourceCount) * 95);
           if (percent !== lastPercent) {
             lastPercent = percent;
-            publishModelState(sender, { state: 'downloading', progress: percent, message: `正在下载 ${resource.name}` });
+            publish(sender, { state: 'downloading', progress: percent, message: `正在下载 ${resource.name}` });
           }
           done(null, chunk);
         },
@@ -264,6 +318,7 @@ async function extractRuntime() {
   await rename(temporary, destination);
   await access(runtimeFile());
   await access(runtimeMarker());
+  await writeFile(runtimeStampFile(), expectedRuntimeStamp(), 'utf8');
   await logEvent('info', 'runtime.repaired', { runtimePath: runtimeFile(), archivePath: runtimeArchive(), backend: runtimeBackend });
 }
 
@@ -288,6 +343,7 @@ async function ensureEmbeddingFiles() {
   try {
     const runtimeStats = await stat(runtimeFile());
     await access(runtimeMarker());
+    if (!await isRuntimeCurrent()) throw new Error('runtime version is outdated');
     await logEvent('info', 'model.path-check', { component: 'runtime', path: runtimeFile(), markerPath: runtimeMarker(), size: runtimeStats.size, isFile: runtimeStats.isFile(), backend: runtimeBackend });
     if (!runtimeStats.isFile()) throw new Error('runtime path is not a file');
   } catch (runtimeError) {
@@ -319,7 +375,7 @@ async function installModel(sender) {
       if (!valid) await downloadResource(resource, sender, index, signal);
     }
     publishModelState(sender, { state: 'installing', progress: 96, message: '正在安装 llama.cpp 运行时' });
-    await Promise.all([access(runtimeFile()), access(runtimeMarker())]).catch(() => extractRuntime());
+    if (!await isRuntimeCurrent()) await extractRuntime();
     publishModelState(sender, { state: 'ready', progress: 100, message: '本地向量模型已就绪' });
     return { installed: true };
   })().catch((error) => {
@@ -396,6 +452,7 @@ async function getFreePort() {
 
 async function startSidecar() {
   await Promise.all([access(modelFile()), access(runtimeFile()), access(runtimeMarker())]);
+  stopGlmSidecar();
   const port = await getFreePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   let logs = '';
@@ -469,7 +526,7 @@ async function getSidecarUrl() {
 async function getModelStatus() {
   const missing = [];
   if (!await exists(modelFile())) missing.push('model');
-  if (!await exists(runtimeFile()) || !await exists(runtimeMarker())) missing.push('runtime');
+  if (!await isRuntimeCurrent()) missing.push('runtime');
   if (missing.length === 0) {
     return { installed: true, loaded: Boolean(sidecarProcess && sidecarProcess.exitCode === null), model: embeddingModel, root: dataRoot(), backend: runtimeBackend, ...modelInstallState, state: modelInstallState.state === 'idle' ? 'ready' : modelInstallState.state };
   }
@@ -483,7 +540,10 @@ const glmTaskPrompts = {
 };
 
 function assertGlmConfig(payload) {
-  const provider = payload?.provider === 'ollama' ? 'ollama' : 'openai-compatible';
+  const provider = ['managed', 'ollama'].includes(payload?.provider) ? payload.provider : 'openai-compatible';
+  if (provider === 'managed') {
+    return { provider, endpoint: '', model: glmManagedModel, apiKey: '', autoStart: payload?.autoStart !== false };
+  }
   const endpoint = String(payload?.endpoint || '').trim().replace(/\/+$/, '');
   const model = String(payload?.model || '').trim();
   if (!endpoint || !model) throw new Error('GLM-OCR 端点和模型名称不能为空');
@@ -527,7 +587,133 @@ async function fetchJsonWithTimeout(url, options = {}, timeout = 5_000) {
   }
 }
 
+async function managedGlmFilesReady() {
+  const resources = glmModelResources();
+  const checks = await Promise.all(resources.map(async (resource) => {
+    const details = await stat(resource.output).catch(() => null);
+    return Boolean(details?.isFile() && details.size === resource.size);
+  }));
+  return checks.every(Boolean) && await isRuntimeCurrent();
+}
+
+function stopGlmSidecar() {
+  if (glmSidecarIdleTimer) clearTimeout(glmSidecarIdleTimer);
+  glmSidecarIdleTimer = undefined;
+  if (glmSidecarProcess && glmSidecarProcess.exitCode === null) {
+    void logEvent('info', 'glm-ocr.sidecar-stop-requested', { pid: glmSidecarProcess.pid });
+    glmSidecarProcess.kill();
+  }
+  glmSidecarProcess = undefined;
+  glmSidecarPromise = undefined;
+}
+
+function scheduleGlmSidecarIdleStop() {
+  if (glmSidecarIdleTimer) clearTimeout(glmSidecarIdleTimer);
+  glmSidecarIdleTimer = setTimeout(stopGlmSidecar, 300_000);
+  glmSidecarIdleTimer.unref();
+}
+
+async function startManagedGlmSidecar() {
+  if (!await managedGlmFilesReady()) throw new Error('本地 GLM-OCR 尚未安装，请先在模型设置中点击“下载并安装”');
+  stopSidecar();
+  const port = await getFreePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  let logs = '';
+  const startedAt = Date.now();
+  const args = [
+    '--model', glmModelFile(),
+    '--mmproj', glmProjectorFile(),
+    '--host', '127.0.0.1',
+    '--port', String(port),
+    '--ctx-size', '12288',
+    '--parallel', '1',
+    '--threads', String(Math.max(1, Math.min(8, Math.ceil(os.cpus().length / 2)))),
+    '--flash-attn', 'off',
+    '--fit', 'off',
+    ...(runtimeBackend === 'vulkan' ? ['--n-gpu-layers', '99'] : ['--no-mmproj-offload']),
+    '--no-webui',
+  ];
+  await logEvent('info', 'glm-ocr.sidecar-starting', { runtimePath: runtimeFile(), modelPath: glmModelFile(), projectorPath: glmProjectorFile(), backend: runtimeBackend, port });
+  glmSidecarProcess = spawn(runtimeFile(), args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const launchedProcess = glmSidecarProcess;
+  const collect = (chunk) => { logs = `${logs}${chunk}`.slice(-8_000); };
+  launchedProcess.stdout.on('data', collect);
+  launchedProcess.stderr.on('data', collect);
+  launchedProcess.once('exit', (code, signal) => {
+    void logEvent(code === 0 || signal === 'SIGTERM' ? 'info' : 'error', 'glm-ocr.sidecar-exited', { pid: launchedProcess.pid, code, signal, logTail: logs.slice(-2_000) });
+    if (glmSidecarProcess === launchedProcess) {
+      glmSidecarProcess = undefined;
+      glmSidecarPromise = undefined;
+    }
+  });
+  for (let attempt = 0; attempt < 360; attempt += 1) {
+    if (launchedProcess.exitCode !== null) throw new Error(`本地 GLM-OCR 服务退出 (${launchedProcess.exitCode})：${logs.slice(-1_000)}`);
+    try {
+      const response = await fetch(`${baseUrl}/health`);
+      if (response.ok) {
+        scheduleGlmSidecarIdleStop();
+        await logEvent('info', 'glm-ocr.sidecar-ready', { pid: launchedProcess.pid, port, elapsedMs: Date.now() - startedAt, backend: runtimeBackend });
+        return baseUrl;
+      }
+    } catch { /* Model is still loading. */ }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  stopGlmSidecar();
+  throw new Error(`本地 GLM-OCR 加载超时：${logs.slice(-1_000)}`);
+}
+
+async function getManagedGlmUrl() {
+  if (!glmSidecarPromise) glmSidecarPromise = startManagedGlmSidecar().catch((error) => { glmSidecarPromise = undefined; throw error; });
+  return glmSidecarPromise;
+}
+
+async function installManagedGlm(sender) {
+  glmDownloadController = new AbortController();
+  const signal = glmDownloadController.signal;
+  await mkdir(dataRoot(), { recursive: true });
+  try {
+    const disk = await statfs(dataRoot());
+    const available = Number(disk.bavail) * Number(disk.bsize);
+    const resources = [...glmModelResources(), modelResources()[1]];
+    const resourceValidity = await Promise.all(resources.map(async (resource) => {
+      if (resource.output === runtimeArchive() && await isRuntimeCurrent()) return true;
+      return access(resource.output).then(() => hashFile(resource.output)).then((digest) => digest === resource.sha256).catch(() => false);
+    }));
+    const required = resources.reduce((sum, resource, index) => sum + (resourceValidity[index] ? 0 : resource.size), 0) + 500 * 1024 * 1024;
+    if (available < required) throw new Error(`磁盘空间不足，需要至少 ${(required / 1024 / 1024 / 1024).toFixed(1)} GB 可用空间`);
+    publishGlmState(sender, { provider: 'managed', state: 'checking', progress: 0, message: '正在校验本地 GLM-OCR 文件' });
+    for (const [index, resource] of resources.entries()) {
+      if (!resourceValidity[index]) await downloadResource(resource, sender, index, signal, resources.length, (target, changes) => publishGlmState(target, { provider: 'managed', ...changes }));
+    }
+    publishGlmState(sender, { provider: 'managed', state: 'installing', progress: 96, message: '正在安装共享 llama.cpp 运行时' });
+    if (!await isRuntimeCurrent()) await extractRuntime();
+    publishGlmState(sender, { provider: 'managed', state: 'ready', progress: 100, message: '本地 GLM-OCR 已就绪' });
+  } catch (error) {
+    if (signal.aborted) {
+      publishGlmState(sender, { provider: 'managed', state: 'paused', message: '下载已暂停，可继续下载' });
+      return false;
+    }
+    publishGlmState(sender, { provider: 'managed', state: 'error', message: error instanceof Error ? error.message : String(error) });
+    throw error;
+  } finally {
+    glmDownloadController = undefined;
+  }
+  return true;
+}
+
 async function getGlmStatus(config) {
+  if (config.provider === 'managed') {
+    const runtimeInstalled = await isRuntimeCurrent();
+    const modelInstalled = await managedGlmFilesReady();
+    const modelLoaded = Boolean(glmSidecarProcess && glmSidecarProcess.exitCode === null);
+    const activeInstallState = ['checking', 'downloading', 'installing', 'paused', 'error'].includes(glmInstallState.state);
+    const state = activeInstallState ? glmInstallState.state : (modelLoaded ? 'loaded' : modelInstalled ? 'ready' : 'missing-model');
+    return {
+      provider: 'managed', runtimeInstalled, serviceRunning: modelLoaded, modelInstalled, modelLoaded, state,
+      progress: glmInstallState.progress,
+      message: activeInstallState && glmInstallState.message ? glmInstallState.message : (modelLoaded ? `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? 'Vulkan GPU' : 'CPU'}` : modelInstalled ? 'GLM-OCR 已安装，可按需自动启动' : '约 1.4 GB，Margin 将自动下载模型与运行时'),
+    };
+  }
   if (config.provider !== 'ollama') return { provider: config.provider, runtimeInstalled: true, serviceRunning: null, modelInstalled: null, modelLoaded: null, state: 'remote', progress: 0, message: '外部 OpenAI-compatible 服务由你自行管理' };
   const executable = findOllamaExecutable();
   const baseUrl = ollamaBaseUrl(config.endpoint);
@@ -564,7 +750,8 @@ async function ensureOllamaService(config) {
 }
 
 function publishGlmState(sender, changes) {
-  if (sender && !sender.isDestroyed()) sender.send('glm:progress', changes);
+  const state = changes.provider === 'managed' ? (glmInstallState = { ...glmInstallState, ...changes }) : changes;
+  if (sender && !sender.isDestroyed()) sender.send('glm:progress', state);
 }
 
 async function pullOllamaModel(config, sender) {
@@ -601,9 +788,18 @@ async function pullOllamaModel(config, sender) {
 }
 
 async function prepareGlm(config, sender) {
-  if (config.provider !== 'ollama') return getGlmStatus(config);
+  if (config.provider === 'openai-compatible') return getGlmStatus(config);
   if (glmPreparePromise) return glmPreparePromise;
   glmPreparePromise = (async () => {
+    if (config.provider === 'managed') {
+      if (!await managedGlmFilesReady()) await installManagedGlm(sender);
+      if (!await managedGlmFilesReady()) return getGlmStatus(config);
+      publishGlmState(sender, { provider: 'managed', state: 'loading', progress: 99, message: '正在载入本地 GLM-OCR' });
+      await getManagedGlmUrl();
+      publishGlmState(sender, { provider: 'managed', state: 'loaded', progress: 100, message: `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? 'Vulkan GPU' : 'CPU'}` });
+      await logEvent('info', 'glm-ocr.prepared', { provider: 'managed', model: glmManagedModel, backend: runtimeBackend });
+      return getGlmStatus(config);
+    }
     publishGlmState(sender, { state: 'starting', progress: 0, message: '正在启动 Ollama 服务' });
     let status = await ensureOllamaService(config);
     if (!status.modelInstalled) {
@@ -642,12 +838,21 @@ async function recognizeGlm(payload) {
       }, 180_000);
       result = String(result.response || '').trim();
     } else {
-      const endpoint = config.endpoint.endsWith('/chat/completions') ? config.endpoint : `${config.endpoint}/chat/completions`;
+      let configuredEndpoint = config.endpoint;
+      let configuredModel = config.model;
+      if (config.provider === 'managed') {
+        const installed = await managedGlmFilesReady();
+        if (!installed) throw new Error('本地 GLM-OCR 尚未下载，请在模型设置中点击“下载并安装”');
+        if (!config.autoStart && !(glmSidecarProcess && glmSidecarProcess.exitCode === null)) throw new Error('本地 GLM-OCR 未启动，请点击“启动并载入”或启用自动开启');
+        configuredEndpoint = `${await getManagedGlmUrl()}/v1`;
+        configuredModel = glmManagedModel;
+      }
+      const endpoint = configuredEndpoint.endsWith('/chat/completions') ? configuredEndpoint : `${configuredEndpoint}/chat/completions`;
       const headers = { 'Content-Type': 'application/json' };
       if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
       const mimeType = typeof payload.mimeType === 'string' ? payload.mimeType : 'image/jpeg';
       const body = {
-        model: config.model, temperature: 0, max_tokens: 4096, stream: false,
+        model: configuredModel, temperature: 0, max_tokens: 4096, stream: false,
         messages: [{ role: 'user', content: [
           { type: 'image_url', image_url: { url: `data:${mimeType};base64,${Buffer.from(image.buffer, image.byteOffset, image.byteLength).toString('base64')}` } },
           { type: 'text', text: glmTaskPrompts[task] },
@@ -656,6 +861,7 @@ async function recognizeGlm(payload) {
       const response = await fetchJsonWithTimeout(endpoint, { method: 'POST', headers, body: JSON.stringify(body) }, 180_000);
       const content = response.choices?.[0]?.message?.content;
       result = (typeof content === 'string' ? content : Array.isArray(content) ? content.map((item) => item.text || '').join('\n') : '').trim();
+      if (config.provider === 'managed') scheduleGlmSidecarIdleStop();
     }
     if (!result) throw new Error('GLM-OCR 未返回识别结果');
     await logEvent('info', 'glm-ocr.request-succeeded', { provider: config.provider, model: config.model, task, elapsedMs: Date.now() - startedAt });
@@ -673,6 +879,11 @@ ipcMain.handle('glm:prepare', (event, payload) => prepareGlm(assertGlmConfig(pay
 ipcMain.handle('glm:recognize', (_event, payload) => recognizeGlm(payload));
 ipcMain.handle('glm:unload', async (_event, payload) => {
   const config = assertGlmConfig(payload);
+  if (config.provider === 'managed') {
+    stopGlmSidecar();
+    glmInstallState = { state: 'ready', progress: 100, message: '本地 GLM-OCR 已释放' };
+    return getGlmStatus(config);
+  }
   if (config.provider !== 'ollama') return getGlmStatus(config);
   const status = await getGlmStatus(config);
   if (status.serviceRunning && status.modelInstalled) {
@@ -681,6 +892,25 @@ ipcMain.handle('glm:unload', async (_event, payload) => {
       body: JSON.stringify({ model: config.model, prompt: '', stream: false, keep_alive: 0 }),
     }, 30_000);
   }
+  return getGlmStatus(config);
+});
+ipcMain.handle('glm:pause', () => {
+  glmDownloadController?.abort();
+  return { paused: Boolean(glmDownloadController) };
+});
+ipcMain.handle('glm:open-folder', async () => {
+  await mkdir(path.dirname(glmModelFile()), { recursive: true });
+  const result = await shell.openPath(path.dirname(glmModelFile()));
+  if (result) throw new Error(result);
+  return { opened: true };
+});
+ipcMain.handle('glm:remove', async (_event, payload) => {
+  const config = assertGlmConfig(payload);
+  if (config.provider !== 'managed') return getGlmStatus(config);
+  glmDownloadController?.abort();
+  stopGlmSidecar();
+  await rm(path.dirname(glmModelFile()), { recursive: true, force: true });
+  glmInstallState = { state: 'idle', progress: 0, message: '' };
   return getGlmStatus(config);
 });
 ipcMain.handle('glm:open-install', async () => {
@@ -977,6 +1207,7 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', () => {
   stopSidecar();
+  stopGlmSidecar();
   stopOcrWorker();
   for (const build of indexBuilds.values()) pauseIndexBuild(build);
   indexBuilds.clear();
