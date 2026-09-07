@@ -112,12 +112,12 @@ try {
     if (!state.page.includes('2 / 2') || !state.synced.includes('2') || state.canvasWidth <= 1 || !state.indicatorVisible) throw new Error('Page 2 has not rendered yet');
     return state;
   }, 120, 500);
-  const ocrImageBase64 = (await readFile(path.resolve('docs', 'images', 'reader-overview.png'))).toString('base64');
+  const ocrImageBase64 = (await readFile(path.resolve('docs', 'images', 'reader-overview.jpg'))).toString('base64');
   const ocrResult = await evaluate(`(() => {
     const image = Uint8Array.from(atob('${ocrImageBase64}'), character => character.charCodeAt(0));
     return window.marginDesktop.ocrRecognize(image, 'chi_sim+eng');
   })()`, true);
-  if (!/Margin/i.test(ocrResult?.text || '') || !/PDF/i.test(ocrResult?.text || '')) throw new Error(`Packaged OCR failed: ${ocrResult?.text?.slice(0, 200) || 'no text'}`);
+  if (!/Second Page/i.test(ocrResult?.text || '') || !/NEBULA-BETA/i.test(ocrResult?.text || '')) throw new Error(`Packaged OCR failed: ${ocrResult?.text?.slice(0, 200) || 'no text'}`);
   await retry(async () => {
     const entries = await evaluate(`window.marginDesktop.libraryList()`, true);
     if (entries?.[0]?.lastPage !== 2) throw new Error('Reading progress has not persisted yet');

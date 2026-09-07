@@ -17,9 +17,9 @@ let worker;
 try {
   const startedAt = performance.now();
   worker = await createWorker(['chi_sim', 'eng'], OEM.LSTM_ONLY, { langPath: tessdata, cachePath: path.join(root, 'cache'), gzip: true });
-  const result = await worker.recognize(path.resolve('docs', 'images', 'reader-overview.png'), { rotateAuto: true });
+  const result = await worker.recognize(path.resolve('docs', 'images', 'reader-overview.jpg'), { rotateAuto: true });
   const text = String(result.data.text || '').replace(/\s+/g, ' ').trim();
-  if (!/Margin/i.test(text) || !/PDF/i.test(text)) throw new Error(`OCR output did not contain expected words: ${text.slice(0, 300)}`);
+  if (!/Second Page/i.test(text) || !/NEBULA-BETA/i.test(text)) throw new Error(`OCR output did not contain expected words: ${text.slice(0, 300)}`);
   console.log(JSON.stringify({ languages: ['chi_sim', 'eng'], confidence: result.data.confidence, characters: text.length, elapsedMs: Math.round(performance.now() - startedAt), sample: text.slice(0, 180) }));
 } finally {
   await worker?.terminate();
