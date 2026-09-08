@@ -5,7 +5,8 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   isDesktop: true,
   appInfo: () => ipcRenderer.invoke('app:info'),
   openLogs: () => ipcRenderer.invoke('logs:open'),
-  logEvent: (event, details = {}, level = 'info') => ipcRenderer.send('log:renderer', { event, details, level }),
+  logEvent: (event, details = {}, level = 'info') =>
+    ipcRenderer.send('log:renderer', { event, details, level }),
   embed: (texts) => ipcRenderer.invoke('embedding:embed', texts),
   modelStatus: () => ipcRenderer.invoke('embedding:status'),
   modelPrepare: () => ipcRenderer.invoke('model:prepare'),
@@ -19,7 +20,8 @@ contextBridge.exposeInMainWorld('marginDesktop', {
     ipcRenderer.on('model:progress', handler);
     return () => ipcRenderer.removeListener('model:progress', handler);
   },
-  ocrRecognize: (image, language, page) => ipcRenderer.invoke('ocr:recognize', { image, language, page }),
+  ocrRecognize: (image, language, page) =>
+    ipcRenderer.invoke('ocr:recognize', { image, language, page }),
   onOcrProgress: (listener) => {
     const handler = (_event, progress) => listener(progress);
     ipcRenderer.on('ocr:progress', handler);
@@ -39,28 +41,79 @@ contextBridge.exposeInMainWorld('marginDesktop', {
     return () => ipcRenderer.removeListener('glm:progress', handler);
   },
   libraryList: () => ipcRenderer.invoke('library:list'),
-  libraryImport: (name, data) => ipcRenderer.invoke('library:import', { name, data }),
+  libraryImport: (name, data) =>
+    ipcRenderer.invoke('library:import', { name, data }),
   libraryImportFile: async (file) => {
     const filePath = webUtils.getPathForFile(file);
-    if (filePath) return ipcRenderer.invoke('library:import-file', { name: file.name, filePath });
-    return ipcRenderer.invoke('library:import', { name: file.name, data: await file.arrayBuffer() });
+    if (filePath)
+      return ipcRenderer.invoke('library:import-file', {
+        name: file.name,
+        filePath,
+      });
+    return ipcRenderer.invoke('library:import', {
+      name: file.name,
+      data: await file.arrayBuffer(),
+    });
   },
   libraryRead: (id) => ipcRenderer.invoke('library:read', id),
   libraryRemove: (id) => ipcRenderer.invoke('library:remove', id),
-  libraryUpdate: (id, changes) => ipcRenderer.invoke('library:update', id, changes),
-  libraryIndexOpen: (id, providerId) => ipcRenderer.invoke('library:index-open', id, providerId),
-  libraryIndexStart: (id, providerId, dimensions, buildKey) => ipcRenderer.invoke('library:index-start', id, providerId, dimensions, buildKey),
-  libraryIndexSavePages: (id, entries) => ipcRenderer.invoke('library:index-save-pages', id, entries),
-  libraryIndexAppend: (id, entries) => ipcRenderer.invoke('library:index-append', id, entries),
+  libraryUpdate: (id, changes) =>
+    ipcRenderer.invoke('library:update', id, changes),
+  libraryIndexOpen: (id, providerId) =>
+    ipcRenderer.invoke('library:index-open', id, providerId),
+  libraryIndexStart: (id, providerId, dimensions, buildKey) =>
+    ipcRenderer.invoke(
+      'library:index-start',
+      id,
+      providerId,
+      dimensions,
+      buildKey,
+    ),
+  libraryIndexSavePages: (id, entries) =>
+    ipcRenderer.invoke('library:index-save-pages', id, entries),
+  libraryIndexAppend: (id, entries) =>
+    ipcRenderer.invoke('library:index-append', id, entries),
   libraryIndexFinish: (id) => ipcRenderer.invoke('library:index-finish', id),
   libraryIndexCancel: (id) => ipcRenderer.invoke('library:index-cancel', id),
   libraryIndexDiscard: (id) => ipcRenderer.invoke('library:index-discard', id),
-  libraryIndexSearch: (id, providerId, vector, limit) => ipcRenderer.invoke('library:index-search', id, providerId, vector, limit),
+  libraryIndexSearch: (id, providerId, vector, limit) =>
+    ipcRenderer.invoke('library:index-search', id, providerId, vector, limit),
+  workspaceChatLoad: (bookId, limit) =>
+    ipcRenderer.invoke('workspace:chat-load', bookId, limit),
+  workspaceChatReplace: (bookId, bookName, messages) =>
+    ipcRenderer.invoke('workspace:chat-replace', bookId, bookName, messages),
+  workspaceHistorySearch: (query, limit, offset) =>
+    ipcRenderer.invoke('workspace:history-search', query, limit, offset),
+  workspaceNotesList: (options) =>
+    ipcRenderer.invoke('workspace:notes-list', options),
+  workspaceNoteSave: (bookId, bookName, note) =>
+    ipcRenderer.invoke('workspace:note-save', bookId, bookName, note),
+  workspaceNoteRemove: (id) => ipcRenderer.invoke('workspace:note-remove', id),
+  workspaceExportMarkdown: (options) =>
+    ipcRenderer.invoke('workspace:export-markdown', options),
 });
 
 window.addEventListener('error', (event) => {
-  ipcRenderer.send('log:renderer', { event: 'window-error', level: 'error', details: { message: event.message, filename: event.filename, line: event.lineno, column: event.colno } });
+  ipcRenderer.send('log:renderer', {
+    event: 'window-error',
+    level: 'error',
+    details: {
+      message: event.message,
+      filename: event.filename,
+      line: event.lineno,
+      column: event.colno,
+    },
+  });
 });
 window.addEventListener('unhandledrejection', (event) => {
-  ipcRenderer.send('log:renderer', { event: 'unhandled-rejection', level: 'error', details: { message: event.reason instanceof Error ? event.reason.message : String(event.reason) } });
+  ipcRenderer.send('log:renderer', {
+    event: 'unhandled-rejection',
+    level: 'error',
+    details: {
+      message:
+        event.reason instanceof Error
+          ? event.reason.message
+          : String(event.reason),
+    },
+  });
 });
