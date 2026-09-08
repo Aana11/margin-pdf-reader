@@ -1,6 +1,6 @@
 {
   "name": "margin-pdf-reader",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Local-first AI PDF reader with offline and pluggable RAG",
   "author": "Margin contributors",
   "private": true,
@@ -28,6 +28,7 @@
     "test:region-reading": "node scripts/test-region-reading.mjs",
     "test:index-resume": "node scripts/test-index-resume.mjs",
     "test:index-tasks": "node scripts/test-index-tasks.mjs",
+    "test:workspace": "node scripts/test-workspace-store.mjs",
     "benchmark:index": "node scripts/benchmark-index-store.mjs",
     "diagnose:library-index": "node scripts/diagnose-library-index.mjs",
     "docs:screenshots": "node scripts/capture-readme-screenshots.mjs",

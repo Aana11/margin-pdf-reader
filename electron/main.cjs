@@ -1,15 +1,55 @@
-const { app, BrowserWindow, ipcMain, net, protocol, shell } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  net,
+  protocol,
+  shell,
+} = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
 const { createHash, randomUUID } = require('node:crypto');
 const { createReadStream, createWriteStream } = require('node:fs');
-const { access, appendFile, copyFile, mkdir, open, readFile, rename, rm, stat, statfs, writeFile } = require('node:fs/promises');
+const {
+  access,
+  appendFile,
+  copyFile,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  rm,
+  stat,
+  statfs,
+  writeFile,
+} = require('node:fs/promises');
 const nodeNet = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { Readable, Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
-const { appendIndexBatch, cancelIndexBuild, finishIndexBuild, getIndexCheckpoint, openIndex, pauseIndexBuild, saveIndexPages, searchIndex, startIndexBuild } = require('./index-store.cjs');
+const {
+  appendIndexBatch,
+  cancelIndexBuild,
+  finishIndexBuild,
+  getIndexCheckpoint,
+  openIndex,
+  pauseIndexBuild,
+  saveIndexPages,
+  searchIndex,
+  startIndexBuild,
+} = require('./index-store.cjs');
+const {
+  listNotes,
+  loadChat,
+  markdownExport,
+  removeBookData,
+  removeNote,
+  replaceChat,
+  saveNote,
+  searchHistory,
+} = require('./workspace-store.cjs');
 
 const isDevelopment = !app.isPackaged;
 const embeddingModel = 'Qwen/Qwen3-Embedding-4B';
@@ -21,7 +61,13 @@ const gpuRuntimeVersion = 'b10516';
 const forcedRuntimeBackend = process.env.MARGIN_RUNTIME_BACKEND;
 const runtimeBackend = ['cpu', 'vulkan'].includes(forcedRuntimeBackend)
   ? forcedRuntimeBackend
-  : (spawnSync('nvidia-smi', ['--query-gpu=name', '--format=csv,noheader'], { windowsHide: true, encoding: 'utf8', timeout: 3_000 }).status === 0 ? 'vulkan' : 'cpu');
+  : spawnSync('nvidia-smi', ['--query-gpu=name', '--format=csv,noheader'], {
+        windowsHide: true,
+        encoding: 'utf8',
+        timeout: 3_000,
+      }).status === 0
+    ? 'vulkan'
+    : 'cpu';
 let sidecarPromise;
 let sidecarProcess;
 let sidecarIdleTimer;
@@ -31,7 +77,10 @@ let modelDownloadController;
 let modelInstallState = { state: 'idle', progress: 0, message: '' };
 let runtimeRepairPromise;
 let logQueue = Promise.resolve();
-const OCR_WORKER_COUNT = Math.max(1, Math.min(4, Math.floor(os.cpus().length / 4)));
+const OCR_WORKER_COUNT = Math.max(
+  1,
+  Math.min(4, Math.floor(os.cpus().length / 4)),
+);
 let ocrWorkerLanguage;
 let ocrWorkerSlots = [];
 let ocrPoolSetupPromise;
@@ -50,7 +99,17 @@ const glmManagedProjectorName = 'mmproj-GLM-OCR-Q8_0.gguf';
 
 app.setName('Margin');
 
-protocol.registerSchemesAsPrivileged([{ scheme: 'margin', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }]);
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'margin',
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+    },
+  },
+]);
 
 function dataRoot() {
   return process.env.MARGIN_DATA_ROOT || app.getPath('userData');
@@ -65,7 +124,7 @@ function ocrRoot() {
 }
 
 const ocrLanguages = {
-  'eng': ['eng'],
+  eng: ['eng'],
   'chi_sim+eng': ['chi_sim', 'eng'],
   'chi_tra+eng': ['chi_tra', 'eng'],
 };
@@ -75,7 +134,8 @@ async function ensureOcrLanguageData(language) {
   if (!codes) throw new Error('Unsupported OCR language');
   if (app.isPackaged) {
     const destination = path.join(process.resourcesPath, 'ocr', 'tessdata');
-    for (const code of codes) await access(path.join(destination, `${code}.traineddata.gz`));
+    for (const code of codes)
+      await access(path.join(destination, `${code}.traineddata.gz`));
     return { codes, destination };
   }
   const destination = path.join(ocrRoot(), 'tessdata');
@@ -87,7 +147,11 @@ async function ensureOcrLanguageData(language) {
   };
   for (const code of codes) {
     const target = path.join(destination, `${code}.traineddata.gz`);
-    if (!await exists(target)) await copyFile(path.join(packages[code].langPath, `${code}.traineddata.gz`), target);
+    if (!(await exists(target)))
+      await copyFile(
+        path.join(packages[code].langPath, `${code}.traineddata.gz`),
+        target,
+      );
   }
   return { codes, destination };
 }
@@ -100,13 +164,25 @@ async function createOcrWorkerPool(language) {
   const cachePath = path.join(ocrRoot(), 'cache');
   await mkdir(cachePath, { recursive: true });
   const createSlot = (index) => {
-    const slot = { index, pending: 0, page: 0, sender: null, queue: Promise.resolve(), worker: null };
+    const slot = {
+      index,
+      pending: 0,
+      page: 0,
+      sender: null,
+      queue: Promise.resolve(),
+      worker: null,
+    };
     slot.worker = createWorker(codes, OEM.LSTM_ONLY, {
       langPath: destination,
       cachePath,
       gzip: true,
       logger(message) {
-        if (slot.sender && !slot.sender.isDestroyed()) slot.sender.send('ocr:progress', { page: slot.page, status: message.status, progress: Math.round((message.progress || 0) * 100) });
+        if (slot.sender && !slot.sender.isDestroyed())
+          slot.sender.send('ocr:progress', {
+            page: slot.page,
+            status: message.status,
+            progress: Math.round((message.progress || 0) * 100),
+          });
       },
     });
     return slot;
@@ -117,7 +193,12 @@ async function createOcrWorkerPool(language) {
   const first = createSlot(0);
   ocrWorkerSlots = [first];
   await first.worker;
-  const slots = [first, ...Array.from({ length: OCR_WORKER_COUNT - 1 }, (_, index) => createSlot(index + 1))];
+  const slots = [
+    first,
+    ...Array.from({ length: OCR_WORKER_COUNT - 1 }, (_, index) =>
+      createSlot(index + 1),
+    ),
+  ];
   ocrWorkerSlots = slots;
   await Promise.all(slots.slice(1).map((slot) => slot.worker));
   await logEvent('info', 'ocr.pool-ready', { language, workers: slots.length });
@@ -125,13 +206,21 @@ async function createOcrWorkerPool(language) {
 }
 
 function getOcrWorkerPool(language) {
-  if (ocrWorkerLanguage === language && ocrWorkerSlots.length === OCR_WORKER_COUNT) return Promise.resolve(ocrWorkerSlots);
+  if (
+    ocrWorkerLanguage === language &&
+    ocrWorkerSlots.length === OCR_WORKER_COUNT
+  )
+    return Promise.resolve(ocrWorkerSlots);
   if (!ocrPoolSetupPromise) {
-    ocrPoolSetupPromise = createOcrWorkerPool(language).catch((error) => {
-      ocrWorkerLanguage = undefined;
-      ocrWorkerSlots = [];
-      throw error;
-    }).finally(() => { ocrPoolSetupPromise = undefined; });
+    ocrPoolSetupPromise = createOcrWorkerPool(language)
+      .catch((error) => {
+        ocrWorkerLanguage = undefined;
+        ocrWorkerSlots = [];
+        throw error;
+      })
+      .finally(() => {
+        ocrPoolSetupPromise = undefined;
+      });
   }
   return ocrPoolSetupPromise;
 }
@@ -140,7 +229,10 @@ function stopOcrWorker() {
   const current = ocrWorkerSlots;
   ocrWorkerSlots = [];
   ocrWorkerLanguage = undefined;
-  for (const slot of current) void slot.worker.then((worker) => worker.terminate()).catch(() => undefined);
+  for (const slot of current)
+    void slot.worker
+      .then((worker) => worker.terminate())
+      .catch(() => undefined);
 }
 
 function describeError(error) {
@@ -152,22 +244,29 @@ function describeError(error) {
     errno: error.errno,
     syscall: error.syscall,
     path: error.path,
-    stack: typeof error.stack === 'string' ? error.stack.split('\n').slice(0, 8).join('\n') : undefined,
+    stack:
+      typeof error.stack === 'string'
+        ? error.stack.split('\n').slice(0, 8).join('\n')
+        : undefined,
   };
 }
 
 function logEvent(level, event, details = {}) {
   const line = `${JSON.stringify({ timestamp: new Date().toISOString(), level, event, ...details })}\n`;
-  logQueue = logQueue.then(async () => {
-    const file = logFile();
-    await mkdir(path.dirname(file), { recursive: true });
-    const size = await stat(file).then((value) => value.size).catch(() => 0);
-    if (size > 5 * 1024 * 1024) {
-      await rm(`${file}.previous`, { force: true });
-      await rename(file, `${file}.previous`);
-    }
-    await appendFile(file, line, 'utf8');
-  }).catch((error) => console.error('[margin-log]', error));
+  logQueue = logQueue
+    .then(async () => {
+      const file = logFile();
+      await mkdir(path.dirname(file), { recursive: true });
+      const size = await stat(file)
+        .then((value) => value.size)
+        .catch(() => 0);
+      if (size > 5 * 1024 * 1024) {
+        await rm(`${file}.previous`, { force: true });
+        await rename(file, `${file}.previous`);
+      }
+      await appendFile(file, line, 'utf8');
+    })
+    .catch((error) => console.error('[margin-log]', error));
   return logQueue;
 }
 
@@ -180,11 +279,19 @@ function runtimeFile() {
 }
 
 function runtimeArchive() {
-  return path.join(dataRoot(), 'downloads', runtimeBackend === 'vulkan' ? `llama-${gpuRuntimeVersion}-bin-win-vulkan-x64.zip` : `llama-${runtimeVersion}-bin-win-cpu-x64.zip`);
+  return path.join(
+    dataRoot(),
+    'downloads',
+    runtimeBackend === 'vulkan'
+      ? `llama-${gpuRuntimeVersion}-bin-win-vulkan-x64.zip`
+      : `llama-${runtimeVersion}-bin-win-cpu-x64.zip`,
+  );
 }
 
 function runtimeMarker() {
-  return runtimeBackend === 'vulkan' ? path.join(path.dirname(runtimeFile()), 'ggml-vulkan.dll') : runtimeFile();
+  return runtimeBackend === 'vulkan'
+    ? path.join(path.dirname(runtimeFile()), 'ggml-vulkan.dll')
+    : runtimeFile();
 }
 
 function runtimeStampFile() {
@@ -196,8 +303,11 @@ function expectedRuntimeStamp() {
 }
 
 async function isRuntimeCurrent() {
-  if (!await exists(runtimeFile()) || !await exists(runtimeMarker())) return false;
-  return readFile(runtimeStampFile(), 'utf8').then((value) => value.trim() === expectedRuntimeStamp()).catch(() => false);
+  if (!(await exists(runtimeFile())) || !(await exists(runtimeMarker())))
+    return false;
+  return readFile(runtimeStampFile(), 'utf8')
+    .then((value) => value.trim() === expectedRuntimeStamp())
+    .catch(() => false);
 }
 
 function glmModelFile() {
@@ -214,7 +324,8 @@ function glmModelResources() {
       name: 'GLM-OCR Q8_0',
       output: glmModelFile(),
       size: 950433408,
-      sha256: '45bc244a6446aff850521dc41f18bc8d7105ad5f0c2c8c28af04e7cc4f4d50b1',
+      sha256:
+        '45bc244a6446aff850521dc41f18bc8d7105ad5f0c2c8c28af04e7cc4f4d50b1',
       urls: [
         `https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main/${glmManagedModelName}`,
         `https://hf-mirror.com/ggml-org/GLM-OCR-GGUF/resolve/main/${glmManagedModelName}`,
@@ -224,7 +335,8 @@ function glmModelResources() {
       name: 'GLM-OCR 多模态投影器',
       output: glmProjectorFile(),
       size: 484403648,
-      sha256: '9c4b58e33e316ed142eb5dcb41abec3844d3e6e5dc361ffb782c3fa9d175141f',
+      sha256:
+        '9c4b58e33e316ed142eb5dcb41abec3844d3e6e5dc361ffb782c3fa9d175141f',
       urls: [
         `https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main/${glmManagedProjectorName}`,
         `https://hf-mirror.com/ggml-org/GLM-OCR-GGUF/resolve/main/${glmManagedProjectorName}`,
@@ -239,28 +351,35 @@ function modelResources() {
       name: 'Qwen3-Embedding-4B Q4_K_M',
       output: modelFile(),
       size: 2496703776,
-      sha256: '2b0cf8f17b4c723c27303015383c27ec4bf2d8314bb677d05e920dd70bb0f16b',
+      sha256:
+        '2b0cf8f17b4c723c27303015383c27ec4bf2d8314bb677d05e920dd70bb0f16b',
       urls: [
         `https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/resolve/${modelRevision}/${modelName}`,
         `https://www.modelscope.cn/models/Qwen/Qwen3-Embedding-4B-GGUF/resolve/master/${modelName}`,
         `https://hf-mirror.com/Qwen/Qwen3-Embedding-4B-GGUF/resolve/${modelRevision}/${modelName}`,
       ],
     },
-    runtimeBackend === 'vulkan' ? {
-      name: `llama.cpp ${gpuRuntimeVersion} Vulkan GPU`,
-      output: runtimeArchive(),
-      size: 34861181,
-      sha256: '530f57d2a874ce017827c1e5a926812b9d5de4667248575d1372b1c0acf94d83',
-      urls: [
-        `https://github.com/ggml-org/llama.cpp/releases/download/${gpuRuntimeVersion}/llama-${gpuRuntimeVersion}-bin-win-vulkan-x64.zip`,
-      ],
-    } : {
-      name: `llama.cpp ${runtimeVersion} CPU`,
-      output: runtimeArchive(),
-      size: 18506923,
-      sha256: 'fbbbc55e0eb2e1b07f9dcb9488616c98ed47d9003b90e15e7c8c7812c4307cd3',
-      urls: [`https://github.com/ggml-org/llama.cpp/releases/download/${runtimeVersion}/llama-${runtimeVersion}-bin-win-cpu-x64.zip`],
-    },
+    runtimeBackend === 'vulkan'
+      ? {
+          name: `llama.cpp ${gpuRuntimeVersion} Vulkan GPU`,
+          output: runtimeArchive(),
+          size: 34861181,
+          sha256:
+            '530f57d2a874ce017827c1e5a926812b9d5de4667248575d1372b1c0acf94d83',
+          urls: [
+            `https://github.com/ggml-org/llama.cpp/releases/download/${gpuRuntimeVersion}/llama-${gpuRuntimeVersion}-bin-win-vulkan-x64.zip`,
+          ],
+        }
+      : {
+          name: `llama.cpp ${runtimeVersion} CPU`,
+          output: runtimeArchive(),
+          size: 18506923,
+          sha256:
+            'fbbbc55e0eb2e1b07f9dcb9488616c98ed47d9003b90e15e7c8c7812c4307cd3',
+          urls: [
+            `https://github.com/ggml-org/llama.cpp/releases/download/${runtimeVersion}/llama-${runtimeVersion}-bin-win-cpu-x64.zip`,
+          ],
+        },
   ];
 }
 
@@ -272,17 +391,32 @@ async function hashFile(file) {
 
 function publishModelState(sender, changes) {
   modelInstallState = { ...modelInstallState, ...changes };
-  if (sender && !sender.isDestroyed()) sender.send('model:progress', modelInstallState);
+  if (sender && !sender.isDestroyed())
+    sender.send('model:progress', modelInstallState);
 }
 
-async function downloadResource(resource, sender, resourceIndex, signal, resourceCount = 2, publish = publishModelState) {
+async function downloadResource(
+  resource,
+  sender,
+  resourceIndex,
+  signal,
+  resourceCount = 2,
+  publish = publishModelState,
+) {
   const temporary = `${resource.output}.download`;
   await mkdir(path.dirname(resource.output), { recursive: true });
   for (const url of resource.urls) {
     try {
-      const existing = await stat(temporary).then((value) => value.size).catch(() => 0);
-      const response = await fetch(url, { redirect: 'follow', headers: existing ? { Range: `bytes=${existing}-` } : {}, signal });
-      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+      const existing = await stat(temporary)
+        .then((value) => value.size)
+        .catch(() => 0);
+      const response = await fetch(url, {
+        redirect: 'follow',
+        headers: existing ? { Range: `bytes=${existing}-` } : {},
+        signal,
+      });
+      if (!response.ok || !response.body)
+        throw new Error(`HTTP ${response.status}`);
       const resumed = existing > 0 && response.status === 206;
       let received = resumed ? existing : 0;
       let lastPercent = -1;
@@ -290,16 +424,26 @@ async function downloadResource(resource, sender, resourceIndex, signal, resourc
         transform(chunk, _encoding, done) {
           received += chunk.length;
           const resourceProgress = Math.min(1, received / resource.size);
-          const percent = Math.round(((resourceIndex + resourceProgress) / resourceCount) * 95);
+          const percent = Math.round(
+            ((resourceIndex + resourceProgress) / resourceCount) * 95,
+          );
           if (percent !== lastPercent) {
             lastPercent = percent;
-            publish(sender, { state: 'downloading', progress: percent, message: `正在下载 ${resource.name}` });
+            publish(sender, {
+              state: 'downloading',
+              progress: percent,
+              message: `正在下载 ${resource.name}`,
+            });
           }
           done(null, chunk);
         },
       });
-      await pipeline(Readable.fromWeb(response.body), progress, createWriteStream(temporary, { flags: resumed ? 'a' : 'w' }));
-      if (await hashFile(temporary) !== resource.sha256) {
+      await pipeline(
+        Readable.fromWeb(response.body),
+        progress,
+        createWriteStream(temporary, { flags: resumed ? 'a' : 'w' }),
+      );
+      if ((await hashFile(temporary)) !== resource.sha256) {
         await rm(temporary, { force: true });
         throw new Error('checksum mismatch');
       }
@@ -318,9 +462,15 @@ async function extractRuntime() {
   await rm(temporary, { recursive: true, force: true });
   await mkdir(temporary, { recursive: true });
   await new Promise((resolve, reject) => {
-    const process = spawn('tar.exe', ['-xf', runtimeArchive(), '-C', temporary], { windowsHide: true, stdio: 'ignore' });
+    const process = spawn(
+      'tar.exe',
+      ['-xf', runtimeArchive(), '-C', temporary],
+      { windowsHide: true, stdio: 'ignore' },
+    );
     process.once('error', reject);
-    process.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`运行时解压失败 (${code})`)));
+    process.once('exit', (code) =>
+      code === 0 ? resolve() : reject(new Error(`运行时解压失败 (${code})`)),
+    );
   });
   const destination = path.dirname(runtimeFile());
   await rm(destination, { recursive: true, force: true });
@@ -328,41 +478,90 @@ async function extractRuntime() {
   await access(runtimeFile());
   await access(runtimeMarker());
   await writeFile(runtimeStampFile(), expectedRuntimeStamp(), 'utf8');
-  await logEvent('info', 'runtime.repaired', { runtimePath: runtimeFile(), archivePath: runtimeArchive(), backend: runtimeBackend });
+  await logEvent('info', 'runtime.repaired', {
+    runtimePath: runtimeFile(),
+    archivePath: runtimeArchive(),
+    backend: runtimeBackend,
+  });
 }
 
 async function exists(file) {
-  return access(file).then(() => true).catch(() => false);
+  return access(file)
+    .then(() => true)
+    .catch(() => false);
 }
 
 async function ensureEmbeddingFiles() {
   let modelStats;
   try {
     modelStats = await stat(modelFile());
-    await logEvent('info', 'model.path-check', { component: 'model', path: modelFile(), size: modelStats.size, isFile: modelStats.isFile() });
+    await logEvent('info', 'model.path-check', {
+      component: 'model',
+      path: modelFile(),
+      size: modelStats.size,
+      isFile: modelStats.isFile(),
+    });
   } catch (error) {
-    await logEvent('error', 'model.path-check-failed', { component: 'model', path: modelFile(), error: describeError(error) });
-    const reason = error?.code === 'ENOENT' ? '文件不存在' : `访问失败 (${error?.code || 'UNKNOWN'}: ${error?.message || error})`;
-    throw new Error(`本地 GGUF 模型不可用：${modelFile()}；${reason}。请在模型设置中检查安装或打开日志。`);
+    await logEvent('error', 'model.path-check-failed', {
+      component: 'model',
+      path: modelFile(),
+      error: describeError(error),
+    });
+    const reason =
+      error?.code === 'ENOENT'
+        ? '文件不存在'
+        : `访问失败 (${error?.code || 'UNKNOWN'}: ${error?.message || error})`;
+    throw new Error(
+      `本地 GGUF 模型不可用：${modelFile()}；${reason}。请在模型设置中检查安装或打开日志。`,
+    );
   }
   if (!modelStats.isFile() || modelStats.size !== modelResources()[0].size) {
-    await logEvent('error', 'model.file-invalid', { path: modelFile(), size: modelStats.size, expectedSize: modelResources()[0].size });
-    throw new Error(`本地 GGUF 模型大小异常：${modelFile()}；实际 ${modelStats.size} 字节，应为 ${modelResources()[0].size} 字节。`);
+    await logEvent('error', 'model.file-invalid', {
+      path: modelFile(),
+      size: modelStats.size,
+      expectedSize: modelResources()[0].size,
+    });
+    throw new Error(
+      `本地 GGUF 模型大小异常：${modelFile()}；实际 ${modelStats.size} 字节，应为 ${modelResources()[0].size} 字节。`,
+    );
   }
   try {
     const runtimeStats = await stat(runtimeFile());
     await access(runtimeMarker());
-    if (!await isRuntimeCurrent()) throw new Error('runtime version is outdated');
-    await logEvent('info', 'model.path-check', { component: 'runtime', path: runtimeFile(), markerPath: runtimeMarker(), size: runtimeStats.size, isFile: runtimeStats.isFile(), backend: runtimeBackend });
+    if (!(await isRuntimeCurrent()))
+      throw new Error('runtime version is outdated');
+    await logEvent('info', 'model.path-check', {
+      component: 'runtime',
+      path: runtimeFile(),
+      markerPath: runtimeMarker(),
+      size: runtimeStats.size,
+      isFile: runtimeStats.isFile(),
+      backend: runtimeBackend,
+    });
     if (!runtimeStats.isFile()) throw new Error('runtime path is not a file');
   } catch (runtimeError) {
-    await logEvent('warn', 'runtime.path-check-failed', { path: runtimeFile(), error: describeError(runtimeError) });
-    if (await exists(runtimeArchive()) && await hashFile(runtimeArchive()) === modelResources()[1].sha256) {
-      await logEvent('info', 'runtime.repair-started', { archivePath: runtimeArchive(), runtimePath: runtimeFile(), backend: runtimeBackend });
-      if (!runtimeRepairPromise) runtimeRepairPromise = extractRuntime().finally(() => { runtimeRepairPromise = undefined; });
+    await logEvent('warn', 'runtime.path-check-failed', {
+      path: runtimeFile(),
+      error: describeError(runtimeError),
+    });
+    if (
+      (await exists(runtimeArchive())) &&
+      (await hashFile(runtimeArchive())) === modelResources()[1].sha256
+    ) {
+      await logEvent('info', 'runtime.repair-started', {
+        archivePath: runtimeArchive(),
+        runtimePath: runtimeFile(),
+        backend: runtimeBackend,
+      });
+      if (!runtimeRepairPromise)
+        runtimeRepairPromise = extractRuntime().finally(() => {
+          runtimeRepairPromise = undefined;
+        });
       await runtimeRepairPromise;
     } else {
-      throw new Error(`llama.cpp ${runtimeBackend} 运行时不可用：${runtimeFile()}；${runtimeError?.code || runtimeError?.message || '未知访问错误'}。请在模型设置中点击“下载并安装”或打开日志。`);
+      throw new Error(
+        `llama.cpp ${runtimeBackend} 运行时不可用：${runtimeFile()}；${runtimeError?.code || runtimeError?.message || '未知访问错误'}。请在模型设置中点击“下载并安装”或打开日志。`,
+      );
     }
   }
 }
@@ -375,29 +574,57 @@ async function installModel(sender) {
     await mkdir(dataRoot(), { recursive: true });
     const disk = await statfs(dataRoot());
     const available = Number(disk.bavail) * Number(disk.bsize);
-    const required = modelResources().reduce((sum, resource) => sum + resource.size, 0) + 600 * 1024 * 1024;
-    if (available < required) throw new Error(`磁盘空间不足，需要至少 ${(required / 1024 / 1024 / 1024).toFixed(1)} GB 可用空间`);
-    publishModelState(sender, { state: 'checking', progress: 0, message: '正在校验本地文件' });
+    const required =
+      modelResources().reduce((sum, resource) => sum + resource.size, 0) +
+      600 * 1024 * 1024;
+    if (available < required)
+      throw new Error(
+        `磁盘空间不足，需要至少 ${(required / 1024 / 1024 / 1024).toFixed(1)} GB 可用空间`,
+      );
+    publishModelState(sender, {
+      state: 'checking',
+      progress: 0,
+      message: '正在校验本地文件',
+    });
     const resources = modelResources();
     for (const [index, resource] of resources.entries()) {
-      const valid = await access(resource.output).then(() => hashFile(resource.output)).then((digest) => digest === resource.sha256).catch(() => false);
+      const valid = await access(resource.output)
+        .then(() => hashFile(resource.output))
+        .then((digest) => digest === resource.sha256)
+        .catch(() => false);
       if (!valid) await downloadResource(resource, sender, index, signal);
     }
-    publishModelState(sender, { state: 'installing', progress: 96, message: '正在安装 llama.cpp 运行时' });
-    if (!await isRuntimeCurrent()) await extractRuntime();
-    publishModelState(sender, { state: 'ready', progress: 100, message: '本地向量模型已就绪' });
+    publishModelState(sender, {
+      state: 'installing',
+      progress: 96,
+      message: '正在安装 llama.cpp 运行时',
+    });
+    if (!(await isRuntimeCurrent())) await extractRuntime();
+    publishModelState(sender, {
+      state: 'ready',
+      progress: 100,
+      message: '本地向量模型已就绪',
+    });
     return { installed: true };
-  })().catch((error) => {
-    if (signal.aborted) {
-      publishModelState(sender, { state: 'paused', message: '下载已暂停，可继续下载' });
-      return { installed: false, paused: true };
-    }
-    publishModelState(sender, { state: 'error', message: error instanceof Error ? error.message : String(error) });
-    throw error;
-  }).finally(() => {
-    modelInstallPromise = undefined;
-    modelDownloadController = undefined;
-  });
+  })()
+    .catch((error) => {
+      if (signal.aborted) {
+        publishModelState(sender, {
+          state: 'paused',
+          message: '下载已暂停，可继续下载',
+        });
+        return { installed: false, paused: true };
+      }
+      publishModelState(sender, {
+        state: 'error',
+        message: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    })
+    .finally(() => {
+      modelInstallPromise = undefined;
+      modelDownloadController = undefined;
+    });
   return modelInstallPromise;
 }
 
@@ -410,7 +637,8 @@ function catalogFile() {
 }
 
 function assertBookId(id) {
-  if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/.test(id)) throw new Error('Invalid library book id');
+  if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/.test(id))
+    throw new Error('Invalid library book id');
   return id;
 }
 
@@ -460,7 +688,11 @@ async function getFreePort() {
 }
 
 async function startSidecar() {
-  await Promise.all([access(modelFile()), access(runtimeFile()), access(runtimeMarker())]);
+  await Promise.all([
+    access(modelFile()),
+    access(runtimeFile()),
+    access(runtimeMarker()),
+  ]);
   stopGlmSidecar();
   const port = await getFreePort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -468,42 +700,78 @@ async function startSidecar() {
   const startedAt = Date.now();
   const parallelSlots = runtimeBackend === 'vulkan' ? 8 : 4;
   const batchSize = runtimeBackend === 'vulkan' ? 1024 : 512;
-  await logEvent('info', 'sidecar.starting', { runtimePath: runtimeFile(), modelPath: modelFile(), backend: runtimeBackend, port, contextSize: 2048, batchSize, parallelSlots });
-  sidecarProcess = spawn(runtimeFile(), [
-    '--model', modelFile(),
-    '--embedding',
-    '--pooling', 'last',
-    '--host', '127.0.0.1',
-    '--port', String(port),
-    '--ctx-size', '2048',
-    '--parallel', String(parallelSlots),
-    '--kv-unified',
-    '--batch-size', String(batchSize),
-    '--ubatch-size', String(batchSize),
-    '--threads', String(Math.max(1, Math.min(8, Math.ceil(os.cpus().length / 2)))),
-    ...(runtimeBackend === 'vulkan' ? ['--n-gpu-layers', '99'] : []),
-    '--no-webui',
-  ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  await logEvent('info', 'sidecar.starting', {
+    runtimePath: runtimeFile(),
+    modelPath: modelFile(),
+    backend: runtimeBackend,
+    port,
+    contextSize: 2048,
+    batchSize,
+    parallelSlots,
+  });
+  sidecarProcess = spawn(
+    runtimeFile(),
+    [
+      '--model',
+      modelFile(),
+      '--embedding',
+      '--pooling',
+      'last',
+      '--host',
+      '127.0.0.1',
+      '--port',
+      String(port),
+      '--ctx-size',
+      '2048',
+      '--parallel',
+      String(parallelSlots),
+      '--kv-unified',
+      '--batch-size',
+      String(batchSize),
+      '--ubatch-size',
+      String(batchSize),
+      '--threads',
+      String(Math.max(1, Math.min(8, Math.ceil(os.cpus().length / 2)))),
+      ...(runtimeBackend === 'vulkan' ? ['--n-gpu-layers', '99'] : []),
+      '--no-webui',
+    ],
+    { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
   const launchedProcess = sidecarProcess;
   launchedProcess.once('exit', (code, signal) => {
-    void logEvent(code === 0 || signal === 'SIGTERM' ? 'info' : 'error', 'sidecar.exited', { pid: launchedProcess.pid, code, signal, logTail: logs.slice(-2000) });
+    void logEvent(
+      code === 0 || signal === 'SIGTERM' ? 'info' : 'error',
+      'sidecar.exited',
+      { pid: launchedProcess.pid, code, signal, logTail: logs.slice(-2000) },
+    );
     if (sidecarProcess === launchedProcess) {
       sidecarProcess = undefined;
       sidecarPromise = undefined;
     }
   });
-  const collect = (chunk) => { logs = `${logs}${chunk}`.slice(-6_000); };
+  const collect = (chunk) => {
+    logs = `${logs}${chunk}`.slice(-6_000);
+  };
   sidecarProcess.stdout.on('data', collect);
   sidecarProcess.stderr.on('data', collect);
   for (let attempt = 0; attempt < 240; attempt += 1) {
-    if (sidecarProcess.exitCode !== null) throw new Error(`本地向量服务退出 (${sidecarProcess.exitCode})：${logs.slice(-1000)}`);
+    if (sidecarProcess.exitCode !== null)
+      throw new Error(
+        `本地向量服务退出 (${sidecarProcess.exitCode})：${logs.slice(-1000)}`,
+      );
     try {
       const response = await fetch(`${baseUrl}/health`);
       if (response.ok) {
-        await logEvent('info', 'sidecar.ready', { pid: sidecarProcess.pid, port, elapsedMs: Date.now() - startedAt });
+        await logEvent('info', 'sidecar.ready', {
+          pid: sidecarProcess.pid,
+          port,
+          elapsedMs: Date.now() - startedAt,
+        });
         return baseUrl;
       }
-    } catch { /* Model is still loading. */ }
+    } catch {
+      /* Model is still loading. */
+    }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   sidecarProcess.kill();
@@ -514,7 +782,9 @@ function stopSidecar() {
   if (sidecarIdleTimer) clearTimeout(sidecarIdleTimer);
   sidecarIdleTimer = undefined;
   if (sidecarProcess && sidecarProcess.exitCode === null) {
-    void logEvent('info', 'sidecar.stop-requested', { pid: sidecarProcess.pid });
+    void logEvent('info', 'sidecar.stop-requested', {
+      pid: sidecarProcess.pid,
+    });
     sidecarProcess.kill();
   }
   sidecarProcess = undefined;
@@ -528,18 +798,39 @@ function scheduleSidecarIdleStop() {
 }
 
 async function getSidecarUrl() {
-  if (!sidecarPromise) sidecarPromise = startSidecar().catch((error) => { sidecarPromise = undefined; throw error; });
+  if (!sidecarPromise)
+    sidecarPromise = startSidecar().catch((error) => {
+      sidecarPromise = undefined;
+      throw error;
+    });
   return sidecarPromise;
 }
 
 async function getModelStatus() {
   const missing = [];
-  if (!await exists(modelFile())) missing.push('model');
-  if (!await isRuntimeCurrent()) missing.push('runtime');
+  if (!(await exists(modelFile()))) missing.push('model');
+  if (!(await isRuntimeCurrent())) missing.push('runtime');
   if (missing.length === 0) {
-    return { installed: true, loaded: Boolean(sidecarProcess && sidecarProcess.exitCode === null), model: embeddingModel, root: dataRoot(), backend: runtimeBackend, ...modelInstallState, state: modelInstallState.state === 'idle' ? 'ready' : modelInstallState.state };
+    return {
+      installed: true,
+      loaded: Boolean(sidecarProcess && sidecarProcess.exitCode === null),
+      model: embeddingModel,
+      root: dataRoot(),
+      backend: runtimeBackend,
+      ...modelInstallState,
+      state:
+        modelInstallState.state === 'idle' ? 'ready' : modelInstallState.state,
+    };
   }
-  return { installed: false, loaded: false, missing, model: embeddingModel, root: dataRoot(), backend: runtimeBackend, ...modelInstallState };
+  return {
+    installed: false,
+    loaded: false,
+    missing,
+    model: embeddingModel,
+    root: dataRoot(),
+    backend: runtimeBackend,
+    ...modelInstallState,
+  };
 }
 
 const glmTaskPrompts = {
@@ -549,16 +840,33 @@ const glmTaskPrompts = {
 };
 
 function assertGlmConfig(payload) {
-  const provider = ['managed', 'ollama'].includes(payload?.provider) ? payload.provider : 'openai-compatible';
+  const provider = ['managed', 'ollama'].includes(payload?.provider)
+    ? payload.provider
+    : 'openai-compatible';
   if (provider === 'managed') {
-    return { provider, endpoint: '', model: glmManagedModel, apiKey: '', autoStart: payload?.autoStart !== false };
+    return {
+      provider,
+      endpoint: '',
+      model: glmManagedModel,
+      apiKey: '',
+      autoStart: payload?.autoStart !== false,
+    };
   }
-  const endpoint = String(payload?.endpoint || '').trim().replace(/\/+$/, '');
+  const endpoint = String(payload?.endpoint || '')
+    .trim()
+    .replace(/\/+$/, '');
   const model = String(payload?.model || '').trim();
   if (!endpoint || !model) throw new Error('GLM-OCR 端点和模型名称不能为空');
   const url = new URL(endpoint);
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('GLM-OCR 端点必须使用 HTTP 或 HTTPS');
-  return { provider, endpoint, model, apiKey: String(payload?.apiKey || '').trim(), autoStart: payload?.autoStart !== false };
+  if (!['http:', 'https:'].includes(url.protocol))
+    throw new Error('GLM-OCR 端点必须使用 HTTP 或 HTTPS');
+  return {
+    provider,
+    endpoint,
+    model,
+    apiKey: String(payload?.apiKey || '').trim(),
+    autoStart: payload?.autoStart !== false,
+  };
 }
 
 function ollamaBaseUrl(endpoint) {
@@ -570,46 +878,76 @@ function ollamaBaseUrl(endpoint) {
 }
 
 function findOllamaExecutable() {
-  const located = spawnSync('where.exe', ['ollama.exe'], { windowsHide: true, encoding: 'utf8', timeout: 3_000 });
-  const fromPath = located.status === 0 ? located.stdout.split(/\r?\n/).find(Boolean)?.trim() : '';
+  const located = spawnSync('where.exe', ['ollama.exe'], {
+    windowsHide: true,
+    encoding: 'utf8',
+    timeout: 3_000,
+  });
+  const fromPath =
+    located.status === 0
+      ? located.stdout.split(/\r?\n/).find(Boolean)?.trim()
+      : '';
   const candidates = [
     fromPath,
-    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'Ollama', 'ollama.exe'),
-    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Ollama', 'ollama.exe'),
+    process.env.LOCALAPPDATA &&
+      path.join(process.env.LOCALAPPDATA, 'Programs', 'Ollama', 'ollama.exe'),
+    process.env.PROGRAMFILES &&
+      path.join(process.env.PROGRAMFILES, 'Ollama', 'ollama.exe'),
   ].filter(Boolean);
-  return candidates.find((candidate) => require('node:fs').existsSync(candidate)) || null;
+  return (
+    candidates.find((candidate) => require('node:fs').existsSync(candidate)) ||
+    null
+  );
 }
 
 async function fetchJsonWithTimeout(url, options = {}, timeout = 5_000) {
   try {
-    const response = await fetch(url, { ...options, signal: AbortSignal.timeout(timeout) });
+    const response = await fetch(url, {
+      ...options,
+      signal: AbortSignal.timeout(timeout),
+    });
     const text = await response.text();
     let payload;
-    try { payload = text ? JSON.parse(text) : {}; } catch { payload = { message: text }; }
-    if (!response.ok) throw new Error(payload?.error || payload?.message || `HTTP ${response.status}`);
+    try {
+      payload = text ? JSON.parse(text) : {};
+    } catch {
+      payload = { message: text };
+    }
+    if (!response.ok)
+      throw new Error(
+        payload?.error || payload?.message || `HTTP ${response.status}`,
+      );
     return payload;
   } catch (error) {
     const code = error?.cause?.code || error?.code;
-    if (code === 'ECONNREFUSED' || error?.name === 'TimeoutError') throw new Error('无法连接 GLM-OCR 服务；请确认服务已启动且端口正确');
-    if (error?.message === 'fetch failed' || code) throw new Error(`无法访问 GLM-OCR 端点${code ? `（${code}）` : ''}；请检查地址、网络和服务状态`);
+    if (code === 'ECONNREFUSED' || error?.name === 'TimeoutError')
+      throw new Error('无法连接 GLM-OCR 服务；请确认服务已启动且端口正确');
+    if (error?.message === 'fetch failed' || code)
+      throw new Error(
+        `无法访问 GLM-OCR 端点${code ? `（${code}）` : ''}；请检查地址、网络和服务状态`,
+      );
     throw error;
   }
 }
 
 async function managedGlmFilesReady() {
   const resources = glmModelResources();
-  const checks = await Promise.all(resources.map(async (resource) => {
-    const details = await stat(resource.output).catch(() => null);
-    return Boolean(details?.isFile() && details.size === resource.size);
-  }));
-  return checks.every(Boolean) && await isRuntimeCurrent();
+  const checks = await Promise.all(
+    resources.map(async (resource) => {
+      const details = await stat(resource.output).catch(() => null);
+      return Boolean(details?.isFile() && details.size === resource.size);
+    }),
+  );
+  return checks.every(Boolean) && (await isRuntimeCurrent());
 }
 
 function stopGlmSidecar() {
   if (glmSidecarIdleTimer) clearTimeout(glmSidecarIdleTimer);
   glmSidecarIdleTimer = undefined;
   if (glmSidecarProcess && glmSidecarProcess.exitCode === null) {
-    void logEvent('info', 'glm-ocr.sidecar-stop-requested', { pid: glmSidecarProcess.pid });
+    void logEvent('info', 'glm-ocr.sidecar-stop-requested', {
+      pid: glmSidecarProcess.pid,
+    });
     glmSidecarProcess.kill();
   }
   glmSidecarProcess = undefined;
@@ -623,48 +961,85 @@ function scheduleGlmSidecarIdleStop() {
 }
 
 async function startManagedGlmSidecar() {
-  if (!await managedGlmFilesReady()) throw new Error('本地 GLM-OCR 尚未安装，请先在模型设置中点击“下载并安装”');
+  if (!(await managedGlmFilesReady()))
+    throw new Error('本地 GLM-OCR 尚未安装，请先在模型设置中点击“下载并安装”');
   stopSidecar();
   const port = await getFreePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   let logs = '';
   const startedAt = Date.now();
   const args = [
-    '--model', glmModelFile(),
-    '--mmproj', glmProjectorFile(),
-    '--host', '127.0.0.1',
-    '--port', String(port),
-    '--ctx-size', '12288',
-    '--parallel', '1',
-    '--threads', String(Math.max(1, Math.min(8, Math.ceil(os.cpus().length / 2)))),
-    '--flash-attn', 'off',
-    '--fit', 'off',
-    ...(runtimeBackend === 'vulkan' ? ['--n-gpu-layers', '99'] : ['--no-mmproj-offload']),
+    '--model',
+    glmModelFile(),
+    '--mmproj',
+    glmProjectorFile(),
+    '--host',
+    '127.0.0.1',
+    '--port',
+    String(port),
+    '--ctx-size',
+    '12288',
+    '--parallel',
+    '1',
+    '--threads',
+    String(Math.max(1, Math.min(8, Math.ceil(os.cpus().length / 2)))),
+    '--flash-attn',
+    'off',
+    '--fit',
+    'off',
+    ...(runtimeBackend === 'vulkan'
+      ? ['--n-gpu-layers', '99']
+      : ['--no-mmproj-offload']),
     '--no-webui',
   ];
-  await logEvent('info', 'glm-ocr.sidecar-starting', { runtimePath: runtimeFile(), modelPath: glmModelFile(), projectorPath: glmProjectorFile(), backend: runtimeBackend, port });
-  glmSidecarProcess = spawn(runtimeFile(), args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  await logEvent('info', 'glm-ocr.sidecar-starting', {
+    runtimePath: runtimeFile(),
+    modelPath: glmModelFile(),
+    projectorPath: glmProjectorFile(),
+    backend: runtimeBackend,
+    port,
+  });
+  glmSidecarProcess = spawn(runtimeFile(), args, {
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   const launchedProcess = glmSidecarProcess;
-  const collect = (chunk) => { logs = `${logs}${chunk}`.slice(-8_000); };
+  const collect = (chunk) => {
+    logs = `${logs}${chunk}`.slice(-8_000);
+  };
   launchedProcess.stdout.on('data', collect);
   launchedProcess.stderr.on('data', collect);
   launchedProcess.once('exit', (code, signal) => {
-    void logEvent(code === 0 || signal === 'SIGTERM' ? 'info' : 'error', 'glm-ocr.sidecar-exited', { pid: launchedProcess.pid, code, signal, logTail: logs.slice(-2_000) });
+    void logEvent(
+      code === 0 || signal === 'SIGTERM' ? 'info' : 'error',
+      'glm-ocr.sidecar-exited',
+      { pid: launchedProcess.pid, code, signal, logTail: logs.slice(-2_000) },
+    );
     if (glmSidecarProcess === launchedProcess) {
       glmSidecarProcess = undefined;
       glmSidecarPromise = undefined;
     }
   });
   for (let attempt = 0; attempt < 360; attempt += 1) {
-    if (launchedProcess.exitCode !== null) throw new Error(`本地 GLM-OCR 服务退出 (${launchedProcess.exitCode})：${logs.slice(-1_000)}`);
+    if (launchedProcess.exitCode !== null)
+      throw new Error(
+        `本地 GLM-OCR 服务退出 (${launchedProcess.exitCode})：${logs.slice(-1_000)}`,
+      );
     try {
       const response = await fetch(`${baseUrl}/health`);
       if (response.ok) {
         scheduleGlmSidecarIdleStop();
-        await logEvent('info', 'glm-ocr.sidecar-ready', { pid: launchedProcess.pid, port, elapsedMs: Date.now() - startedAt, backend: runtimeBackend });
+        await logEvent('info', 'glm-ocr.sidecar-ready', {
+          pid: launchedProcess.pid,
+          port,
+          elapsedMs: Date.now() - startedAt,
+          backend: runtimeBackend,
+        });
         return baseUrl;
       }
-    } catch { /* Model is still loading. */ }
+    } catch {
+      /* Model is still loading. */
+    }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   stopGlmSidecar();
@@ -672,7 +1047,11 @@ async function startManagedGlmSidecar() {
 }
 
 async function getManagedGlmUrl() {
-  if (!glmSidecarPromise) glmSidecarPromise = startManagedGlmSidecar().catch((error) => { glmSidecarPromise = undefined; throw error; });
+  if (!glmSidecarPromise)
+    glmSidecarPromise = startManagedGlmSidecar().catch((error) => {
+      glmSidecarPromise = undefined;
+      throw error;
+    });
   return glmSidecarPromise;
 }
 
@@ -684,25 +1063,72 @@ async function installManagedGlm(sender) {
     const disk = await statfs(dataRoot());
     const available = Number(disk.bavail) * Number(disk.bsize);
     const resources = [...glmModelResources(), modelResources()[1]];
-    const resourceValidity = await Promise.all(resources.map(async (resource) => {
-      if (resource.output === runtimeArchive() && await isRuntimeCurrent()) return true;
-      return access(resource.output).then(() => hashFile(resource.output)).then((digest) => digest === resource.sha256).catch(() => false);
-    }));
-    const required = resources.reduce((sum, resource, index) => sum + (resourceValidity[index] ? 0 : resource.size), 0) + 500 * 1024 * 1024;
-    if (available < required) throw new Error(`磁盘空间不足，需要至少 ${(required / 1024 / 1024 / 1024).toFixed(1)} GB 可用空间`);
-    publishGlmState(sender, { provider: 'managed', state: 'checking', progress: 0, message: '正在校验本地 GLM-OCR 文件' });
+    const resourceValidity = await Promise.all(
+      resources.map(async (resource) => {
+        if (resource.output === runtimeArchive() && (await isRuntimeCurrent()))
+          return true;
+        return access(resource.output)
+          .then(() => hashFile(resource.output))
+          .then((digest) => digest === resource.sha256)
+          .catch(() => false);
+      }),
+    );
+    const required =
+      resources.reduce(
+        (sum, resource, index) =>
+          sum + (resourceValidity[index] ? 0 : resource.size),
+        0,
+      ) +
+      500 * 1024 * 1024;
+    if (available < required)
+      throw new Error(
+        `磁盘空间不足，需要至少 ${(required / 1024 / 1024 / 1024).toFixed(1)} GB 可用空间`,
+      );
+    publishGlmState(sender, {
+      provider: 'managed',
+      state: 'checking',
+      progress: 0,
+      message: '正在校验本地 GLM-OCR 文件',
+    });
     for (const [index, resource] of resources.entries()) {
-      if (!resourceValidity[index]) await downloadResource(resource, sender, index, signal, resources.length, (target, changes) => publishGlmState(target, { provider: 'managed', ...changes }));
+      if (!resourceValidity[index])
+        await downloadResource(
+          resource,
+          sender,
+          index,
+          signal,
+          resources.length,
+          (target, changes) =>
+            publishGlmState(target, { provider: 'managed', ...changes }),
+        );
     }
-    publishGlmState(sender, { provider: 'managed', state: 'installing', progress: 96, message: '正在安装共享 llama.cpp 运行时' });
-    if (!await isRuntimeCurrent()) await extractRuntime();
-    publishGlmState(sender, { provider: 'managed', state: 'ready', progress: 100, message: '本地 GLM-OCR 已就绪' });
+    publishGlmState(sender, {
+      provider: 'managed',
+      state: 'installing',
+      progress: 96,
+      message: '正在安装共享 llama.cpp 运行时',
+    });
+    if (!(await isRuntimeCurrent())) await extractRuntime();
+    publishGlmState(sender, {
+      provider: 'managed',
+      state: 'ready',
+      progress: 100,
+      message: '本地 GLM-OCR 已就绪',
+    });
   } catch (error) {
     if (signal.aborted) {
-      publishGlmState(sender, { provider: 'managed', state: 'paused', message: '下载已暂停，可继续下载' });
+      publishGlmState(sender, {
+        provider: 'managed',
+        state: 'paused',
+        message: '下载已暂停，可继续下载',
+      });
       return false;
     }
-    publishGlmState(sender, { provider: 'managed', state: 'error', message: error instanceof Error ? error.message : String(error) });
+    publishGlmState(sender, {
+      provider: 'managed',
+      state: 'error',
+      message: error instanceof Error ? error.message : String(error),
+    });
     throw error;
   } finally {
     glmDownloadController = undefined;
@@ -714,16 +1140,52 @@ async function getGlmStatus(config) {
   if (config.provider === 'managed') {
     const runtimeInstalled = await isRuntimeCurrent();
     const modelInstalled = await managedGlmFilesReady();
-    const modelLoaded = Boolean(glmSidecarProcess && glmSidecarProcess.exitCode === null);
-    const activeInstallState = ['checking', 'downloading', 'installing', 'paused', 'error'].includes(glmInstallState.state);
-    const state = activeInstallState ? glmInstallState.state : (modelLoaded ? 'loaded' : modelInstalled ? 'ready' : 'missing-model');
+    const modelLoaded = Boolean(
+      glmSidecarProcess && glmSidecarProcess.exitCode === null,
+    );
+    const activeInstallState = [
+      'checking',
+      'downloading',
+      'installing',
+      'paused',
+      'error',
+    ].includes(glmInstallState.state);
+    const state = activeInstallState
+      ? glmInstallState.state
+      : modelLoaded
+        ? 'loaded'
+        : modelInstalled
+          ? 'ready'
+          : 'missing-model';
     return {
-      provider: 'managed', runtimeInstalled, serviceRunning: modelLoaded, modelInstalled, modelLoaded, state,
+      provider: 'managed',
+      runtimeInstalled,
+      serviceRunning: modelLoaded,
+      modelInstalled,
+      modelLoaded,
+      state,
       progress: glmInstallState.progress,
-      message: activeInstallState && glmInstallState.message ? glmInstallState.message : (modelLoaded ? `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? 'Vulkan GPU' : 'CPU'}` : modelInstalled ? 'GLM-OCR 已安装，可按需自动启动' : '约 1.4 GB，Margin 将自动下载模型与运行时'),
+      message:
+        activeInstallState && glmInstallState.message
+          ? glmInstallState.message
+          : modelLoaded
+            ? `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? 'Vulkan GPU' : 'CPU'}`
+            : modelInstalled
+              ? 'GLM-OCR 已安装，可按需自动启动'
+              : '约 1.4 GB，Margin 将自动下载模型与运行时',
     };
   }
-  if (config.provider !== 'ollama') return { provider: config.provider, runtimeInstalled: true, serviceRunning: null, modelInstalled: null, modelLoaded: null, state: 'remote', progress: 0, message: '外部 OpenAI-compatible 服务由你自行管理' };
+  if (config.provider !== 'ollama')
+    return {
+      provider: config.provider,
+      runtimeInstalled: true,
+      serviceRunning: null,
+      modelInstalled: null,
+      modelLoaded: null,
+      state: 'remote',
+      progress: 0,
+      message: '外部 OpenAI-compatible 服务由你自行管理',
+    };
   const executable = findOllamaExecutable();
   const baseUrl = ollamaBaseUrl(config.endpoint);
   try {
@@ -731,14 +1193,52 @@ async function getGlmStatus(config) {
       fetchJsonWithTimeout(`${baseUrl}/api/tags`),
       fetchJsonWithTimeout(`${baseUrl}/api/ps`).catch(() => ({ models: [] })),
     ]);
-    const names = Array.isArray(tags.models) ? tags.models.flatMap((item) => [item.name, item.model].filter(Boolean)) : [];
-    const loadedNames = Array.isArray(running.models) ? running.models.flatMap((item) => [item.name, item.model].filter(Boolean)) : [];
-    const expectedNames = new Set([config.model, config.model.includes(':') ? config.model : `${config.model}:latest`]);
+    const names = Array.isArray(tags.models)
+      ? tags.models.flatMap((item) => [item.name, item.model].filter(Boolean))
+      : [];
+    const loadedNames = Array.isArray(running.models)
+      ? running.models.flatMap((item) =>
+          [item.name, item.model].filter(Boolean),
+        )
+      : [];
+    const expectedNames = new Set([
+      config.model,
+      config.model.includes(':') ? config.model : `${config.model}:latest`,
+    ]);
     const modelInstalled = names.some((name) => expectedNames.has(name));
     const modelLoaded = loadedNames.some((name) => expectedNames.has(name));
-    return { provider: 'ollama', runtimeInstalled: Boolean(executable), serviceRunning: true, modelInstalled, modelLoaded, state: modelLoaded ? 'loaded' : modelInstalled ? 'ready' : 'missing-model', progress: 0, message: modelLoaded ? 'GLM-OCR 已载入内存' : modelInstalled ? 'GLM-OCR 已安装，可按需自动载入' : `尚未下载 ${config.model}` };
+    return {
+      provider: 'ollama',
+      runtimeInstalled: Boolean(executable),
+      serviceRunning: true,
+      modelInstalled,
+      modelLoaded,
+      state: modelLoaded
+        ? 'loaded'
+        : modelInstalled
+          ? 'ready'
+          : 'missing-model',
+      progress: 0,
+      message: modelLoaded
+        ? 'GLM-OCR 已载入内存'
+        : modelInstalled
+          ? 'GLM-OCR 已安装，可按需自动载入'
+          : `尚未下载 ${config.model}`,
+    };
   } catch (error) {
-    return { provider: 'ollama', runtimeInstalled: Boolean(executable), serviceRunning: false, modelInstalled: false, modelLoaded: false, state: executable ? 'stopped' : 'missing-runtime', progress: 0, message: executable ? 'Ollama 服务未启动' : '未安装 Ollama；请先安装后再准备模型', error: error.message };
+    return {
+      provider: 'ollama',
+      runtimeInstalled: Boolean(executable),
+      serviceRunning: false,
+      modelInstalled: false,
+      modelLoaded: false,
+      state: executable ? 'stopped' : 'missing-runtime',
+      progress: 0,
+      message: executable
+        ? 'Ollama 服务未启动'
+        : '未安装 Ollama；请先安装后再准备模型',
+      error: error.message,
+    };
   }
 }
 
@@ -746,10 +1246,18 @@ async function ensureOllamaService(config) {
   const current = await getGlmStatus(config);
   if (current.serviceRunning) return current;
   const executable = findOllamaExecutable();
-  if (!executable) throw new Error('未检测到 Ollama。请在模型设置中点击“安装 Ollama”，安装后再准备 GLM-OCR');
+  if (!executable)
+    throw new Error(
+      '未检测到 Ollama。请在模型设置中点击“安装 Ollama”，安装后再准备 GLM-OCR',
+    );
   if (ollamaProcess?.exitCode === null) return current;
-  ollamaProcess = spawn(executable, ['serve'], { windowsHide: true, stdio: 'ignore' });
-  ollamaProcess.once('exit', () => { ollamaProcess = undefined; });
+  ollamaProcess = spawn(executable, ['serve'], {
+    windowsHide: true,
+    stdio: 'ignore',
+  });
+  ollamaProcess.once('exit', () => {
+    ollamaProcess = undefined;
+  });
   for (let attempt = 0; attempt < 40; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 500));
     const status = await getGlmStatus(config);
@@ -759,7 +1267,10 @@ async function ensureOllamaService(config) {
 }
 
 function publishGlmState(sender, changes) {
-  const state = changes.provider === 'managed' ? (glmInstallState = { ...glmInstallState, ...changes }) : changes;
+  const state =
+    changes.provider === 'managed'
+      ? (glmInstallState = { ...glmInstallState, ...changes })
+      : changes;
   if (sender && !sender.isDestroyed()) sender.send('glm:progress', state);
 }
 
@@ -774,9 +1285,14 @@ async function pullOllamaModel(config, sender) {
     });
   } catch (error) {
     const code = error?.cause?.code || error?.code;
-    throw new Error(`无法连接 Ollama 下载模型${code ? `（${code}）` : ''}；请检查本地服务和网络`);
+    throw new Error(
+      `无法连接 Ollama 下载模型${code ? `（${code}）` : ''}；请检查本地服务和网络`,
+    );
   }
-  if (!response.ok || !response.body) throw new Error((await response.text()) || `下载 GLM-OCR 失败 (${response.status})`);
+  if (!response.ok || !response.body)
+    throw new Error(
+      (await response.text()) || `下载 GLM-OCR 失败 (${response.status})`,
+    );
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -789,8 +1305,15 @@ async function pullOllamaModel(config, sender) {
       if (!line.trim()) continue;
       const item = JSON.parse(line);
       if (item.error) throw new Error(item.error);
-      const progress = item.total > 0 ? Math.min(99, Math.round((item.completed / item.total) * 100)) : 0;
-      publishGlmState(sender, { state: 'downloading', progress, message: item.status || `正在下载 ${config.model}` });
+      const progress =
+        item.total > 0
+          ? Math.min(99, Math.round((item.completed / item.total) * 100))
+          : 0;
+      publishGlmState(sender, {
+        state: 'downloading',
+        progress,
+        message: item.status || `正在下载 ${config.model}`,
+      });
     }
     if (done) break;
   }
@@ -801,31 +1324,77 @@ async function prepareGlm(config, sender) {
   if (glmPreparePromise) return glmPreparePromise;
   glmPreparePromise = (async () => {
     if (config.provider === 'managed') {
-      if (!await managedGlmFilesReady()) await installManagedGlm(sender);
-      if (!await managedGlmFilesReady()) return getGlmStatus(config);
-      publishGlmState(sender, { provider: 'managed', state: 'loading', progress: 99, message: '正在载入本地 GLM-OCR' });
+      if (!(await managedGlmFilesReady())) await installManagedGlm(sender);
+      if (!(await managedGlmFilesReady())) return getGlmStatus(config);
+      publishGlmState(sender, {
+        provider: 'managed',
+        state: 'loading',
+        progress: 99,
+        message: '正在载入本地 GLM-OCR',
+      });
       await getManagedGlmUrl();
-      publishGlmState(sender, { provider: 'managed', state: 'loaded', progress: 100, message: `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? 'Vulkan GPU' : 'CPU'}` });
-      await logEvent('info', 'glm-ocr.prepared', { provider: 'managed', model: glmManagedModel, backend: runtimeBackend });
+      publishGlmState(sender, {
+        provider: 'managed',
+        state: 'loaded',
+        progress: 100,
+        message: `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? 'Vulkan GPU' : 'CPU'}`,
+      });
+      await logEvent('info', 'glm-ocr.prepared', {
+        provider: 'managed',
+        model: glmManagedModel,
+        backend: runtimeBackend,
+      });
       return getGlmStatus(config);
     }
-    publishGlmState(sender, { state: 'starting', progress: 0, message: '正在启动 Ollama 服务' });
+    publishGlmState(sender, {
+      state: 'starting',
+      progress: 0,
+      message: '正在启动 Ollama 服务',
+    });
     let status = await ensureOllamaService(config);
     if (!status.modelInstalled) {
-      publishGlmState(sender, { state: 'downloading', progress: 0, message: `正在下载 ${config.model}` });
+      publishGlmState(sender, {
+        state: 'downloading',
+        progress: 0,
+        message: `正在下载 ${config.model}`,
+      });
       await pullOllamaModel(config, sender);
     }
-    publishGlmState(sender, { state: 'loading', progress: 99, message: '正在载入 GLM-OCR' });
+    publishGlmState(sender, {
+      state: 'loading',
+      progress: 99,
+      message: '正在载入 GLM-OCR',
+    });
     const baseUrl = ollamaBaseUrl(config.endpoint);
-    await fetchJsonWithTimeout(`${baseUrl}/api/generate`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: config.model, prompt: '', stream: false, keep_alive: '10m' }),
-    }, 120_000);
+    await fetchJsonWithTimeout(
+      `${baseUrl}/api/generate`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: config.model,
+          prompt: '',
+          stream: false,
+          keep_alive: '10m',
+        }),
+      },
+      120_000,
+    );
     status = await getGlmStatus(config);
-    publishGlmState(sender, { ...status, state: 'loaded', progress: 100, message: 'GLM-OCR 已载入内存' });
-    await logEvent('info', 'glm-ocr.prepared', { model: config.model, endpoint: config.endpoint });
+    publishGlmState(sender, {
+      ...status,
+      state: 'loaded',
+      progress: 100,
+      message: 'GLM-OCR 已载入内存',
+    });
+    await logEvent('info', 'glm-ocr.prepared', {
+      model: config.model,
+      endpoint: config.endpoint,
+    });
     return status;
-  })().finally(() => { glmPreparePromise = undefined; });
+  })().finally(() => {
+    glmPreparePromise = undefined;
+  });
   return glmPreparePromise;
 }
 
@@ -833,50 +1402,127 @@ async function recognizeGlm(payload) {
   const config = assertGlmConfig(payload);
   const image = payload?.image;
   const task = glmTaskPrompts[payload?.task] ? payload.task : 'text';
-  if (!ArrayBuffer.isView(image) || image.byteLength === 0 || image.byteLength > 20 * 1024 * 1024) throw new Error('GLM-OCR 页面图像无效或过大');
+  if (
+    !ArrayBuffer.isView(image) ||
+    image.byteLength === 0 ||
+    image.byteLength > 20 * 1024 * 1024
+  )
+    throw new Error('GLM-OCR 页面图像无效或过大');
   const startedAt = Date.now();
   try {
     let result;
     if (config.provider === 'ollama') {
-      const status = config.autoStart ? await ensureOllamaService(config) : await getGlmStatus(config);
-      if (!status.serviceRunning) throw new Error('Ollama 服务未启动；请启用自动启动或在设置中点击“准备模型”');
-      if (!status.modelInstalled) throw new Error(`尚未下载 ${config.model}；请在模型设置中点击“准备模型”`);
-      result = await fetchJsonWithTimeout(`${ollamaBaseUrl(config.endpoint)}/api/generate`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: config.model, prompt: glmTaskPrompts[task], images: [Buffer.from(image.buffer, image.byteOffset, image.byteLength).toString('base64')], stream: false, keep_alive: '10m', options: { temperature: 0 } }),
-      }, 180_000);
+      const status = config.autoStart
+        ? await ensureOllamaService(config)
+        : await getGlmStatus(config);
+      if (!status.serviceRunning)
+        throw new Error(
+          'Ollama 服务未启动；请启用自动启动或在设置中点击“准备模型”',
+        );
+      if (!status.modelInstalled)
+        throw new Error(
+          `尚未下载 ${config.model}；请在模型设置中点击“准备模型”`,
+        );
+      result = await fetchJsonWithTimeout(
+        `${ollamaBaseUrl(config.endpoint)}/api/generate`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: config.model,
+            prompt: glmTaskPrompts[task],
+            images: [
+              Buffer.from(
+                image.buffer,
+                image.byteOffset,
+                image.byteLength,
+              ).toString('base64'),
+            ],
+            stream: false,
+            keep_alive: '10m',
+            options: { temperature: 0 },
+          }),
+        },
+        180_000,
+      );
       result = String(result.response || '').trim();
     } else {
       let configuredEndpoint = config.endpoint;
       let configuredModel = config.model;
       if (config.provider === 'managed') {
         const installed = await managedGlmFilesReady();
-        if (!installed) throw new Error('本地 GLM-OCR 尚未下载，请在模型设置中点击“下载并安装”');
-        if (!config.autoStart && !(glmSidecarProcess && glmSidecarProcess.exitCode === null)) throw new Error('本地 GLM-OCR 未启动，请点击“启动并载入”或启用自动开启');
+        if (!installed)
+          throw new Error(
+            '本地 GLM-OCR 尚未下载，请在模型设置中点击“下载并安装”',
+          );
+        if (
+          !config.autoStart &&
+          !(glmSidecarProcess && glmSidecarProcess.exitCode === null)
+        )
+          throw new Error(
+            '本地 GLM-OCR 未启动，请点击“启动并载入”或启用自动开启',
+          );
         configuredEndpoint = `${await getManagedGlmUrl()}/v1`;
         configuredModel = glmManagedModel;
       }
-      const endpoint = configuredEndpoint.endsWith('/chat/completions') ? configuredEndpoint : `${configuredEndpoint}/chat/completions`;
+      const endpoint = configuredEndpoint.endsWith('/chat/completions')
+        ? configuredEndpoint
+        : `${configuredEndpoint}/chat/completions`;
       const headers = { 'Content-Type': 'application/json' };
       if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
-      const mimeType = typeof payload.mimeType === 'string' ? payload.mimeType : 'image/jpeg';
+      const mimeType =
+        typeof payload.mimeType === 'string' ? payload.mimeType : 'image/jpeg';
       const body = {
-        model: configuredModel, temperature: 0, max_tokens: 4096, stream: false,
-        messages: [{ role: 'user', content: [
-          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${Buffer.from(image.buffer, image.byteOffset, image.byteLength).toString('base64')}` } },
-          { type: 'text', text: glmTaskPrompts[task] },
-        ] }],
+        model: configuredModel,
+        temperature: 0,
+        max_tokens: 4096,
+        stream: false,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:${mimeType};base64,${Buffer.from(image.buffer, image.byteOffset, image.byteLength).toString('base64')}`,
+                },
+              },
+              { type: 'text', text: glmTaskPrompts[task] },
+            ],
+          },
+        ],
       };
-      const response = await fetchJsonWithTimeout(endpoint, { method: 'POST', headers, body: JSON.stringify(body) }, 180_000);
+      const response = await fetchJsonWithTimeout(
+        endpoint,
+        { method: 'POST', headers, body: JSON.stringify(body) },
+        180_000,
+      );
       const content = response.choices?.[0]?.message?.content;
-      result = (typeof content === 'string' ? content : Array.isArray(content) ? content.map((item) => item.text || '').join('\n') : '').trim();
+      result = (
+        typeof content === 'string'
+          ? content
+          : Array.isArray(content)
+            ? content.map((item) => item.text || '').join('\n')
+            : ''
+      ).trim();
       if (config.provider === 'managed') scheduleGlmSidecarIdleStop();
     }
     if (!result) throw new Error('GLM-OCR 未返回识别结果');
-    await logEvent('info', 'glm-ocr.request-succeeded', { provider: config.provider, model: config.model, task, elapsedMs: Date.now() - startedAt });
+    await logEvent('info', 'glm-ocr.request-succeeded', {
+      provider: config.provider,
+      model: config.model,
+      task,
+      elapsedMs: Date.now() - startedAt,
+    });
     return { text: result, task };
   } catch (error) {
-    await logEvent('error', 'glm-ocr.request-failed', { provider: config.provider, model: config.model, task, elapsedMs: Date.now() - startedAt, error: describeError(error) });
+    await logEvent('error', 'glm-ocr.request-failed', {
+      provider: config.provider,
+      model: config.model,
+      task,
+      elapsedMs: Date.now() - startedAt,
+      error: describeError(error),
+    });
     throw error;
   }
 }
@@ -892,25 +1538,46 @@ ipcMain.handle('app:info', () => ({
   freeMemory: os.freemem(),
   runtimeBackend,
   ocrWorkers: OCR_WORKER_COUNT,
-  embeddingSlots: runtimeBackend === 'vulkan' ? 8 : Math.max(1, Math.min(4, Math.floor(os.cpus().length / 4))),
+  embeddingSlots:
+    runtimeBackend === 'vulkan'
+      ? 8
+      : Math.max(1, Math.min(4, Math.floor(os.cpus().length / 4))),
 }));
-ipcMain.handle('glm:status', (_event, payload) => getGlmStatus(assertGlmConfig(payload)));
-ipcMain.handle('glm:prepare', (event, payload) => prepareGlm(assertGlmConfig(payload), event.sender));
+ipcMain.handle('glm:status', (_event, payload) =>
+  getGlmStatus(assertGlmConfig(payload)),
+);
+ipcMain.handle('glm:prepare', (event, payload) =>
+  prepareGlm(assertGlmConfig(payload), event.sender),
+);
 ipcMain.handle('glm:recognize', (_event, payload) => recognizeGlm(payload));
 ipcMain.handle('glm:unload', async (_event, payload) => {
   const config = assertGlmConfig(payload);
   if (config.provider === 'managed') {
     stopGlmSidecar();
-    glmInstallState = { state: 'ready', progress: 100, message: '本地 GLM-OCR 已释放' };
+    glmInstallState = {
+      state: 'ready',
+      progress: 100,
+      message: '本地 GLM-OCR 已释放',
+    };
     return getGlmStatus(config);
   }
   if (config.provider !== 'ollama') return getGlmStatus(config);
   const status = await getGlmStatus(config);
   if (status.serviceRunning && status.modelInstalled) {
-    await fetchJsonWithTimeout(`${ollamaBaseUrl(config.endpoint)}/api/generate`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: config.model, prompt: '', stream: false, keep_alive: 0 }),
-    }, 30_000);
+    await fetchJsonWithTimeout(
+      `${ollamaBaseUrl(config.endpoint)}/api/generate`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: config.model,
+          prompt: '',
+          stream: false,
+          keep_alive: 0,
+        }),
+      },
+      30_000,
+    );
   }
   return getGlmStatus(config);
 });
@@ -938,7 +1605,13 @@ ipcMain.handle('glm:open-install', async () => {
   return { opened: true };
 });
 ipcMain.handle('model:prepare', async (event) => {
-  await logEvent('info', 'model.prepare-started', { modelPath: modelFile(), runtimePath: runtimeFile(), runtimeMarker: runtimeMarker(), backend: runtimeBackend, executablePath: process.execPath });
+  await logEvent('info', 'model.prepare-started', {
+    modelPath: modelFile(),
+    runtimePath: runtimeFile(),
+    runtimeMarker: runtimeMarker(),
+    backend: runtimeBackend,
+    executablePath: process.execPath,
+  });
   try {
     // If a download/install is already under way (e.g. started from the model
     // manager), wait for it to finish instead of failing with a "model file
@@ -952,7 +1625,9 @@ ipcMain.handle('model:prepare', async (event) => {
     await logEvent('info', 'model.prepare-succeeded');
     return getModelStatus();
   } catch (error) {
-    await logEvent('error', 'model.prepare-failed', { error: describeError(error) });
+    await logEvent('error', 'model.prepare-failed', {
+      error: describeError(error),
+    });
     throw error;
   }
 });
@@ -988,57 +1663,122 @@ ipcMain.handle('model:remove', async () => {
 });
 
 ipcMain.handle('embedding:embed', async (_event, texts) => {
-  if (!Array.isArray(texts) || texts.length === 0 || texts.length > 16 || texts.some((text) => typeof text !== 'string' || text.length > 20_000)) {
+  if (
+    !Array.isArray(texts) ||
+    texts.length === 0 ||
+    texts.length > 16 ||
+    texts.some((text) => typeof text !== 'string' || text.length > 20_000)
+  ) {
     throw new Error('Invalid embedding input');
   }
   const startedAt = Date.now();
-  await logEvent('info', 'embedding.request-started', { textCount: texts.length, characterCount: texts.reduce((sum, text) => sum + text.length, 0) });
+  await logEvent('info', 'embedding.request-started', {
+    textCount: texts.length,
+    characterCount: texts.reduce((sum, text) => sum + text.length, 0),
+  });
   try {
     await ensureEmbeddingFiles();
     const baseUrl = await getSidecarUrl();
     const response = await fetch(`${baseUrl}/v1/embeddings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: embeddingModel, input: texts, encoding_format: 'float' }),
+      body: JSON.stringify({
+        model: embeddingModel,
+        input: texts,
+        encoding_format: 'float',
+      }),
     });
-    if (!response.ok) throw new Error((await response.text()) || `本地向量请求失败 (${response.status})`);
+    if (!response.ok)
+      throw new Error(
+        (await response.text()) || `本地向量请求失败 (${response.status})`,
+      );
     const payload = await response.json();
-    if (!Array.isArray(payload.data)) throw new Error('本地向量服务返回格式无效');
+    if (!Array.isArray(payload.data))
+      throw new Error('本地向量服务返回格式无效');
     scheduleSidecarIdleStop();
-    await logEvent('info', 'embedding.request-succeeded', { textCount: texts.length, vectorCount: payload.data.length, dimensions: payload.data[0]?.embedding?.length, elapsedMs: Date.now() - startedAt });
-    return payload.data.sort((a, b) => a.index - b.index).map((item) => item.embedding);
+    await logEvent('info', 'embedding.request-succeeded', {
+      textCount: texts.length,
+      vectorCount: payload.data.length,
+      dimensions: payload.data[0]?.embedding?.length,
+      elapsedMs: Date.now() - startedAt,
+    });
+    return payload.data
+      .sort((a, b) => a.index - b.index)
+      .map((item) => item.embedding);
   } catch (error) {
-    await logEvent('error', 'embedding.request-failed', { elapsedMs: Date.now() - startedAt, error: describeError(error) });
+    await logEvent('error', 'embedding.request-failed', {
+      elapsedMs: Date.now() - startedAt,
+      error: describeError(error),
+    });
     throw error;
   }
 });
 
 ipcMain.on('log:renderer', (_event, payload) => {
   if (!payload || typeof payload.event !== 'string') return;
-  void logEvent(payload.level === 'error' ? 'error' : 'info', `renderer.${payload.event.slice(0, 80)}`, typeof payload.details === 'object' && payload.details ? payload.details : {});
+  void logEvent(
+    payload.level === 'error' ? 'error' : 'info',
+    `renderer.${payload.event.slice(0, 80)}`,
+    typeof payload.details === 'object' && payload.details
+      ? payload.details
+      : {},
+  );
 });
 
 ipcMain.handle('ocr:recognize', async (event, payload) => {
   const image = payload?.image;
   const language = payload?.language || 'chi_sim+eng';
-  const page = Number.isInteger(payload?.page) && payload.page > 0 ? payload.page : 0;
-  if (!(image instanceof Uint8Array) || image.byteLength < 16 || image.byteLength > 24 * 1024 * 1024 || !ocrLanguages[language]) throw new Error('Invalid OCR request');
+  const page =
+    Number.isInteger(payload?.page) && payload.page > 0 ? payload.page : 0;
+  if (
+    !(image instanceof Uint8Array) ||
+    image.byteLength < 16 ||
+    image.byteLength > 24 * 1024 * 1024 ||
+    !ocrLanguages[language]
+  )
+    throw new Error('Invalid OCR request');
   const slots = await getOcrWorkerPool(language);
-  const slot = slots.reduce((best, candidate) => candidate.pending < best.pending ? candidate : best, slots[0]);
+  const slot = slots.reduce(
+    (best, candidate) => (candidate.pending < best.pending ? candidate : best),
+    slots[0],
+  );
   slot.pending += 1;
   const operation = slot.queue.then(async () => {
     const startedAt = Date.now();
     slot.page = page;
     slot.sender = event.sender;
-    await logEvent('info', 'ocr.started', { language, page, worker: slot.index, bytes: image.byteLength });
+    await logEvent('info', 'ocr.started', {
+      language,
+      page,
+      worker: slot.index,
+      bytes: image.byteLength,
+    });
     try {
       const worker = await slot.worker;
-      const result = await worker.recognize(Buffer.from(image.buffer, image.byteOffset, image.byteLength), { rotateAuto: true });
-      const text = String(result?.data?.text || '').replace(/\s+/g, ' ').trim();
-      await logEvent('info', 'ocr.succeeded', { language, page, worker: slot.index, characters: text.length, confidence: result?.data?.confidence, elapsedMs: Date.now() - startedAt });
+      const result = await worker.recognize(
+        Buffer.from(image.buffer, image.byteOffset, image.byteLength),
+        { rotateAuto: true },
+      );
+      const text = String(result?.data?.text || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      await logEvent('info', 'ocr.succeeded', {
+        language,
+        page,
+        worker: slot.index,
+        characters: text.length,
+        confidence: result?.data?.confidence,
+        elapsedMs: Date.now() - startedAt,
+      });
       return { text, confidence: Number(result?.data?.confidence || 0) };
     } catch (error) {
-      await logEvent('error', 'ocr.failed', { language, page, worker: slot.index, elapsedMs: Date.now() - startedAt, error: describeError(error) });
+      await logEvent('error', 'ocr.failed', {
+        language,
+        page,
+        worker: slot.index,
+        elapsedMs: Date.now() - startedAt,
+        error: describeError(error),
+      });
       throw error;
     } finally {
       slot.page = 0;
@@ -1046,47 +1786,96 @@ ipcMain.handle('ocr:recognize', async (event, payload) => {
     }
   });
   slot.queue = operation.catch(() => undefined);
-  return operation.finally(() => { slot.pending -= 1; });
+  return operation.finally(() => {
+    slot.pending -= 1;
+  });
 });
 
-ipcMain.handle('library:list', async () => (await readCatalog()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+ipcMain.handle('library:list', async () =>
+  (await readCatalog()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+);
 
 ipcMain.handle('library:import', async (_event, payload) => {
-  if (!payload || typeof payload.name !== 'string' || payload.name.length > 300) throw new Error('Invalid PDF import');
+  if (!payload || typeof payload.name !== 'string' || payload.name.length > 300)
+    throw new Error('Invalid PDF import');
   const bytes = Buffer.from(payload.data);
-  if (bytes.length < 5 || bytes.length > 1024 * 1024 * 1024 || bytes.subarray(0, 5).toString() !== '%PDF-') throw new Error('Invalid or oversized PDF');
+  if (
+    bytes.length < 5 ||
+    bytes.length > 1024 * 1024 * 1024 ||
+    bytes.subarray(0, 5).toString() !== '%PDF-'
+  )
+    throw new Error('Invalid or oversized PDF');
   const now = new Date().toISOString();
-  const entry = { id: randomUUID(), name: path.basename(payload.name), pageCount: 0, lastPage: 1, addedAt: now, updatedAt: now, indexProviderId: null };
+  const entry = {
+    id: randomUUID(),
+    name: path.basename(payload.name),
+    pageCount: 0,
+    lastPage: 1,
+    addedAt: now,
+    updatedAt: now,
+    indexProviderId: null,
+  };
   const directory = bookDirectory(entry.id);
   await mkdir(directory, { recursive: true });
   await writeFile(path.join(directory, 'document.pdf'), bytes);
-  await updateCatalog((catalog) => { catalog.unshift(entry); });
+  await updateCatalog((catalog) => {
+    catalog.unshift(entry);
+  });
   return entry;
 });
 
 ipcMain.handle('library:import-file', async (_event, payload) => {
-  if (!payload || typeof payload.name !== 'string' || payload.name.length > 300 || typeof payload.filePath !== 'string' || !path.isAbsolute(payload.filePath)) throw new Error('Invalid PDF import path');
+  if (
+    !payload ||
+    typeof payload.name !== 'string' ||
+    payload.name.length > 300 ||
+    typeof payload.filePath !== 'string' ||
+    !path.isAbsolute(payload.filePath)
+  )
+    throw new Error('Invalid PDF import path');
   const source = path.resolve(payload.filePath);
   const sourceStats = await stat(source);
-  if (!sourceStats.isFile() || sourceStats.size < 5 || sourceStats.size > 1024 * 1024 * 1024) throw new Error('Invalid or oversized PDF');
+  if (
+    !sourceStats.isFile() ||
+    sourceStats.size < 5 ||
+    sourceStats.size > 1024 * 1024 * 1024
+  )
+    throw new Error('Invalid or oversized PDF');
   const handle = await open(source, 'r');
   try {
     const signature = Buffer.alloc(5);
     await handle.read(signature, 0, signature.length, 0);
-    if (signature.toString() !== '%PDF-') throw new Error('Invalid PDF signature');
+    if (signature.toString() !== '%PDF-')
+      throw new Error('Invalid PDF signature');
   } finally {
     await handle.close();
   }
   const now = new Date().toISOString();
-  const entry = { id: randomUUID(), name: path.basename(payload.name), pageCount: 0, lastPage: 1, addedAt: now, updatedAt: now, indexProviderId: null };
+  const entry = {
+    id: randomUUID(),
+    name: path.basename(payload.name),
+    pageCount: 0,
+    lastPage: 1,
+    addedAt: now,
+    updatedAt: now,
+    indexProviderId: null,
+  };
   const directory = bookDirectory(entry.id);
   await mkdir(directory, { recursive: true });
   await copyFile(source, path.join(directory, 'document.pdf'));
-  await updateCatalog((catalog) => { catalog.unshift(entry); });
+  await updateCatalog((catalog) => {
+    catalog.unshift(entry);
+  });
   return entry;
 });
 
-ipcMain.handle('library:read', async (_event, id) => new Uint8Array(await readFile(path.join(bookDirectory(id), 'document.pdf'))));
+ipcMain.handle(
+  'library:read',
+  async (_event, id) =>
+    new Uint8Array(
+      await readFile(path.join(bookDirectory(id), 'document.pdf')),
+    ),
+);
 
 ipcMain.handle('library:remove', async (_event, id) => {
   const bookId = assertBookId(id);
@@ -1094,6 +1883,7 @@ ipcMain.handle('library:remove', async (_event, id) => {
   if (build) pauseIndexBuild(build);
   indexBuilds.delete(bookId);
   await rm(bookDirectory(bookId), { recursive: true, force: true });
+  removeBookData(dataRoot(), bookId);
   return updateCatalog((catalog) => {
     const index = catalog.findIndex((candidate) => candidate.id === bookId);
     if (index >= 0) catalog.splice(index, 1);
@@ -1101,30 +1891,56 @@ ipcMain.handle('library:remove', async (_event, id) => {
   });
 });
 
-ipcMain.handle('library:update', async (_event, id, changes) => updateCatalog((catalog) => {
-  const entry = catalog.find((candidate) => candidate.id === assertBookId(id));
-  if (!entry) throw new Error('Book not found');
-  if (Number.isInteger(changes?.pageCount) && changes.pageCount > 0) entry.pageCount = changes.pageCount;
-  if (Number.isInteger(changes?.lastPage) && changes.lastPage > 0) entry.lastPage = Math.min(changes.lastPage, entry.pageCount || changes.lastPage);
-  entry.updatedAt = new Date().toISOString();
-  return entry;
-}));
+ipcMain.handle('library:update', async (_event, id, changes) =>
+  updateCatalog((catalog) => {
+    const entry = catalog.find(
+      (candidate) => candidate.id === assertBookId(id),
+    );
+    if (!entry) throw new Error('Book not found');
+    if (Number.isInteger(changes?.pageCount) && changes.pageCount > 0)
+      entry.pageCount = changes.pageCount;
+    if (Number.isInteger(changes?.lastPage) && changes.lastPage > 0)
+      entry.lastPage = Math.min(
+        changes.lastPage,
+        entry.pageCount || changes.lastPage,
+      );
+    entry.updatedAt = new Date().toISOString();
+    return entry;
+  }),
+);
 
 ipcMain.handle('library:index-open', async (_event, id, providerId) => {
   const startedAt = Date.now();
   const result = openIndex(bookDirectory(id), providerId);
-  if (result) await logEvent('info', result.migrated ? 'index.migrated' : 'index.opened', { bookId: id, ...result, elapsedMs: Date.now() - startedAt });
+  if (result)
+    await logEvent(
+      'info',
+      result.migrated ? 'index.migrated' : 'index.opened',
+      { bookId: id, ...result, elapsedMs: Date.now() - startedAt },
+    );
   return result;
 });
 
-ipcMain.handle('library:index-start', (_event, id, providerId, dimensions = 0, buildKey = providerId) => {
-  const bookId = assertBookId(id);
-  const existing = indexBuilds.get(bookId);
-  if (existing) pauseIndexBuild(existing);
-  const build = startIndexBuild(bookDirectory(bookId), providerId, dimensions, buildKey);
-  indexBuilds.set(bookId, build);
-  return { started: true, format: 'sqlite-f32', ...getIndexCheckpoint(build) };
-});
+ipcMain.handle(
+  'library:index-start',
+  (_event, id, providerId, dimensions = 0, buildKey = providerId) => {
+    const bookId = assertBookId(id);
+    const existing = indexBuilds.get(bookId);
+    if (existing) pauseIndexBuild(existing);
+    const build = startIndexBuild(
+      bookDirectory(bookId),
+      providerId,
+      dimensions,
+      buildKey,
+    );
+    indexBuilds.set(bookId, build);
+    return {
+      started: true,
+      format: 'sqlite-f32',
+      ...getIndexCheckpoint(build),
+    };
+  },
+);
 
 ipcMain.handle('library:index-save-pages', (_event, id, entries) => {
   const bookId = assertBookId(id);
@@ -1152,7 +1968,11 @@ ipcMain.handle('library:index-finish', async (_event, id) => {
       entry.indexProviderId = build.providerId;
       entry.updatedAt = new Date().toISOString();
     });
-    await logEvent('info', 'index.sqlite-finished', { bookId, providerId: build.providerId, ...result });
+    await logEvent('info', 'index.sqlite-finished', {
+      bookId,
+      providerId: build.providerId,
+      ...result,
+    });
     return result;
   } finally {
     indexBuilds.delete(bookId);
@@ -1172,14 +1992,68 @@ ipcMain.handle('library:index-discard', async (_event, id) => {
   const build = indexBuilds.get(bookId);
   if (build) cancelIndexBuild(build);
   indexBuilds.delete(bookId);
-  if (!build) await rm(path.join(bookDirectory(bookId), 'index.sqlite.building'), { force: true });
-  await logEvent('info', 'index.checkpoint-discarded', { bookId, activeBuild: Boolean(build) });
+  if (!build)
+    await rm(path.join(bookDirectory(bookId), 'index.sqlite.building'), {
+      force: true,
+    });
+  await logEvent('info', 'index.checkpoint-discarded', {
+    bookId,
+    activeBuild: Boolean(build),
+  });
   return { discarded: true };
 });
 
-ipcMain.handle('library:index-search', (_event, id, providerId, vector, limit) => {
-  if (!Number.isInteger(limit) || limit <= 0 || limit > 20) throw new Error('Invalid search limit');
-  return searchIndex(bookDirectory(id), providerId, vector, limit);
+ipcMain.handle(
+  'library:index-search',
+  (_event, id, providerId, vector, limit) => {
+    if (!Number.isInteger(limit) || limit <= 0 || limit > 20)
+      throw new Error('Invalid search limit');
+    return searchIndex(bookDirectory(id), providerId, vector, limit);
+  },
+);
+
+ipcMain.handle('workspace:chat-load', (_event, bookId, limit) =>
+  loadChat(dataRoot(), assertBookId(bookId), limit),
+);
+
+ipcMain.handle('workspace:chat-replace', (_event, bookId, bookName, messages) =>
+  replaceChat(dataRoot(), assertBookId(bookId), bookName, messages),
+);
+
+ipcMain.handle('workspace:history-search', (_event, query, limit, offset) =>
+  searchHistory(dataRoot(), query, limit, offset),
+);
+
+ipcMain.handle('workspace:notes-list', (_event, options) =>
+  listNotes(dataRoot(), options),
+);
+
+ipcMain.handle('workspace:note-save', (_event, bookId, bookName, note) =>
+  saveNote(dataRoot(), assertBookId(bookId), bookName, note),
+);
+
+ipcMain.handle('workspace:note-remove', (_event, id) =>
+  removeNote(dataRoot(), id),
+);
+
+ipcMain.handle('workspace:export-markdown', async (_event, options = {}) => {
+  const bookId = options.bookId ? assertBookId(options.bookId) : undefined;
+  const catalog = await readCatalog();
+  const book = bookId
+    ? catalog.find((entry) => entry.id === bookId)
+    : undefined;
+  const suggestedName = book
+    ? `${path.parse(book.name).name}-Margin-阅读资料.md`
+    : 'Margin-阅读资料.md';
+  const result = await dialog.showSaveDialog({
+    title: '导出 Markdown 阅读资料',
+    defaultPath: path.join(app.getPath('documents'), suggestedName),
+    filters: [{ name: 'Markdown', extensions: ['md'] }],
+  });
+  if (result.canceled || !result.filePath) return { exported: false };
+  const markdown = markdownExport(dataRoot(), { bookId, bookName: book?.name });
+  await writeFile(result.filePath, markdown, 'utf8');
+  return { exported: true, path: result.filePath };
 });
 
 function createWindow() {
@@ -1204,7 +2078,8 @@ function createWindow() {
   });
   window.webContents.on('will-navigate', (event, url) => {
     const current = window.webContents.getURL();
-    if (current && new URL(url).origin !== new URL(current).origin) event.preventDefault();
+    if (current && new URL(url).origin !== new URL(current).origin)
+      event.preventDefault();
   });
 
   if (isDevelopment) {
@@ -1215,26 +2090,50 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  void logEvent('info', 'app.ready', { version: app.getVersion(), packaged: app.isPackaged, executablePath: process.execPath, dataRoot: dataRoot(), modelPath: modelFile(), runtimePath: runtimeFile(), runtimeMarker: runtimeMarker(), backend: runtimeBackend });
+  void logEvent('info', 'app.ready', {
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    executablePath: process.execPath,
+    dataRoot: dataRoot(),
+    modelPath: modelFile(),
+    runtimePath: runtimeFile(),
+    runtimeMarker: runtimeMarker(),
+    backend: runtimeBackend,
+  });
   const rendererRoot = path.resolve(__dirname, '..', 'dist', 'client');
   protocol.handle('margin', (request) => {
     const url = new URL(request.url);
     const pathname = decodeURIComponent(url.pathname);
-    const libraryMatch = pathname.match(/^\/library\/([0-9a-f-]{36})\/document\.pdf$/);
+    const libraryMatch = pathname.match(
+      /^\/library\/([0-9a-f-]{36})\/document\.pdf$/,
+    );
     if (url.host === 'app' && libraryMatch) {
       const file = path.join(bookDirectory(libraryMatch[1]), 'document.pdf');
-      return net.fetch(pathToFileURL(file).toString(), { headers: request.headers });
+      return net.fetch(pathToFileURL(file).toString(), {
+        headers: request.headers,
+      });
     }
     if (url.host !== 'app') return new Response('Not found', { status: 404 });
-    const requested = path.resolve(rendererRoot, pathname === '/' ? 'index.html' : `.${pathname}`);
-    if (requested !== rendererRoot && !requested.startsWith(`${rendererRoot}${path.sep}`)) return new Response('Not found', { status: 404 });
+    const requested = path.resolve(
+      rendererRoot,
+      pathname === '/' ? 'index.html' : `.${pathname}`,
+    );
+    if (
+      requested !== rendererRoot &&
+      !requested.startsWith(`${rendererRoot}${path.sep}`)
+    )
+      return new Response('Not found', { status: 404 });
     return net.fetch(pathToFileURL(requested).toString());
   });
   createWindow();
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
 });
 
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
 app.on('before-quit', () => {
   stopSidecar();
   stopGlmSidecar();
@@ -1242,5 +2141,13 @@ app.on('before-quit', () => {
   for (const build of indexBuilds.values()) pauseIndexBuild(build);
   indexBuilds.clear();
 });
-process.on('uncaughtException', (error) => { void logEvent('error', 'process.uncaught-exception', { error: describeError(error) }); });
-process.on('unhandledRejection', (error) => { void logEvent('error', 'process.unhandled-rejection', { error: describeError(error) }); });
+process.on('uncaughtException', (error) => {
+  void logEvent('error', 'process.uncaught-exception', {
+    error: describeError(error),
+  });
+});
+process.on('unhandledRejection', (error) => {
+  void logEvent('error', 'process.unhandled-rejection', {
+    error: describeError(error),
+  });
+});

@@ -2,6 +2,21 @@
 
 All notable changes to Margin are documented here.
 
+## [0.2.9] - 2026-09-08
+
+### Added
+
+- A reading workspace in the left sidebar for page-region highlights, annotations, AI summary cards, and a searchable concept glossary.
+- One-click saving of any completed assistant answer as a Markdown/KaTeX-preserving summary card.
+- Cross-book question-history search, reading-material filters, page/region navigation, pagination, and Markdown export through a native save dialog.
+- Unit and packaged desktop coverage for workspace persistence, legacy-history migration, search, export generation, and cleanup.
+
+### Changed
+
+- Per-book chat history moved from renderer `localStorage` to a dedicated `workspace.sqlite` database. Existing `margin-chat-history-v1` records migrate automatically on the first 0.2.9 launch.
+- Long histories and reading-material collections are loaded in bounded pages instead of being deserialized into the renderer at startup.
+- Removing a managed book now also removes its associated messages, highlights, notes, summary cards, and glossary entries from the workspace database.
+
 ## [0.2.8] - 2026-09-08
 
 ### Added

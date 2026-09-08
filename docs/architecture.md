@@ -4,7 +4,7 @@ Margin is a local-first Electron PDF reader. It separates untrusted document ren
 
 ## Runtime boundaries
 
-- **Electron main process:** owns the managed library, `margin://` file protocol, Tesseract worker, SQLite indexes, logs, downloads, and llama.cpp sidecar. It never receives chat or remote-embedding API keys.
+- **Electron main process:** owns the managed library, `margin://` file protocol, Tesseract worker, vector and reading-workspace SQLite databases, logs, downloads, Markdown export, and llama.cpp sidecar. It never receives chat or remote-embedding API keys.
 - **Sandboxed renderer:** owns PDF.js rendering, text extraction, page virtualization, UI state, chat orchestration, and embedding-provider requests. `nodeIntegration` is disabled; context isolation and sandboxing are enabled.
 - **Model providers:** small interfaces isolate OpenAI-compatible chat/embedding services and the built-in Qwen embedding sidecar.
 
@@ -42,6 +42,8 @@ GLM-OCR weights are not packaged by Margin. Managed mode downloads checksum-pinn
 
 Manual region reading is independent of vector-index state. The renderer stores a normalized page rectangle plus a single in-memory crop, dispatches formula/table/text recognition according to the selected action, and caches recognition by SHA-256 + task + provider identity. Chat history stores the normalized rectangle but never the image bytes. Citation buttons restore the page and overlay exactly from these normalized coordinates.
 
+The same normalized rectangle can be persisted without model inference as a highlight, annotation, or glossary source. Completed assistant output can be persisted as a summary card. These records and per-book messages live in the global `workspace.sqlite`; queries use bounded limits/offsets, so opening the app does not deserialize every historical conversation. A one-time renderer migration copies legacy `margin-chat-history-v1` records into SQLite and removes the old payload only after every known book succeeds.
+
 ## Index storage
 
 Each completed book index is stored beside the managed PDF as `index.sqlite`. Metadata records the schema version, provider identity, vector dimensions, completion state, and timestamps. Chunk rows contain page, ordinal, text, norm, and a little-endian Float32 BLOB.
@@ -58,7 +60,7 @@ The model and llama.cpp runtime are optional downloaded resources rather than Gi
 
 ## Local state and privacy
 
-The managed PDF, catalog metadata, progress, OCR-derived index text, and SQLite vectors remain below the local Margin data root. Renderer preferences—including chat/embedding/GLM-OCR settings, custom system prompt, and per-book chat history—use Electron browser storage. Chat history is capped per book and removed when that book is deleted.
+The managed PDF, catalog metadata, progress, OCR-derived index text, SQLite vectors, chat history, highlights, annotations, summary cards, and glossary entries remain below the local Margin data root. Chat history and reading materials use `workspace.sqlite`; chat is capped to the latest 100 messages per book in the active context, while history search and material lists load bounded result pages. Renderer preferences—including chat/embedding/GLM-OCR settings and the custom system prompt—use Electron browser storage. Removing a book also removes all workspace rows carrying that book ID.
 
 Chat and embedding credentials are separate because users may choose different vendors. They are stored in the Electron browser profile, not committed to Git, and are sent only to their configured endpoint.
 
