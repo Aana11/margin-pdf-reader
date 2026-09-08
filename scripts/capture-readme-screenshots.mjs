@@ -131,6 +131,29 @@ try {
   });
   await capture('reader-overview.jpg');
 
+  const canvas = await retry(async () => {
+    const bounds = await evaluate(`(() => { const canvas = document.querySelector('.pdf-page[data-page="1"] canvas'); if (!canvas || canvas.clientWidth < 400) return null; const rect = canvas.getBoundingClientRect(); return { left: rect.left, top: rect.top, width: rect.width, height: rect.height }; })()`);
+    if (!bounds) throw new Error('Demo page canvas is not ready for region capture');
+    return bounds;
+  });
+  await evaluate(`document.querySelector('.region-select-toggle')?.click()`);
+  await retry(async () => {
+    const active = await evaluate(`document.querySelector('.region-select-toggle')?.classList.contains('active')`);
+    if (!active) throw new Error('Region selection mode has not activated');
+    return active;
+  });
+  const regionStart = { x: canvas.left + canvas.width * 0.1, y: canvas.top + canvas.height * 0.05 };
+  const regionEnd = { x: canvas.left + canvas.width * 0.88, y: canvas.top + canvas.height * 0.24 };
+  await command('Input.dispatchMouseEvent', { type: 'mousePressed', x: regionStart.x, y: regionStart.y, button: 'left', clickCount: 1 });
+  await command('Input.dispatchMouseEvent', { type: 'mouseMoved', x: regionEnd.x, y: regionEnd.y, button: 'left' });
+  await command('Input.dispatchMouseEvent', { type: 'mouseReleased', x: regionEnd.x, y: regionEnd.y, button: 'left', clickCount: 1 });
+  await retry(async () => {
+    const ready = await evaluate(`Boolean(document.querySelector('.region-action-popover'))`);
+    if (!ready) throw new Error('Region action popover has not appeared');
+    return ready;
+  });
+  await capture('region-reading.jpg');
+
   await evaluate(`document.querySelector('[aria-label="模型设置"]')?.click()`);
   await retry(async () => {
     const visible = await evaluate(`Boolean(document.querySelector('#system-prompt'))`);

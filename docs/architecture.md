@@ -27,6 +27,7 @@ An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Elec
 7. Query search streams rows from SQLite, computes cosine similarity, and retains only the best K matches.
 8. When optional GLM-OCR deep reading is enabled, the renderer classifies retrieved text for formulas, code, tables, or an explicit deep-reading request. It rasterizes at most two unique candidates and sends them to the configured GLM-OCR endpoint.
 9. The current page, top-ranked chunks, and successful visual-recognition results are sent to the configured chat model only after the user asks a question.
+10. Explicit region reading crops the already-rendered page canvas, caps the longest edge at 1,800 pixels, and sends only that JPEG region to GLM-OCR before task-specific chat processing.
 
 Tesseract OCR runs only when PDF.js finds no text layer. Its output is used for assistant context and retrieval; Margin does not write an invisible selectable-text layer back into the PDF.
 
@@ -37,6 +38,8 @@ GLM-OCR is a query-time precision layer, not a replacement for the embedding ind
 GLM requests cross the context-isolated preload bridge and execute in the Electron main process, avoiding renderer CORS restrictions. The default managed mode uses llama.cpp's multimodal `/v1/chat/completions` endpoint; legacy Ollama mode follows `/api/generate`, while vLLM, SGLang, and remote providers use multimodal `/chat/completions`. The feature is disabled by default, sends at most two JPEG page images per question, runs sequentially, and caches results by book/page/task/provider/endpoint/model for the current session. A recognition error is logged with an actionable service/runtime/model diagnosis and degrades to ordinary RAG instead of failing the chat request.
 
 GLM-OCR weights are not packaged by Margin. Managed mode downloads checksum-pinned `GLM-OCR-Q8_0.gguf` and `mmproj-GLM-OCR-Q8_0.gguf`, reuses the pinned llama.cpp CPU/Vulkan runtime, and starts a loopback-only sidecar on a random port. Downloads resume from partial files; the sidecar exits after five idle minutes or explicit unload. Starting GLM-OCR stops the embedding sidecar and vice versa so both large models do not compete for GPU memory. Existing Ollama and OpenAI-compatible services remain optional advanced providers and are never terminated by managed mode.
+
+Manual region reading is independent of vector-index state. The renderer stores a normalized page rectangle plus a single in-memory crop, dispatches formula/table/text recognition according to the selected action, and caches recognition by SHA-256 + task + provider identity. Chat history stores the normalized rectangle but never the image bytes. Citation buttons restore the page and overlay exactly from these normalized coordinates.
 
 ## Index storage
 
@@ -63,6 +66,6 @@ Chat and embedding credentials are separate because users may choose different v
 - A vector index contains embeddings from exactly one provider identity and one fixed dimension.
 - Every match retains its PDF page number and source text.
 - Library removal deletes only the app-managed PDF, metadata, and indexes after explicit confirmation; the original import source is untouched.
-- OCR work is capped at three concurrent workers to improve scanned-book throughput without unbounded CPU or memory growth.
+- OCR work is adaptively capped at one to four concurrent workers to improve scanned-book throughput without unbounded CPU or memory growth.
 - GLM-OCR is optional, query-time only, and limited to two retrieved pages per question.
 - Exact SQLite search targets individual large books; a future cross-library or million-chunk mode may require an ANN extension.
