@@ -22,6 +22,7 @@ jobs:
       - run: npx tsc --noEmit
       - run: npm run test:ocr
       - run: npm run test:deep-reading
+      - run: npm run test:region-reading
       - run: npm run test:index-resume
       - run: npm run desktop:release
         env:
@@ -29,6 +30,7 @@ jobs:
       - run: npm run test:desktop
       - run: npm run test:desktop:ocr
       - run: npm run test:desktop:deep-reading
+      - run: npm run test:desktop:region-reading
       - uses: softprops/action-gh-release@v2
         with:
           draft: false

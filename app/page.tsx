@@ -1,7 +1,7 @@
 'use client';
 
-import { SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { BookOpen, Bot, FileText, HardDrive, History, Library, MessageSquareText, Plus, Send, Settings2, Sparkles, Trash2, Upload } from 'lucide-react';
+import { PointerEvent as ReactPointerEvent, SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { BookOpen, Bot, Code2, FileText, HardDrive, History, Languages, Library, MessageSquareText, Plus, ScanSearch, Send, Settings2, Sigma, Sparkles, Table2, Trash2, Upload, X } from 'lucide-react';
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist';
 import ReactMarkdown from 'react-markdown';
 import rehypeKatex from 'rehype-katex';
@@ -19,13 +19,18 @@ import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { chunkPage } from '@/lib/rag/chunk';
 import { recognizeWithGlmOcr, selectDeepReadCandidates } from '@/lib/rag/deep-reading';
 import type { DeepReadMode } from '@/lib/rag/deep-reading';
+import { cropCanvasRegion, hashRegionImage, isUsableRegion, normalizeRegion, REGION_ACTIONS } from '@/lib/rag/region-reading';
+import type { NormalizedRegion, RegionAction } from '@/lib/rag/region-reading';
 import { MemoryVectorIndex } from '@/lib/rag/memory-index';
 import { createEmbeddingProvider } from '@/lib/rag/providers';
 import type { EmbeddingProvider, EmbeddingProviderKind, RagChunk, RagMatch } from '@/lib/rag/types';
 import type { GlmOcrConfig, GlmOcrProvider, GlmOcrStatus, LibraryEntry, ModelInstallStatus } from '@/types/electron';
 
-type Message = { role: 'user' | 'assistant'; content: string; page: number; createdAt?: string };
+type RegionCitation = { page: number; region: NormalizedRegion };
+type Message = { role: 'user' | 'assistant'; content: string; page: number; createdAt?: string; citation?: RegionCitation };
 type ChatHistoryRecord = { bookId: string; bookName: string; messages: Message[]; updatedAt: string };
+type SelectedRegion = RegionCitation & { image?: Uint8Array; mimeType?: string; imageHash?: string; pixelWidth?: number; pixelHeight?: number };
+type RegionAiContext = { recognized: string; action: RegionAction; citation: RegionCitation };
 type ModelSettings = {
   endpoint: string;
   model: string;
@@ -116,7 +121,7 @@ async function renderPageImage(pdfPage: PDFPageProxy, format: 'png' | 'jpeg' = '
   canvas.height = Math.ceil(viewport.height);
   const context = canvas.getContext('2d', { alpha: false });
   if (!context) throw new Error('无法创建 OCR 页面画布');
-  await pdfPage.render({ canvas, canvasContext: context, viewport, background: '#ffffff' }).promise;
+  await pdfPage.render({ canvas, canvasContext: context, viewport, background: '#ffffff', intent: 'print' }).promise;
   const mimeType = format === 'jpeg' ? 'image/jpeg' : 'image/png';
   const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('无法编码识别页面')), mimeType, format === 'jpeg' ? 0.92 : undefined));
   canvas.width = 1;
@@ -130,14 +135,24 @@ type PdfPageCanvasProps = {
   activePage: number;
   onText: (pageNumber: number, text: string) => void;
   onError: (message: string) => void;
+  selectionEnabled: boolean;
+  selectedRegion?: SelectedRegion;
+  regionActionBusy: RegionAction | null;
+  onSelectionStart: () => void;
+  onRegionSelected: (selection: SelectedRegion) => void;
+  onRegionAction: (action: RegionAction) => void;
+  onRegionClear: () => void;
 };
 
-function PdfPageCanvas({ pdf, pageNumber, activePage, onText, onError }: PdfPageCanvasProps) {
+function PdfPageCanvas({ pdf, pageNumber, activePage, onText, onError, selectionEnabled, selectedRegion, regionActionBusy, onSelectionStart, onRegionSelected, onRegionAction, onRegionClear }: PdfPageCanvasProps) {
   const shellRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const [nearViewport, setNearViewport] = useState(false);
   const [availableWidth, setAvailableWidth] = useState(760);
   const [pageRatio, setPageRatio] = useState(1 / 1.414);
+  const [draftRegion, setDraftRegion] = useState<NormalizedRegion | null>(null);
 
   useEffect(() => {
     const shell = shellRef.current;
@@ -200,8 +215,71 @@ function PdfPageCanvas({ pdf, pageNumber, activePage, onText, onError }: PdfPage
     return () => { cancelled = true; renderTask?.cancel(); };
   }, [availableWidth, onError, onText, pageNumber, pdf, shouldRender]);
 
+  const pointerPosition = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const rect = stageRef.current?.getBoundingClientRect();
+    if (!rect?.width || !rect.height) return null;
+    return {
+      x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
+    };
+  };
+
+  const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!selectionEnabled || event.button !== 0 || (event.target as HTMLElement).closest('button')) return;
+    const point = pointerPosition(event);
+    if (!point) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragStartRef.current = point;
+    setDraftRegion({ x: point.x, y: point.y, width: 0, height: 0 });
+    onSelectionStart();
+  };
+
+  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = dragStartRef.current;
+    if (!start) return;
+    const point = pointerPosition(event);
+    if (point) setDraftRegion(normalizeRegion(start.x, start.y, point.x, point.y));
+  };
+
+  const handlePointerEnd = async (event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = dragStartRef.current;
+    dragStartRef.current = null;
+    if (!start) return;
+    const point = pointerPosition(event);
+    const canvas = canvasRef.current;
+    if (!point || !canvas) { setDraftRegion(null); return; }
+    const region = normalizeRegion(start.x, start.y, point.x, point.y);
+    if (!isUsableRegion(region, canvas.clientWidth, canvas.clientHeight)) { setDraftRegion(null); return; }
+    setDraftRegion(region);
+    try {
+      const cropped = await cropCanvasRegion(canvas, region);
+      const imageHash = await hashRegionImage(cropped.bytes);
+      onRegionSelected({ page: pageNumber, region, image: cropped.bytes, mimeType: cropped.mimeType, pixelWidth: cropped.pixelWidth, pixelHeight: cropped.pixelHeight, imageHash });
+      setDraftRegion(null);
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : '无法裁剪框选区域');
+      setDraftRegion(null);
+    }
+  };
+
+  const visibleRegion = draftRegion ?? selectedRegion?.region;
+  const toolbarAbove = Boolean(visibleRegion && visibleRegion.y + visibleRegion.height > 0.82);
   return <div ref={shellRef} className="pdf-page" style={{ aspectRatio: pageRatio }} data-page={pageNumber} aria-label={`PDF 第 ${pageNumber} 页`}>
-    <canvas ref={canvasRef} />
+    <div ref={stageRef} className={selectionEnabled ? 'pdf-canvas-stage selecting' : 'pdf-canvas-stage'} onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={(event) => void handlePointerEnd(event)} onPointerCancel={() => { dragStartRef.current = null; setDraftRegion(null); }}>
+      <canvas ref={canvasRef} />
+      {visibleRegion && <div className={selectedRegion ? 'region-selection committed' : 'region-selection'} style={{ left: `${visibleRegion.x * 100}%`, top: `${visibleRegion.y * 100}%`, width: `${visibleRegion.width * 100}%`, height: `${visibleRegion.height * 100}%` }} />}
+      {selectedRegion && <div className={toolbarAbove ? 'region-action-popover above' : 'region-action-popover'} style={{ top: `${(selectedRegion.region.y + selectedRegion.region.height) * 100}%` }} onPointerDown={(event) => event.stopPropagation()}>
+        {selectedRegion.image ? <>
+          <button onClick={() => onRegionAction('formula')} disabled={Boolean(regionActionBusy)} title="调用 GLM-OCR 识别并解释公式"><Sigma />解释公式</button>
+          <button onClick={() => onRegionAction('table')} disabled={Boolean(regionActionBusy)} title="调用 GLM-OCR 还原表格"><Table2 />识别表格</button>
+          <button onClick={() => onRegionAction('code')} disabled={Boolean(regionActionBusy)} title="识别并分析代码"><Code2 />分析代码</button>
+          <button onClick={() => onRegionAction('translate')} disabled={Boolean(regionActionBusy)} title="识别并翻译文字"><Languages />翻译</button>
+        </> : <span>AI 引用区域</span>}
+        {regionActionBusy && <span className="region-action-busy">识别中…</span>}
+        <button className="region-action-close" onClick={onRegionClear} aria-label="关闭框选区域"><X /></button>
+      </div>}
+    </div>
   </div>;
 }
 
@@ -209,7 +287,6 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const readerScrollRef = useRef<HTMLDivElement>(null);
   const pageTextsRef = useRef(new Map<number, string>());
-  const visiblePagesRef = useRef(new Map<number, number>());
   const vectorIndexRef = useRef(new MemoryVectorIndex());
   const embeddingProviderRef = useRef<EmbeddingProvider | null>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
@@ -217,6 +294,7 @@ export default function Home() {
   const indexAbortRef = useRef(false);
   const indexProgressRef = useRef(0);
   const pageIndicatorTimerRef = useRef<number | null>(null);
+  const readerScrollTimerRef = useRef<number | null>(null);
   const deepReadCacheRef = useRef(new Map<string, string>());
   const activeBookIdRef = useRef<string | null>(null);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
@@ -247,6 +325,9 @@ export default function Home() {
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [showPageIndicator, setShowPageIndicator] = useState(false);
   const [chatHistory, setChatHistory] = useState<ChatHistoryRecord[]>(readChatHistory);
+  const [regionSelectMode, setRegionSelectMode] = useState(false);
+  const [selectedRegion, setSelectedRegion] = useState<SelectedRegion | null>(null);
+  const [regionActionBusy, setRegionActionBusy] = useState<RegionAction | null>(null);
 
   const glmConfig = useCallback((): GlmOcrConfig => ({
     provider: settings.glmOcrProvider,
@@ -286,6 +367,12 @@ export default function Home() {
     setPage(target);
     revealPageIndicator();
   }, [revealPageIndicator]);
+
+  const revealCitation = useCallback((citation: RegionCitation) => {
+    setRegionSelectMode(false);
+    setSelectedRegion({ ...citation });
+    scrollToPage(citation.page);
+  }, [scrollToPage]);
 
   const handlePageText = useCallback((pageNumber: number, text: string) => {
     pageTextsRef.current.set(pageNumber, text);
@@ -333,7 +420,42 @@ export default function Home() {
 
   useEffect(() => () => {
     if (pageIndicatorTimerRef.current !== null) window.clearTimeout(pageIndicatorTimerRef.current);
+    if (readerScrollTimerRef.current !== null) window.clearTimeout(readerScrollTimerRef.current);
   }, []);
+
+  const handleReaderScroll = useCallback(() => {
+    revealPageIndicator();
+    if (readerScrollTimerRef.current !== null) return;
+    readerScrollTimerRef.current = window.setTimeout(() => {
+      readerScrollTimerRef.current = null;
+      const container = readerScrollRef.current;
+      if (!container) return;
+      const pages = container.querySelectorAll<HTMLElement>('.pdf-page');
+      if (pages.length === 0) return;
+      const focus = container.scrollTop + container.clientHeight / 2;
+      let low = 0;
+      let high = pages.length - 1;
+      let selected = 0;
+      while (low <= high) {
+        const middle = Math.floor((low + high) / 2);
+        if (pages[middle].offsetTop <= focus) { selected = middle; low = middle + 1; }
+        else high = middle - 1;
+      }
+      const bestPage = Number(pages[selected].dataset.page) || 1;
+      setPage((current) => current === bestPage ? current : bestPage);
+    }, 0);
+  }, [revealPageIndicator]);
+
+  useEffect(() => {
+    if (!regionSelectMode) return;
+    const cancelSelection = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setRegionSelectMode(false);
+      setSelectedRegion(null);
+    };
+    window.addEventListener('keydown', cancelSelection);
+    return () => window.removeEventListener('keydown', cancelSelection);
+  }, [regionSelectMode]);
 
   useEffect(() => {
     const el = chatAreaRef.current;
@@ -386,23 +508,6 @@ export default function Home() {
   }, [pdf, pageCount, scrollToPage]);
 
   useEffect(() => {
-    const root = readerScrollRef.current;
-    if (!pdf || !root) return;
-    visiblePagesRef.current.clear();
-    const observer = new IntersectionObserver((entries) => {
-      for (const entry of entries) visiblePagesRef.current.set(Number((entry.target as HTMLElement).dataset.page), entry.intersectionRatio);
-      let nextPage = 1;
-      let bestRatio = 0;
-      for (const [pageNumber, ratio] of visiblePagesRef.current) {
-        if (ratio > bestRatio) { nextPage = pageNumber; bestRatio = ratio; }
-      }
-      if (bestRatio > 0) setPage((current) => current === nextPage ? current : nextPage);
-    }, { root, threshold: [0, 0.15, 0.35, 0.55, 0.75] });
-    for (const element of root.querySelectorAll('.pdf-page')) observer.observe(element);
-    return () => observer.disconnect();
-  }, [pdf, pageCount]);
-
-  useEffect(() => {
     if (!pdf) return;
     let cancelled = false;
     async function updatePageText() {
@@ -437,6 +542,7 @@ export default function Home() {
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       pageTextsRef.current.clear();
       deepReadCacheRef.current.clear();
+      setRegionSelectMode(false); setSelectedRegion(null); setRegionActionBusy(null);
       setDeepReadStatus(settings.glmOcrMode === 'auto' ? 'GLM-OCR 已待命，将按需精读公式、代码与表格页' : '');
       setScanWarning('');
       setIndexStatus('idle'); setIndexProgress(0); setIndexMessage(''); setHasIndexCheckpoint(false);
@@ -523,7 +629,7 @@ export default function Home() {
       if (activeBookIdRef.current === book.id || activeBookId === book.id || fileName === book.name) {
         vectorIndexRef.current.clear(); embeddingProviderRef.current = null; pageTextsRef.current.clear(); deepReadCacheRef.current.clear();
         activeBookIdRef.current = null;
-        setPdf(null); setFileName(''); setPage(1); setPageCount(0); setPageText(''); setActiveBookId(null); setMessages([]); setIndexStatus('idle'); setIndexProgress(0); setIndexMessage(''); setScanWarning(''); setDeepReadStatus('');
+        setPdf(null); setFileName(''); setPage(1); setPageCount(0); setPageText(''); setActiveBookId(null); setMessages([]); setIndexStatus('idle'); setIndexProgress(0); setIndexMessage(''); setScanWarning(''); setDeepReadStatus(''); setRegionSelectMode(false); setSelectedRegion(null); setRegionActionBusy(null);
         void pdf?.destroy().catch(() => undefined);
       }
     } catch (reason) {
@@ -709,6 +815,7 @@ export default function Home() {
           const remaining = ocrCompleted > 0 ? formatRemaining(((ocrCandidates.length - ocrCompleted) / pagesPerMinute) * 60) : '';
           setIndexMessage(`${concurrency.ocr} 路 OCR：${ocrCompleted} / ${ocrCandidates.length} 页${pagesPerMinute > 0 ? ` · ${pagesPerMinute.toFixed(1)} 页/分钟` : ''}${remaining ? ` · ${remaining}` : ''}${detail}`);
         };
+        updateOcrMessage(' · 正在准备页面图像');
         const unsubscribe = window.marginDesktop.onOcrProgress?.(() => updateOcrMessage(` · ${concurrency.ocr} 个页面并行处理中`));
         try {
           await mapWithConcurrency(ocrCandidates.length, concurrency.ocr, async (candidateNumber) => {
@@ -860,14 +967,57 @@ export default function Home() {
     return results.join('\n\n');
   }
 
-  async function askAi(event?: SyntheticEvent<HTMLFormElement>, preset?: string) {
+  async function runRegionAction(action: RegionAction) {
+    const selection = selectedRegion;
+    if (!selection?.image || !selection.mimeType || !selection.imageHash || asking || regionActionBusy) return;
+    if (!settings.apiKey.trim()) { setError('请先在模型设置中填入聊天模型 API Key，识别结果需要由聊天模型继续解释或整理。'); return; }
+    const actionSpec = REGION_ACTIONS[action];
+    const cacheKey = `region:${selection.imageHash}:${actionSpec.task}:${settings.glmOcrProvider}:${settings.glmOcrEndpoint}:${settings.glmOcrModel}`;
+    setError(''); setRegionActionBusy(action);
+    try {
+      let recognized = deepReadCacheRef.current.get(cacheKey);
+      const cacheHit = Boolean(recognized);
+      setDeepReadStatus(cacheHit ? `已命中框选识别缓存 · 正在${actionSpec.label}` : `GLM-OCR 正在识别第 ${selection.page} 页框选区域…`);
+      if (!recognized) {
+        const result = window.marginDesktop?.glmOcrRecognize
+          ? await window.marginDesktop.glmOcrRecognize({ ...glmConfig(), image: selection.image, mimeType: selection.mimeType, task: actionSpec.task })
+          : await recognizeWithGlmOcr({ endpoint: settings.glmOcrEndpoint, model: settings.glmOcrModel, apiKey: settings.glmOcrApiKey }, selection.image, selection.mimeType, actionSpec.task);
+        recognized = result.text;
+        deepReadCacheRef.current.set(cacheKey, recognized);
+      }
+      setDeepReadStatus(`第 ${selection.page} 页框选区域已识别 · 正在由聊天模型${actionSpec.label}`);
+      window.marginDesktop?.logEvent?.('glm-ocr-region-read-succeeded', {
+        bookId: activeBookId,
+        page: selection.page,
+        action,
+        task: actionSpec.task,
+        cacheHit,
+        imageBytes: selection.image.byteLength,
+        pixelWidth: selection.pixelWidth,
+        pixelHeight: selection.pixelHeight,
+      });
+      const answered = await askAi(undefined, actionSpec.prompt, { recognized, action, citation: { page: selection.page, region: selection.region } });
+      setDeepReadStatus(answered ? `框选${actionSpec.label}完成 · 点击回答下方引用可返回原区域` : `框选区域已识别，但聊天模型未能完成${actionSpec.label}`);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message.slice(0, 180) : '未知错误';
+      setError(`框选${actionSpec.label}失败：${message}`);
+      setDeepReadStatus(`GLM-OCR 框选精读失败：${message}`);
+      window.marginDesktop?.logEvent?.('glm-ocr-region-read-failed', { bookId: activeBookId, page: selection.page, action, message }, 'error');
+    } finally {
+      setRegionActionBusy(null);
+    }
+  }
+
+  async function askAi(event?: SyntheticEvent<HTMLFormElement>, preset?: string, regionContext?: RegionAiContext) {
     event?.preventDefault();
     const prompt = (preset ?? question).trim();
-    if (!prompt || !pdf || asking) return;
-    if (!settings.apiKey.trim()) { setError('请先在模型设置中填入 API Key。'); return; }
+    if (!prompt || !pdf || asking) return false;
+    if (!settings.apiKey.trim()) { setError('请先在模型设置中填入 API Key。'); return false; }
     const askedAt = new Date().toISOString();
-    const userMessage: Message = { role: 'user', content: prompt, page, createdAt: askedAt };
-    const assistantMessage: Message = { role: 'assistant', content: '', page, createdAt: askedAt };
+    const targetPage = regionContext?.citation.page ?? page;
+    const citation = regionContext?.citation;
+    const userMessage: Message = { role: 'user', content: regionContext ? REGION_ACTIONS[regionContext.action].label : prompt, page: targetPage, createdAt: askedAt, citation };
+    const assistantMessage: Message = { role: 'assistant', content: '', page: targetPage, createdAt: askedAt, citation };
     const previousMessages = messages;
     setQuestion(''); setError(''); setAsking(true);
     // Reserve a placeholder assistant bubble immediately so the user sees a
@@ -875,14 +1025,14 @@ export default function Home() {
     setMessages((current) => [...current, userMessage, assistantMessage]);
     try {
       let matches: RagMatch[] = [];
-      if (indexStatus === 'ready' && embeddingProviderRef.current) {
+      if (!regionContext && indexStatus === 'ready' && embeddingProviderRef.current) {
         if (activeBookId && window.marginDesktop?.libraryIndexSearch) {
           const [queryVector] = await embeddingProviderRef.current.embed([prompt], 'query');
           matches = await window.marginDesktop.libraryIndexSearch(activeBookId, embeddingProviderRef.current.id, Float32Array.from(queryVector), 5);
         } else matches = await vectorIndexRef.current.search(prompt, embeddingProviderRef.current, 5);
       }
       let deepReadContext = '';
-      if (settings.glmOcrMode === 'auto') {
+      if (!regionContext && settings.glmOcrMode === 'auto') {
         try {
           deepReadContext = await createDeepReadContext(matches, prompt);
         } catch (reason) {
@@ -893,7 +1043,10 @@ export default function Home() {
       }
       const ragContext = matches.length
         ? matches.map((match) => `[第 ${match.page} 页，相似度 ${match.score.toFixed(2)}]\n${match.text}`).join('\n\n')
-        : '（尚未建立全文向量索引）';
+        : regionContext ? '（框选精读仅使用选区，不发送整页或全文片段）' : '（尚未建立全文向量索引）';
+      const requestContent = regionContext
+        ? `我框选了第 ${targetPage} 页的一处区域。\n\nGLM-OCR 对该区域的识别结果：\n${regionContext.recognized.slice(0, 16000)}\n\n任务：${prompt}\n\n回答必须以识别结果为依据，不要补造看不清的内容。行内公式使用 $...$，独立公式使用 $$...$$；代码使用带语言标记的代码块；表格使用 Markdown。`
+        : `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。行内公式使用 $...$，独立公式使用 $$...$$，以便阅读器渲染。\n\n我的问题：${prompt}`;
       const response = await fetch(`${settings.endpoint.replace(/\/$/, '')}/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.apiKey}` },
@@ -902,7 +1055,7 @@ export default function Home() {
           messages: [
             { role: 'system', content: settings.systemPrompt.trim() || DEFAULT_SETTINGS.systemPrompt },
             ...messages.slice(-6).map(({ role, content }) => ({ role, content })),
-            { role: 'user', content: `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。行内公式使用 $...$，独立公式使用 $$...$$，以便阅读器渲染。\n\n我的问题：${prompt}` },
+            { role: 'user', content: requestContent },
           ],
         }),
       });
@@ -956,6 +1109,7 @@ export default function Home() {
       });
       const savedAnswer = answerText || '（模型未返回文本）';
       saveChatHistory(activeBookId ?? fileName, fileName, [...previousMessages, userMessage, { ...assistantMessage, content: savedAnswer }]);
+      return true;
     } catch (reason) {
       setError(`AI 请求失败：${reason instanceof Error ? reason.message.slice(0, 160) : '请检查端点与密钥'}`);
       // Drop the empty assistant placeholder on failure; keep partial text if any.
@@ -965,6 +1119,7 @@ export default function Home() {
         if (last?.role === 'assistant' && !last.content) next.pop();
         return next;
       });
+      return false;
     } finally { setAsking(false); }
   }
 
@@ -1083,8 +1238,12 @@ export default function Home() {
       <div className="workspace">
         <section className="reader-panel" aria-label="PDF 阅读区">
           {pdf ? <>
-            <div ref={readerScrollRef} className="canvas-wrap" onScroll={revealPageIndicator}><div className="pdf-pages">
-              {Array.from({ length: pageCount }, (_, index) => <PdfPageCanvas key={index + 1} pdf={pdf} pageNumber={index + 1} activePage={page} onText={handlePageText} onError={handleRenderError} />)}
+            <button className={regionSelectMode ? 'region-select-toggle active' : 'region-select-toggle'} onClick={() => { setRegionSelectMode((current) => !current); setSelectedRegion(null); setError(''); }} disabled={asking || Boolean(regionActionBusy)} aria-pressed={regionSelectMode} title="拖动框选 PDF 页面中的公式、表格、代码或文字"><ScanSearch /><span>{regionSelectMode ? '拖动框选区域' : '框选精读'}</span>{regionSelectMode && <kbd>Esc</kbd>}</button>
+            <div ref={readerScrollRef} className="canvas-wrap" onScroll={handleReaderScroll}><div className="pdf-pages">
+              {Array.from({ length: pageCount }, (_, index) => {
+                const pageNumber = index + 1;
+                return <PdfPageCanvas key={pageNumber} pdf={pdf} pageNumber={pageNumber} activePage={page} onText={handlePageText} onError={handleRenderError} selectionEnabled={regionSelectMode} selectedRegion={selectedRegion?.page === pageNumber ? selectedRegion : undefined} regionActionBusy={selectedRegion?.page === pageNumber ? regionActionBusy : null} onSelectionStart={() => setSelectedRegion(null)} onRegionSelected={(selection) => { setSelectedRegion(selection); setRegionSelectMode(false); revealPageIndicator(); }} onRegionAction={(action) => void runRegionAction(action)} onRegionClear={() => setSelectedRegion(null)} />;
+              })}
             </div></div>
             <div className={showPageIndicator ? 'page-scroll-indicator visible' : 'page-scroll-indicator'} aria-live="polite">{page} / {pageCount}</div>
           </> : <div className="empty-state">
@@ -1112,19 +1271,19 @@ export default function Home() {
             <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" onClick={() => indexStatus === 'indexing' ? stopIndexing() : void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? '暂停' : indexStatus === 'error' ? '重试' : hasIndexCheckpoint ? '继续索引' : '建立索引'}</Button>
           </div>}
           {scanWarning && <p className="scan-warning">{scanWarning}</p>}
-          {pdf && settings.glmOcrMode === 'auto' && <p className={deepReadStatus.includes('失败') ? 'deep-read-status error' : 'deep-read-status'}><Sparkles />{deepReadStatus || 'GLM-OCR 已待命 · 复杂页面将自动精读'}</p>}
+          {pdf && (settings.glmOcrMode === 'auto' || deepReadStatus) && <p className={deepReadStatus.includes('失败') ? 'deep-read-status error' : 'deep-read-status'}><Sparkles />{deepReadStatus || 'GLM-OCR 已待命 · 复杂页面将自动精读'}</p>}
           <div className="chat-area" ref={chatAreaRef} onScroll={handleChatScroll}>
             {messages.length === 0 ? <div className="chat-welcome"><MessageSquareText /><h3>我会跟着你的页码</h3><p>{pdf ? '直接提问，我会优先根据当前页原文解释。' : '打开 PDF 后，这里会自动获取你当前阅读的页面。'}</p></div> :
               <div className="messages" aria-live="polite">{messages.map((message, index) => {
                 const thinking = message.role === 'assistant' && !message.content && asking && index === messages.length - 1;
-                return <div className={`message ${message.role}`} key={`${message.page}-${index}`}><span>{message.role === 'assistant' ? <Bot /> : `P.${message.page}`}</span>{thinking ? <p className="thinking"><i /><i /><i /></p> : message.role === 'assistant' ? <MarkdownMessage content={message.content} /> : <p>{message.content}</p>}</div>;
+                return <div className={`message ${message.role}`} key={`${message.page}-${index}`}><span>{message.role === 'assistant' ? <Bot /> : `P.${message.page}`}</span><div className="message-body">{thinking ? <p className="thinking"><i /><i /><i /></p> : message.role === 'assistant' ? <MarkdownMessage content={message.content} /> : <p>{message.content}</p>}{message.citation && <button className="message-citation" onClick={() => revealCitation(message.citation!)}><ScanSearch />第 {message.citation.page} 页 · 查看框选来源</button>}</div></div>;
               })}</div>}
           </div>
           <div className="composer-wrap">
             {error && <p className="error-message">{error}</p>}
             <div className="quick-prompts">{quickPrompts.map((prompt) => <button key={prompt} onClick={() => void askAi(undefined, prompt)} disabled={!pdf || asking}>{prompt}</button>)}</div>
             <form className="composer" onSubmit={(event) => void askAi(event)}><Textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void askAi(); } }} disabled={!pdf || asking} placeholder={pdf ? `针对第 ${page} 页提问…` : '请先打开 PDF'} aria-label="输入问题" /><Button type="submit" size="icon-lg" disabled={!pdf || !question.trim() || asking} aria-label="发送"><Send /></Button></form>
-            <p className="privacy-note">当前页文本仅在提问时发送；启用远程 GLM-OCR 后，最多 2 个命中页图片也会发送。</p>
+            <p className="privacy-note">普通提问仅发送文本；框选精读只把裁剪区域交给 GLM-OCR，不发送整页图片。</p>
           </div>
         </aside>
       </div>

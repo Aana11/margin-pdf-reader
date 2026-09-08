@@ -97,20 +97,29 @@ async function createOcrWorkerPool(language) {
   ocrWorkerLanguage = language;
   const { codes, destination } = await ensureOcrLanguageData(language);
   const { createWorker, OEM } = require('tesseract.js');
-  const slots = Array.from({ length: OCR_WORKER_COUNT }, (_, index) => {
+  const cachePath = path.join(ocrRoot(), 'cache');
+  await mkdir(cachePath, { recursive: true });
+  const createSlot = (index) => {
     const slot = { index, pending: 0, page: 0, sender: null, queue: Promise.resolve(), worker: null };
     slot.worker = createWorker(codes, OEM.LSTM_ONLY, {
       langPath: destination,
-      cachePath: path.join(ocrRoot(), 'cache'),
+      cachePath,
       gzip: true,
       logger(message) {
         if (slot.sender && !slot.sender.isDestroyed()) slot.sender.send('ocr:progress', { page: slot.page, status: message.status, progress: Math.round((message.progress || 0) * 100) });
       },
     });
     return slot;
-  });
+  };
+  // Let one worker populate Tesseract's shared language cache before the
+  // remaining workers start. Parallel first-run cache writes can contend or
+  // stall on Windows, especially while antivirus scans the unpacked data.
+  const first = createSlot(0);
+  ocrWorkerSlots = [first];
+  await first.worker;
+  const slots = [first, ...Array.from({ length: OCR_WORKER_COUNT - 1 }, (_, index) => createSlot(index + 1))];
   ocrWorkerSlots = slots;
-  await Promise.all(slots.map((slot) => slot.worker));
+  await Promise.all(slots.slice(1).map((slot) => slot.worker));
   await logEvent('info', 'ocr.pool-ready', { language, workers: slots.length });
   return slots;
 }

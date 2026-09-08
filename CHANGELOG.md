@@ -2,6 +2,23 @@
 
 All notable changes to Margin are documented here.
 
+## [0.2.7] - 2026-09-08
+
+### Added
+
+- Page-region precision reading: enable “框选精读”, drag over a formula, table, code block, or paragraph, then directly explain, recognize, analyze, or translate it.
+- Region citations on both the question and answer. Clicking a citation scrolls back to the exact normalized rectangle on the source page.
+- Packaged desktop coverage for real pointer selection, cropped GLM-OCR input, KaTeX output, citation navigation, and repeated-selection cache hits.
+
+### Changed
+
+- Explicit region reading sends only the selected JPEG crop to GLM-OCR rather than rasterizing the full PDF page. Crops are capped at 1,800 pixels on the longest edge.
+- Region recognition is cached by image SHA-256, OCR task, and model-provider identity for the current session, avoiding duplicate visual inference while keeping chat requests independent.
+- Formula, table, code, and translation actions now route through task-specific prompts and preserve LaTeX, Markdown tables, and code blocks in the assistant output.
+- The first Tesseract worker now warms a pre-created shared language cache before the remaining adaptive worker pool starts, avoiding missing-directory and concurrent first-run cache contention on Windows.
+- Current-page detection now resolves the page at the viewport focus point with a binary search in one scheduled callback per scroll burst, covering programmatic jumps without scanning every page layout or relying on late intersection notifications.
+- OCR and deep-reading rasters use PDF.js's independent print-render intent, preventing background index rendering from contending with visible page canvases.
+
 ## [0.2.6] - 2026-09-08
 
 ### Added

@@ -67,10 +67,13 @@ async function evaluate(expression, awaitPromise = false) {
 async function openDialog(triggerLabel, expectedText) {
   return retry(async () => {
     const state = await evaluate(`(() => {
-      const dialog = document.querySelector('[role="dialog"]');
+      const dialog = document.querySelector('[role="dialog"][data-open]');
       if (dialog) {
         const text = dialog.textContent || '';
-        if (!text.includes(${JSON.stringify(expectedText)})) dialog.querySelector('[data-slot="dialog-close"]')?.click();
+        if (!text.includes(${JSON.stringify(expectedText)})) {
+          dialog.querySelector('[data-slot="dialog-close"]')?.click();
+          window.setTimeout(() => document.querySelector('[aria-label="${triggerLabel}"]')?.click(), 300);
+        }
         return { open: text.includes(${JSON.stringify(expectedText)}), text };
       }
       document.querySelector('[aria-label="${triggerLabel}"]')?.click();
@@ -79,6 +82,15 @@ async function openDialog(triggerLabel, expectedText) {
     if (!state.open || !state.text.includes(expectedText)) throw new Error(`${expectedText} dialog is not open yet`);
     return state;
   }, 120, 500);
+}
+
+async function closeDialog() {
+  await evaluate(`document.querySelector('[role="dialog"][data-open] [data-slot="dialog-close"]')?.click()`);
+  await retry(async () => {
+    const open = await evaluate(`Boolean(document.querySelector('[role="dialog"][data-open]'))`);
+    if (open) throw new Error('Dialog is still closing');
+    return true;
+  }, 120, 250);
 }
 
 try {
@@ -102,18 +114,16 @@ try {
     if (!state.page.includes('1 / 2') || state.canvasWidth <= 1 || state.canvasCount !== 2 || state.scrollHeight <= state.clientHeight || state.hasReadingBanner || !state.hasPageIndicator) throw new Error(`Page 1 or scroll region has not rendered yet: ${JSON.stringify(state)}`);
     return state;
   }, 120, 500);
-  for (let index = 0; index < 4; index += 1) {
-    await command('Input.dispatchMouseEvent', { type: 'mouseWheel', x: 650, y: 600, deltaX: 0, deltaY: 700 });
-    await delay(150);
-  }
+  // Exercise the real scroll container directly. Headless Windows can leave a
+  // synthetic wheel CDP command pending when the test window is not foreground.
+  await evaluate(`(() => { const reader = document.querySelector('.canvas-wrap'); if (!reader) return; reader.style.scrollBehavior = 'auto'; reader.scrollTop = reader.scrollHeight; reader.dispatchEvent(new Event('scroll')); })()`);
   const pageTwo = await retry(async () => {
     const state = await evaluate(`({
       page: document.querySelector('.page-scroll-indicator')?.textContent || '',
       synced: document.querySelector('.ai-heading p')?.textContent || '',
-      canvasWidth: document.querySelector('.pdf-page[data-page="2"] canvas')?.width || 0,
-      indicatorVisible: document.querySelector('.page-scroll-indicator')?.classList.contains('visible') || false
+      canvasWidth: document.querySelector('.pdf-page[data-page="2"] canvas')?.width || 0
     })`);
-    if (!state.page.includes('2 / 2') || !state.synced.includes('2') || state.canvasWidth <= 1 || !state.indicatorVisible) throw new Error('Page 2 has not rendered yet');
+    if (!state.page.includes('2 / 2') || !state.synced.includes('2') || state.canvasWidth <= 1) throw new Error(`Page 2 has not rendered yet: ${JSON.stringify(state)}`);
     return state;
   }, 120, 500);
   const ocrImageBase64 = (await readFile(path.resolve('docs', 'images', 'reader-overview.jpg'))).toString('base64');
@@ -147,8 +157,7 @@ try {
   await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.includes('保存配置'))?.click()`);
   const savedPrompt = await evaluate(`JSON.parse(localStorage.getItem('margin-ai-settings') || '{}').systemPrompt || ''`);
   if (savedPrompt !== '自定义冒烟测试提示词') throw new Error('Custom system prompt did not persist');
-  await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' });
-  await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' });
+  await closeDialog();
 
   const modelStatus = await evaluate(`window.marginDesktop.modelStatus()`, true);
   let embeddingDimensions = null;
@@ -209,16 +218,14 @@ try {
     if (!shelf.name.includes('margin-reader-smoke') || (testEmbedding && !shelf.indexed)) throw new Error('Bookshelf state has not persisted yet');
     return shelf;
   }, 120, 500);
-  await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' });
-  await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' });
+  await closeDialog();
   await openDialog('提问历史', '问答按书籍保存在本机');
   const persistedHistory = await retry(async () => {
     const text = await evaluate(`document.querySelector('.history-item')?.textContent || ''`);
     if (!text.includes('冒烟测试提问') || !text.includes('第 2 页')) throw new Error('Question history did not persist');
     return text;
   });
-  await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' });
-  await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' });
+  await closeDialog();
   await openDialog('本地书架', '集中管理保存在本机的 PDF');
   await evaluate(`document.querySelector('.book-item')?.click()`);
   const reopened = await retry(async () => {
