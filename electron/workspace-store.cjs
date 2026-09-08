@@ -3,7 +3,7 @@ const { mkdirSync } = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const path = require('node:path');
 
-const WORKSPACE_VERSION = 1;
+const WORKSPACE_VERSION = 2;
 const WORKSPACE_FILE = 'workspace.sqlite';
 const NOTE_KINDS = new Set(['highlight', 'note', 'summary', 'glossary']);
 
@@ -59,9 +59,169 @@ function openWorkspace(root) {
     );
     CREATE INDEX IF NOT EXISTS notes_book_updated ON notes(book_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS notes_kind_updated ON notes(kind, updated_at DESC);
+    CREATE TABLE IF NOT EXISTS knowledge_packs (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS knowledge_pack_books (
+      pack_id TEXT NOT NULL REFERENCES knowledge_packs(id) ON DELETE CASCADE,
+      book_id TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      PRIMARY KEY (pack_id, book_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS knowledge_pack_books_book ON knowledge_pack_books(book_id);
     INSERT OR REPLACE INTO metadata(key, value) VALUES ('version', '${WORKSPACE_VERSION}');
   `);
+  const messageColumns = new Set(
+    database
+      .prepare('PRAGMA table_info(messages)')
+      .all()
+      .map((row) => row.name),
+  );
+  if (!messageColumns.has('sources_json'))
+    database.exec('ALTER TABLE messages ADD COLUMN sources_json TEXT');
   return database;
+}
+
+function validatePackId(packId) {
+  if (typeof packId !== 'string' || !/^[0-9a-f-]{36}$/.test(packId))
+    throw new Error('Invalid knowledge pack id');
+  return packId;
+}
+
+function packRow(database, packId) {
+  const row = database
+    .prepare('SELECT * FROM knowledge_packs WHERE id = ?')
+    .get(validatePackId(packId));
+  if (!row) throw new Error('Knowledge pack not found');
+  const books = database
+    .prepare(
+      'SELECT book_id FROM knowledge_pack_books WHERE pack_id = ? ORDER BY position',
+    )
+    .all(packId)
+    .map((item) => item.book_id);
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    bookIds: books,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function listKnowledgePacks(root) {
+  const database = openWorkspace(root);
+  try {
+    return database
+      .prepare('SELECT id FROM knowledge_packs ORDER BY updated_at DESC, name')
+      .all()
+      .map((row) => packRow(database, row.id));
+  } finally {
+    database.close();
+  }
+}
+
+function createKnowledgePack(root, input = {}) {
+  const name = cleanText(input.name || '', 100, 'knowledge pack name');
+  if (!name) throw new Error('Knowledge pack name is required');
+  const description = cleanText(
+    input.description || '',
+    500,
+    'knowledge pack description',
+  );
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  const database = openWorkspace(root);
+  try {
+    database
+      .prepare(
+        'INSERT INTO knowledge_packs (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(id, name, description, now, now);
+    return packRow(database, id);
+  } finally {
+    database.close();
+  }
+}
+
+function updateKnowledgePack(root, packId, changes = {}) {
+  validatePackId(packId);
+  const database = openWorkspace(root);
+  try {
+    const existing = packRow(database, packId);
+    const name =
+      changes.name === undefined
+        ? existing.name
+        : cleanText(changes.name, 100, 'knowledge pack name');
+    if (!name) throw new Error('Knowledge pack name is required');
+    const description =
+      changes.description === undefined
+        ? existing.description
+        : cleanText(changes.description, 500, 'knowledge pack description');
+    const bookIds =
+      changes.bookIds === undefined ? existing.bookIds : changes.bookIds;
+    if (
+      !Array.isArray(bookIds) ||
+      bookIds.length > 200 ||
+      new Set(bookIds).size !== bookIds.length
+    )
+      throw new Error('Invalid knowledge pack books');
+    bookIds.forEach(validateBookId);
+    const updatedAt = new Date().toISOString();
+    database.exec('BEGIN IMMEDIATE');
+    database
+      .prepare(
+        'UPDATE knowledge_packs SET name = ?, description = ?, updated_at = ? WHERE id = ?',
+      )
+      .run(name, description, updatedAt, packId);
+    database
+      .prepare('DELETE FROM knowledge_pack_books WHERE pack_id = ?')
+      .run(packId);
+    const addBook = database.prepare(
+      'INSERT INTO knowledge_pack_books (pack_id, book_id, position) VALUES (?, ?, ?)',
+    );
+    bookIds.forEach((bookId, position) =>
+      addBook.run(packId, bookId, position),
+    );
+    database.exec('COMMIT');
+    return packRow(database, packId);
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      /* No active transaction. */
+    }
+    throw error;
+  } finally {
+    database.close();
+  }
+}
+
+function removeKnowledgePack(root, packId) {
+  const database = openWorkspace(root);
+  try {
+    return {
+      removed:
+        database
+          .prepare('DELETE FROM knowledge_packs WHERE id = ?')
+          .run(validatePackId(packId)).changes > 0,
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function getKnowledgePack(root, packId) {
+  const database = openWorkspace(root);
+  try {
+    return packRow(database, packId);
+  } finally {
+    database.close();
+  }
 }
 
 function serializeCitation(value) {
@@ -95,6 +255,26 @@ function parseJson(value) {
   }
 }
 
+function serializeSources(value) {
+  if (value === undefined) return null;
+  if (!Array.isArray(value) || value.length > 20)
+    throw new Error('Invalid message sources');
+  return JSON.stringify(
+    value.map((source) => {
+      validateBookId(source?.bookId);
+      if (!Number.isInteger(source.page) || source.page <= 0)
+        throw new Error('Invalid message source page');
+      return {
+        bookId: source.bookId,
+        bookName: cleanText(source.bookName || '', 300, 'source book name'),
+        page: source.page,
+        score: Math.max(-1, Math.min(1, Number(source.score) || 0)),
+        excerpt: cleanText(source.excerpt || '', 2_000, 'source excerpt'),
+      };
+    }),
+  );
+}
+
 function replaceChat(root, bookId, bookName, messages) {
   validateBookId(bookId);
   const safeName = cleanText(bookName, 300, 'book name');
@@ -103,7 +283,7 @@ function replaceChat(root, bookId, bookName, messages) {
   const database = openWorkspace(root);
   try {
     const insert = database.prepare(
-      'INSERT INTO messages (id, book_id, book_name, position, role, content, page, citation_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO messages (id, book_id, book_name, position, role, content, page, citation_json, sources_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     );
     database.exec('BEGIN IMMEDIATE');
     database.prepare('DELETE FROM messages WHERE book_id = ?').run(bookId);
@@ -124,6 +304,7 @@ function replaceChat(root, bookId, bookName, messages) {
         cleanText(message.content, 100_000, 'message'),
         message.page,
         serializeCitation(message.citation),
+        serializeSources(message.sources),
         cleanText(
           message.createdAt || new Date().toISOString(),
           50,
@@ -152,7 +333,7 @@ function loadChat(root, bookId, limit = 100) {
   try {
     const rows = database
       .prepare(
-        'SELECT role, content, page, citation_json, created_at FROM messages WHERE book_id = ? ORDER BY position DESC LIMIT ?',
+        'SELECT role, content, page, citation_json, sources_json, created_at FROM messages WHERE book_id = ? ORDER BY position DESC LIMIT ?',
       )
       .all(bookId, safeLimit)
       .reverse();
@@ -162,6 +343,7 @@ function loadChat(root, bookId, limit = 100) {
       page: row.page,
       createdAt: row.created_at,
       citation: parseJson(row.citation_json),
+      sources: parseJson(row.sources_json),
     }));
   } finally {
     database.close();
@@ -352,6 +534,9 @@ function removeBookData(root, bookId) {
     database.exec('BEGIN IMMEDIATE');
     database.prepare('DELETE FROM messages WHERE book_id = ?').run(bookId);
     database.prepare('DELETE FROM notes WHERE book_id = ?').run(bookId);
+    database
+      .prepare('DELETE FROM knowledge_pack_books WHERE book_id = ?')
+      .run(bookId);
     database.exec('COMMIT');
     return { removed: bookId };
   } catch (error) {
@@ -437,12 +622,17 @@ function markdownExport(root, options = {}) {
 }
 
 module.exports = {
+  createKnowledgePack,
+  getKnowledgePack,
   listNotes,
+  listKnowledgePacks,
   loadChat,
   markdownExport,
   removeBookData,
+  removeKnowledgePack,
   removeNote,
   replaceChat,
   saveNote,
   searchHistory,
+  updateKnowledgePack,
 };

@@ -277,6 +277,8 @@ try {
   let modelLoaded = null;
   let modelReleased = null;
   let persisted = null;
+  let knowledgePackUi = null;
+  let knowledgeSearchResult = null;
   if (testEmbedding) {
     const vectors = await evaluate(
       `window.marginDesktop.embed([
@@ -407,6 +409,77 @@ try {
     return state;
   });
   await closeDialog();
+  await openDialog('跨书知识包', '像文件夹一样自由组合书籍');
+  await evaluate(`(() => {
+    const input = document.querySelector('[aria-label="新知识包名称"]');
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, '冒烟测试知识包');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await evaluate(
+    `[...document.querySelectorAll('.knowledge-create button')].find((button) => button.textContent?.includes('创建'))?.click()`,
+  );
+  await retry(async () => {
+    const text = await evaluate(
+      `document.querySelector('.knowledge-pack-node')?.textContent || ''`,
+    );
+    if (!text.includes('冒烟测试知识包'))
+      throw new Error('Knowledge pack was not created through the UI');
+    return text;
+  });
+  await evaluate(
+    `document.querySelector('.knowledge-member input[type="checkbox"]')?.click()`,
+  );
+  knowledgePackUi = await retry(async () => {
+    const state = await evaluate(`({
+      tree: document.querySelector('.knowledge-tree')?.textContent || '',
+      members: document.querySelector('.knowledge-members-heading')?.textContent || '',
+      checked: Boolean(document.querySelector('.knowledge-member input[type="checkbox"]:checked'))
+    })`);
+    if (
+      !state.tree.includes('margin-reader-smoke') ||
+      !state.members.includes('已选 1') ||
+      !state.checked
+    )
+      throw new Error(
+        `Knowledge pack containment is not visible: ${JSON.stringify(state)}`,
+      );
+    return state;
+  });
+  if (testEmbedding) {
+    knowledgeSearchResult = await evaluate(
+      `(async () => {
+      const pack = (await window.marginDesktop.knowledgeList())[0];
+      const [vector] = await window.marginDesktop.embed(['smoke PDF page retrieval']);
+      return window.marginDesktop.knowledgeSearch(pack.id, ${JSON.stringify('local:Qwen/Qwen3-Embedding-4B:q4_k_m')}, vector, 5);
+    })()`,
+      true,
+    );
+    if (
+      knowledgeSearchResult?.searchedBooks !== 1 ||
+      knowledgeSearchResult?.matches?.length < 1 ||
+      knowledgeSearchResult.matches.some(
+        (match) => match.bookId !== historySeed.bookId,
+      )
+    )
+      throw new Error(
+        `Packaged cross-book search failed: ${JSON.stringify(knowledgeSearchResult)}`,
+      );
+  }
+  await evaluate(
+    `[...document.querySelectorAll('.knowledge-editor-actions button')].find((button) => button.textContent?.includes('用此知识包提问'))?.click()`,
+  );
+  await retry(async () => {
+    const text = await evaluate(
+      `document.querySelector('.ai-scope')?.textContent || ''`,
+    );
+    if (!text.includes('冒烟测试知识包') || !text.includes('1 本书'))
+      throw new Error('Knowledge pack did not become the assistant scope');
+    return text;
+  });
+  await evaluate(
+    `[...document.querySelectorAll('.ai-scope button')].find((button) => button.textContent?.includes('切回当前书籍'))?.click()`,
+  );
   await openDialog('本地书架', '集中管理保存在本机的 PDF');
   await evaluate(`document.querySelector('.book-item')?.click()`);
   const reopened = await retry(
@@ -460,6 +533,17 @@ try {
     60,
     500,
   );
+  const cleanedKnowledgePacks = await evaluate(
+    `window.marginDesktop.knowledgeList()`,
+    true,
+  );
+  if (cleanedKnowledgePacks?.[0]?.bookIds?.length !== 0)
+    throw new Error('Removed book remained inside a knowledge pack');
+  if (cleanedKnowledgePacks?.[0])
+    await evaluate(
+      `window.marginDesktop.knowledgeRemove(${JSON.stringify(cleanedKnowledgePacks[0].id)})`,
+      true,
+    );
   console.log(
     JSON.stringify({
       pageOne,
@@ -481,6 +565,8 @@ try {
       persistedHistory,
       workspaceSeed,
       workspaceUi,
+      knowledgePackUi,
+      knowledgeSearchResult,
       reopened,
       removed,
     }),

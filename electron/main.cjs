@@ -29,6 +29,7 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { Readable, Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
+const { Worker } = require('node:worker_threads');
 const {
   appendIndexBatch,
   cancelIndexBuild,
@@ -41,14 +42,19 @@ const {
   startIndexBuild,
 } = require('./index-store.cjs');
 const {
+  createKnowledgePack,
+  getKnowledgePack,
   listNotes,
+  listKnowledgePacks,
   loadChat,
   markdownExport,
   removeBookData,
+  removeKnowledgePack,
   removeNote,
   replaceChat,
   saveNote,
   searchHistory,
+  updateKnowledgePack,
 } = require('./workspace-store.cjs');
 
 const isDevelopment = !app.isPackaged;
@@ -642,6 +648,15 @@ function assertBookId(id) {
   return id;
 }
 
+function assertWorkspaceContextId(id) {
+  if (
+    typeof id !== 'string' ||
+    (!/^[0-9a-f-]{36}$/.test(id) && !/^pack_[0-9a-f-]{36}$/.test(id))
+  )
+    throw new Error('Invalid workspace context id');
+  return id;
+}
+
 function bookDirectory(id) {
   return path.join(libraryRoot(), assertBookId(id));
 }
@@ -673,6 +688,34 @@ function updateCatalog(mutator) {
   });
   catalogQueue = operation.catch(() => undefined);
   return operation;
+}
+
+function runKnowledgeSearch(books, providerId, vector, limit) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(
+      path.join(__dirname, 'knowledge-search-worker.cjs'),
+      {
+        workerData: {
+          books: books.map((book) => ({
+            ...book,
+            directory: bookDirectory(book.id),
+          })),
+          providerId,
+          vector: Array.from(vector),
+          limit,
+        },
+      },
+    );
+    worker.once('message', (message) => {
+      if (message?.ok) resolve(message.value);
+      else reject(new Error(message?.error || 'Knowledge search failed'));
+    });
+    worker.once('error', reject);
+    worker.once('exit', (code) => {
+      if (code !== 0)
+        reject(new Error(`Knowledge search worker exited (${code})`));
+    });
+  });
 }
 
 async function getFreePort() {
@@ -1795,6 +1838,61 @@ ipcMain.handle('library:list', async () =>
   (await readCatalog()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
 );
 
+ipcMain.handle('knowledge:list', () => listKnowledgePacks(dataRoot()));
+
+ipcMain.handle('knowledge:create', (_event, input) =>
+  createKnowledgePack(dataRoot(), input),
+);
+
+ipcMain.handle('knowledge:update', async (_event, packId, changes = {}) => {
+  if (changes.bookIds !== undefined) {
+    const knownBookIds = new Set((await readCatalog()).map((book) => book.id));
+    if (
+      !Array.isArray(changes.bookIds) ||
+      changes.bookIds.some((bookId) => !knownBookIds.has(bookId))
+    )
+      throw new Error('Knowledge pack contains an unknown book');
+  }
+  return updateKnowledgePack(dataRoot(), packId, changes);
+});
+
+ipcMain.handle('knowledge:remove', (_event, packId) =>
+  removeKnowledgePack(dataRoot(), packId),
+);
+
+ipcMain.handle(
+  'knowledge:search',
+  async (_event, packId, providerId, vector, limit = 8) => {
+    if (
+      typeof providerId !== 'string' ||
+      providerId.length < 2 ||
+      providerId.length > 500 ||
+      (!Array.isArray(vector) && !(vector instanceof Float32Array)) ||
+      vector.length < 2 ||
+      vector.length > 16_384 ||
+      !Number.isInteger(limit) ||
+      limit <= 0 ||
+      limit > 20
+    )
+      throw new Error('Invalid knowledge search request');
+    const pack = getKnowledgePack(dataRoot(), packId);
+    const bookIds = new Set(pack.bookIds);
+    const books = (await readCatalog()).filter((book) => bookIds.has(book.id));
+    const startedAt = Date.now();
+    const result = await runKnowledgeSearch(books, providerId, vector, limit);
+    await logEvent('info', 'knowledge.search-succeeded', {
+      packId,
+      memberBooks: pack.bookIds.length,
+      searchedBooks: result.searchedBooks,
+      skippedBooks: result.skippedBooks.length,
+      matches: result.matches.length,
+      workerElapsedMs: result.elapsedMs,
+      elapsedMs: Date.now() - startedAt,
+    });
+    return { ...result, packId, memberBooks: pack.bookIds.length };
+  },
+);
+
 ipcMain.handle('library:import', async (_event, payload) => {
   if (!payload || typeof payload.name !== 'string' || payload.name.length > 300)
     throw new Error('Invalid PDF import');
@@ -2013,11 +2111,11 @@ ipcMain.handle(
 );
 
 ipcMain.handle('workspace:chat-load', (_event, bookId, limit) =>
-  loadChat(dataRoot(), assertBookId(bookId), limit),
+  loadChat(dataRoot(), assertWorkspaceContextId(bookId), limit),
 );
 
 ipcMain.handle('workspace:chat-replace', (_event, bookId, bookName, messages) =>
-  replaceChat(dataRoot(), assertBookId(bookId), bookName, messages),
+  replaceChat(dataRoot(), assertWorkspaceContextId(bookId), bookName, messages),
 );
 
 ipcMain.handle('workspace:history-search', (_event, query, limit, offset) =>

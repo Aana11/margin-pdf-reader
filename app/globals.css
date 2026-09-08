@@ -357,6 +357,259 @@ textarea {
   line-height: 1.7;
 }
 
+.knowledge-dialog {
+  width: min(1040px, calc(100vw - 32px));
+  max-width: 1040px;
+  max-height: min(88vh, 840px);
+  overflow: hidden;
+}
+.knowledge-create {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid #d9e5e3;
+  border-radius: 11px;
+  background: #f3f8f7;
+}
+.knowledge-create > svg {
+  width: 18px;
+  color: #318d82;
+}
+.knowledge-layout {
+  min-height: 440px;
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(380px, 1.35fr);
+  overflow: hidden;
+  border: 1px solid #dfe5e7;
+  border-radius: 12px;
+  background: #fff;
+}
+.knowledge-tree {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+  border-right: 1px solid #e1e7e8;
+  background: #f6f8f8;
+}
+.knowledge-tree-node {
+  margin-bottom: 6px;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: 10px;
+}
+.knowledge-tree-node.selected {
+  border-color: #bcdad5;
+  background: #edf7f5;
+}
+.knowledge-pack-node {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 14px 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 8px;
+  border: 0;
+  background: transparent;
+  color: #405158;
+  text-align: left;
+  cursor: pointer;
+}
+.knowledge-pack-node > svg:first-child {
+  width: 12px;
+  color: #89979b;
+}
+.knowledge-pack-node > svg:nth-child(2) {
+  width: 20px;
+  color: #4a9b91;
+  fill: #d9efeb;
+}
+.knowledge-pack-node > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.knowledge-pack-node strong,
+.knowledge-tree-books span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.knowledge-pack-node strong {
+  font-size: 12px;
+}
+.knowledge-pack-node small {
+  color: #829095;
+  font-size: 9px;
+}
+.knowledge-pack-node i {
+  padding: 2px 5px;
+  border-radius: 999px;
+  background: #cceae5;
+  color: #267a70;
+  font-size: 8px;
+  font-style: normal;
+}
+.knowledge-tree-books {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 8px 8px 32px;
+  padding-left: 9px;
+  border-left: 1px solid #cbd8d6;
+}
+.knowledge-tree-books > span {
+  padding: 5px 6px;
+  color: #9aa4a7;
+  font-size: 10px;
+}
+.knowledge-tree-books button {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 13px minmax(0, 1fr) 13px;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #68767b;
+  text-align: left;
+  cursor: pointer;
+}
+.knowledge-tree-books button:hover {
+  background: #fff;
+  color: #287b72;
+}
+.knowledge-tree-books svg {
+  width: 12px;
+}
+.knowledge-tree-books svg:last-child {
+  color: #55a499;
+}
+.knowledge-editor {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+}
+.knowledge-editor-heading {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.8fr) minmax(180px, 1.2fr) auto;
+  align-items: end;
+  gap: 9px;
+}
+.knowledge-editor-heading > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.knowledge-editor-heading label {
+  color: #637177;
+  font-size: 10px;
+}
+.knowledge-members-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 17px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e3e8e9;
+}
+.knowledge-members-heading > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.knowledge-members-heading strong {
+  color: #34454a;
+  font-size: 12px;
+}
+.knowledge-members-heading span {
+  color: #8a969a;
+  font-size: 9px;
+}
+.knowledge-members {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 7px 1px;
+}
+.knowledge-members > p {
+  color: #89969a;
+  font-size: 11px;
+  text-align: center;
+}
+.knowledge-member {
+  display: grid;
+  grid-template-columns: auto 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.knowledge-member:hover {
+  background: #f4f7f7;
+}
+.knowledge-member.checked {
+  border-color: #c6dfdb;
+  background: #eff8f6;
+}
+.knowledge-member > span:nth-of-type(2) {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.knowledge-member strong {
+  overflow: hidden;
+  color: #425157;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.knowledge-member small {
+  color: #879297;
+  font-size: 9px;
+}
+.knowledge-member > svg {
+  width: 15px;
+  color: #78a09b;
+}
+.knowledge-editor-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 9px;
+  padding-top: 10px;
+  border-top: 1px solid #e3e8e9;
+}
+.knowledge-empty,
+.knowledge-editor-empty {
+  margin: 70px auto;
+  color: #8d999d;
+  text-align: center;
+}
+.knowledge-empty svg,
+.knowledge-editor-empty svg {
+  width: 25px;
+  color: #62a59c;
+}
+.knowledge-empty p,
+.knowledge-editor-empty p {
+  max-width: 220px;
+  margin: 8px auto 0;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 .task-center-dialog {
   width: min(760px, calc(100vw - 32px));
   max-width: 760px;
@@ -879,6 +1132,69 @@ textarea {
   background: #eaf7f4;
   color: #218170;
 }
+.ai-scope {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 16px;
+  border-bottom: 1px solid #e1e5e8;
+  background: #f7f9f9;
+}
+.ai-scope.pack {
+  background: #eaf6f4;
+}
+.ai-scope > span {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.ai-scope > span > svg {
+  width: 15px;
+  color: #438f86;
+}
+.ai-scope > span > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.ai-scope small {
+  color: #8a959a;
+  font-size: 8px;
+}
+.ai-scope strong {
+  overflow: hidden;
+  color: #3e5256;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-scope > button {
+  flex: 0 0 auto;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: #dce9e7;
+  color: #397c74;
+  font-size: 9px;
+  cursor: pointer;
+}
+.knowledge-search-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  padding: 6px 16px;
+  border-bottom: 1px solid #dce8e6;
+  background: #f3f9f8;
+  color: #4a7f78;
+  font-size: 9px;
+}
+.knowledge-search-status svg {
+  width: 12px;
+}
 .index-strip {
   display: flex;
   align-items: center;
@@ -1112,6 +1428,55 @@ textarea {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
+}
+.message-sources {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid #dce7e5;
+  border-radius: 9px;
+  background: #f5f9f8;
+}
+.message-sources > strong {
+  color: #617579;
+  font-size: 9px;
+}
+.message-sources > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.message-sources button {
+  min-width: 0;
+  display: inline-grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border: 1px solid #cbdedb;
+  border-radius: 7px;
+  background: #fff;
+  color: #34786f;
+  font-size: 9px;
+  cursor: pointer;
+}
+.message-sources button:hover {
+  border-color: #73b9af;
+  background: #eaf6f3;
+}
+.message-sources svg {
+  width: 11px;
+}
+.message-sources button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.message-sources button small {
+  color: #8b989b;
+  font-size: 8px;
 }
 .message-citation,
 .message-save-card {
@@ -1622,6 +1987,15 @@ textarea {
   .task-center-summary > div {
     grid-column: 1 / -1;
   }
+  .knowledge-layout {
+    min-height: 580px;
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(180px, 0.7fr) minmax(340px, 1.3fr);
+  }
+  .knowledge-tree {
+    border-right: 0;
+    border-bottom: 1px solid #e1e7e8;
+  }
 }
 @media (max-width: 460px) {
   .settings-fields {
@@ -1644,5 +2018,12 @@ textarea {
   .task-center-summary > div {
     grid-column: 1;
     flex-wrap: wrap;
+  }
+  .knowledge-create,
+  .knowledge-editor-heading {
+    grid-template-columns: 1fr;
+  }
+  .knowledge-create > svg {
+    display: none;
   }
 }

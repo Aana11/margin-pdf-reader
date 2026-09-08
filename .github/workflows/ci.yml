@@ -27,6 +27,7 @@ jobs:
       - run: npm run test:index-resume
       - run: npm run test:index-tasks
       - run: npm run test:workspace
+      - run: npm run test:knowledge-packs
       - run: npm run build
       - run: npx electron-builder --dir
       - run: npm run test:desktop
@@ -34,3 +35,4 @@ jobs:
       - run: npm run test:desktop:deep-reading
       - run: npm run test:desktop:region-reading
       - run: npm run test:desktop:model-association
+      - run: npm run test:desktop:knowledge-packs

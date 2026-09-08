@@ -25,10 +25,11 @@ An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Elec
 5. Text is normalized and split into overlapping, page-addressable chunks.
 6. The selected embedding provider generates vectors in bounded batches (8 for Vulkan Qwen, adaptive 1–4 for CPU Qwen, 16 for remote providers).
 7. Completed vectors are transferred as `Float32Array` and accumulated into SQLite transactions of at most 64 entries.
-8. Query search streams rows from SQLite, computes cosine similarity, and retains only the best K matches.
-9. When optional GLM-OCR deep reading is enabled, the renderer classifies retrieved text for formulas, code, tables, or an explicit deep-reading request. It rasterizes at most two unique candidates and sends them to the configured GLM-OCR endpoint.
-10. The current page, top-ranked chunks, and successful visual-recognition results are sent to the configured chat model only after the user asks a question.
-11. Explicit region reading crops the already-rendered page canvas, caps the longest edge at 1,800 pixels, and sends only that JPEG region to GLM-OCR before task-specific chat processing.
+8. Single-book search streams rows from SQLite, computes cosine similarity, and retains only the best K matches.
+9. Cross-book search first resolves one user-selected knowledge pack, computes the query vector once, and sends only its member indexes to a worker thread. The worker skips missing/provider-incompatible indexes and merges per-book candidates into a global Top-K carrying book and page identity.
+10. When optional GLM-OCR deep reading is enabled, single-book reading classifies retrieved text for formulas, code, tables, or an explicit deep-reading request. It rasterizes at most two unique candidates and sends them to the configured GLM-OCR endpoint.
+11. The current page or user-selected knowledge-pack matches and successful visual-recognition results are sent to the configured chat model only after the user asks a question.
+12. Explicit region reading crops the already-rendered page canvas, caps the longest edge at 1,800 pixels, and sends only that JPEG region to GLM-OCR before task-specific chat processing.
 
 Tesseract OCR runs only when PDF.js finds no meaningful text layer and the page-density preflight indicates visible content. Its output is used for assistant context and retrieval; Margin does not write an invisible selectable-text layer back into the PDF.
 
@@ -52,6 +53,14 @@ Builds write to `index.sqlite.building` and replace the previous database only a
 
 Provider identity remains an invariant: an index opens only when its embedding provider/model/version matches the current selection. Search stays in the main process so the renderer does not deserialize or retain every vector. Measured results and the reproducible command are in [`index-benchmark.md`](index-benchmark.md).
 
+## Cross-book knowledge packs
+
+Knowledge packs are relational metadata in `workspace.sqlite`: `knowledge_packs` stores the user-visible folder and `knowledge_pack_books` stores its ordered book IDs. This avoids duplicating PDFs or vector BLOBs, permits one book to belong to several packs, and lets book deletion remove memberships transactionally without deleting the remaining pack.
+
+The renderer computes one query embedding and invokes a narrow `knowledge:search` bridge with the selected pack ID. The main process resolves membership against the current catalog, so renderer-supplied IDs cannot widen scope. Exact searches execute in `knowledge-search-worker.cjs`, keeping synchronous `node:sqlite` vector scans off the Electron main thread. Every result carries `bookId`, `bookName`, `page`, score, and text; the assistant persists a bounded source list beside its message for later page navigation.
+
+No all-library fallback exists. Empty packs fail with an actionable message, removed books disappear from memberships, and provider-incompatible indexes are returned as skipped diagnostics. Exact per-book SQLite remains the compatibility path; ANN will be considered only after real pack sizes justify its additional native dependency and migration cost.
+
 ## Embedding providers
 
 The built-in provider uses `Qwen/Qwen3-Embedding-4B`, produces 2560-dimensional embeddings, and runs the official Q4_K_M GGUF through a pinned llama.cpp sidecar bound only to `127.0.0.1`. The same pinned runtime also supports managed GLM-OCR. The main process selects a Vulkan runtime when an NVIDIA GPU is detected and otherwise uses CPU; `MARGIN_RUNTIME_BACKEND` can override it. Vulkan embedding runs eight parallel slots with a larger token batch, while CPU remains at four slots to avoid thread oversubscription. The embedding sidecar exits after two idle minutes or an explicit unload request.
@@ -60,7 +69,7 @@ The model and llama.cpp runtime are optional downloaded resources rather than Gi
 
 ## Local state and privacy
 
-The managed PDF, catalog metadata, progress, OCR-derived index text, SQLite vectors, chat history, highlights, annotations, summary cards, and glossary entries remain below the local Margin data root. Chat history and reading materials use `workspace.sqlite`; chat is capped to the latest 100 messages per book in the active context, while history search and material lists load bounded result pages. Renderer preferences—including chat/embedding/GLM-OCR settings and the custom system prompt—use Electron browser storage. Removing a book also removes all workspace rows carrying that book ID.
+The managed PDF, catalog metadata, progress, OCR-derived index text, SQLite vectors, chat history, source citations, knowledge-pack membership, highlights, annotations, summary cards, and glossary entries remain below the local Margin data root. Chat history, knowledge packs, and reading materials use `workspace.sqlite`; chat is capped to the latest 100 messages per book or pack in the active context, while history search and material lists load bounded result pages. Renderer preferences—including chat/embedding/GLM-OCR settings and the custom system prompt—use Electron browser storage. Removing a book also removes its workspace rows and knowledge-pack memberships.
 
 Chat and embedding credentials are separate because users may choose different vendors. They are stored in the Electron browser profile, not committed to Git, and are sent only to their configured endpoint.
 
@@ -71,4 +80,4 @@ Chat and embedding credentials are separate because users may choose different v
 - Library removal deletes only the app-managed PDF, metadata, and indexes after explicit confirmation; the original import source is untouched.
 - OCR work is adaptively capped at one to four concurrent workers to improve scanned-book throughput without unbounded CPU or memory growth.
 - GLM-OCR is optional, query-time only, and limited to two retrieved pages per question.
-- Exact SQLite search targets individual large books; a future cross-library or million-chunk mode may require an ANN extension.
+- Cross-book exact SQLite search is limited to explicit user-created packs and runs off the main thread; very large/million-chunk packs may later opt into ANN while retaining exact-search compatibility.

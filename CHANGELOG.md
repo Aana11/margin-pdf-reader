@@ -2,6 +2,22 @@
 
 All notable changes to Margin are documented here.
 
+## [0.3.0] - 2026-09-09
+
+### Added
+
+- User-managed cross-book knowledge packs. A folder-style manager shows every pack and its nested books in one view, with same-screen membership selection and index compatibility status.
+- Assistant scope switching between the current book and a selected knowledge pack. Pack questions search only explicitly selected members and never fall back to the entire bookshelf.
+- Cross-book source cards with book name, page, similarity score, persisted excerpts, and one-click navigation back to the exact source page.
+- Unit and packaged desktop coverage for pack CRUD, deletion cleanup, provider filtering, global ranking, a deliberately more-similar excluded book, one-query/one-embedding behavior, chat context isolation, source persistence, and page navigation.
+
+### Changed
+
+- Knowledge-pack relations and cross-book chat sources are stored in the existing `workspace.sqlite`; PDFs and per-book Float32 indexes are not duplicated.
+- Cross-book exact search runs in a worker thread. It computes the query embedding once, streams only selected compatible per-book SQLite indexes, and globally merges their Top-K results without blocking the Electron main process.
+- Books without an index or with a different embedding-provider identity are reported as skipped rather than silently mixed into an incompatible result set.
+- Removing a book now also removes its membership from every knowledge pack while preserving the packs and their remaining books.
+
 ## [0.2.9] - 2026-09-08
 
 ### Added
