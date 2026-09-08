@@ -2,6 +2,22 @@
 
 All notable changes to Margin are documented here.
 
+## [0.2.8] - 2026-09-08
+
+### Added
+
+- A persistent background index task center in the application sidebar. Books can be queued individually or in bulk, processed without switching the reader, paused/resumed from SQLite checkpoints, or cancelled with explicit checkpoint cleanup.
+- Per-task stage timing, page/chunk/OCR counters, failed-page reporting, active CPU/Vulkan backend, and adaptive text/OCR/embedding lane telemetry.
+- OCR preflight classification for pages with no or very little extracted text. Near-blank pages skip Tesseract, while individual OCR failures retry once before being reported.
+- Packaged desktop coverage for automatic local-model association and persisted background task results.
+
+### Changed
+
+- Index progress remains monotonic across extraction, OCR, chunking, embedding, and SQLite completion, including resumed tasks and books queued behind another active job.
+- The application now discovers already-downloaded Qwen, GLM-OCR, and pinned llama.cpp files at startup. If a legacy profile never explicitly chose a GLM-OCR mode, complete local files are associated with managed on-demand mode automatically; an explicit user choice to keep it off is preserved.
+- CPU concurrency now also considers installed memory, while Vulkan/CPU embedding lanes are reported and selected from the main-process hardware profile.
+- Cancelling an index is distinct from pausing: pause retains `index.sqlite.building`, while cancel removes only that unfinished checkpoint and leaves the last completed index intact.
+
 ## [0.2.7] - 2026-09-08
 
 ### Added

@@ -54,6 +54,7 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   libraryIndexAppend: (id, entries) => ipcRenderer.invoke('library:index-append', id, entries),
   libraryIndexFinish: (id) => ipcRenderer.invoke('library:index-finish', id),
   libraryIndexCancel: (id) => ipcRenderer.invoke('library:index-cancel', id),
+  libraryIndexDiscard: (id) => ipcRenderer.invoke('library:index-discard', id),
   libraryIndexSearch: (id, providerId, vector, limit) => ipcRenderer.invoke('library:index-search', id, providerId, vector, limit),
 });
 

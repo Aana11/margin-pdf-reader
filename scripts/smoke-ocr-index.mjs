@@ -154,7 +154,9 @@ try {
     return { info, match: matches[0] };
   })()`, true);
   if (result.info?.format !== 'sqlite-f32' || result.info.chunks < 3 || !/ORCHID/i.test(result.match?.text || '')) throw new Error(`Concurrent OCR text was not stored in SQLite: ${JSON.stringify(result)}`);
-  console.log(JSON.stringify({ indexed, info: result.info, match: { page: result.match.page, text: result.match.text.slice(0, 120) } }));
+  const taskState = await evaluate(`({ tasks: JSON.parse(localStorage.getItem('margin-index-tasks-v1') || '[]'), hasTaskCenter: [...document.querySelectorAll('.sidebar-module-button')].some((button) => button.textContent?.includes('任务')) })`);
+  if (!taskState.hasTaskCenter || taskState.tasks.length !== 1 || taskState.tasks[0].status !== 'completed' || taskState.tasks[0].progress !== 100 || !taskState.tasks[0].timings?.ocr || !taskState.tasks[0].timings?.embedding) throw new Error(`Background task state was not persisted: ${JSON.stringify(taskState)}`);
+  console.log(JSON.stringify({ indexed, task: { status: taskState.tasks[0].status, progress: taskState.tasks[0].progress, timings: taskState.tasks[0].timings }, info: result.info, match: { page: result.match.page, text: result.match.text.slice(0, 120) } }));
 } finally {
   await Promise.race([command('Browser.close').catch(() => undefined), delay(2_000)]);
   socket.close();

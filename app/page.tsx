@@ -1,7 +1,7 @@
 'use client';
 
 import { PointerEvent as ReactPointerEvent, SyntheticEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { BookOpen, Bot, Code2, FileText, HardDrive, History, Languages, Library, MessageSquareText, Plus, ScanSearch, Send, Settings2, Sigma, Sparkles, Table2, Trash2, Upload, X } from 'lucide-react';
+import { BookOpen, Bot, CheckCircle2, Clock3, Code2, FileText, Gauge, HardDrive, History, Languages, Library, ListTodo, MessageSquareText, Pause, Play, Plus, RotateCcw, ScanSearch, Send, Settings2, Sigma, Sparkles, Square, Table2, Trash2, Upload, X } from 'lucide-react';
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist';
 import ReactMarkdown from 'react-markdown';
 import rehypeKatex from 'rehype-katex';
@@ -17,6 +17,8 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
 import { chunkPage } from '@/lib/rag/chunk';
+import { estimateInkRatio, formatElapsed, INDEX_TASKS_KEY, isProbablyBlankPage, normalizeIndexTasks, queueBooks, shouldInspectWithOcr } from '@/lib/indexing/tasks';
+import type { IndexTask, IndexTaskStage } from '@/lib/indexing/tasks';
 import { recognizeWithGlmOcr, selectDeepReadCandidates } from '@/lib/rag/deep-reading';
 import type { DeepReadMode } from '@/lib/rag/deep-reading';
 import { cropCanvasRegion, hashRegionImage, isUsableRegion, normalizeRegion, REGION_ACTIONS } from '@/lib/rag/region-reading';
@@ -60,11 +62,14 @@ const DEFAULT_SETTINGS: ModelSettings = {
 const quickPrompts = ['总结本页', '解释核心概念', '精读本页公式/代码'];
 const CHAT_HISTORY_KEY = 'margin-chat-history-v1';
 
+type AppInfo = { version: string; packaged: boolean; logPath: string; dataRoot: string; cpuThreads: number; totalMemory: number; freeMemory: number; runtimeBackend: 'cpu' | 'vulkan'; ocrWorkers: number; embeddingSlots: number };
+
 function readSavedSettings(): ModelSettings {
   if (typeof window === 'undefined') return DEFAULT_SETTINGS;
   try {
     const saved = JSON.parse(localStorage.getItem('margin-ai-settings') ?? '{}');
-    const migrated = localStorage.getItem('margin-settings-schema') === '2' ? saved : { ...saved, glmOcrProvider: 'managed', glmOcrEndpoint: '', glmOcrModel: 'ggml-org/GLM-OCR-GGUF' };
+    const schema = Number(localStorage.getItem('margin-settings-schema') || 0);
+    const migrated = schema >= 2 ? saved : { ...saved, glmOcrProvider: 'managed', glmOcrEndpoint: '', glmOcrModel: 'ggml-org/GLM-OCR-GGUF' };
     return { ...DEFAULT_SETTINGS, ...migrated };
   }
   catch { return DEFAULT_SETTINGS; }
@@ -78,6 +83,12 @@ function readChatHistory(): ChatHistoryRecord[] {
   } catch { return []; }
 }
 
+function readIndexTasks(): IndexTask[] {
+  if (typeof window === 'undefined') return [];
+  try { return normalizeIndexTasks(JSON.parse(localStorage.getItem(INDEX_TASKS_KEY) ?? '[]')); }
+  catch { return []; }
+}
+
 function formatRemaining(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return '';
   if (seconds < 60) return `约 ${Math.max(1, Math.ceil(seconds))} 秒`;
@@ -89,22 +100,41 @@ function formatRemaining(seconds: number) {
 async function mapWithConcurrency<T>(count: number, concurrency: number, task: (pageNumber: number) => Promise<T>): Promise<T[]> {
   const results = Array.from<T>({ length: count });
   let cursor = 0;
+  let firstError: unknown;
   await Promise.all(Array.from({ length: Math.min(count, concurrency) }, async () => {
-    while (cursor < count) {
+    while (cursor < count && !firstError) {
       const index = cursor;
       cursor += 1;
-      results[index] = await task(index + 1);
+      try { results[index] = await task(index + 1); }
+      catch (reason) { firstError ||= reason; }
     }
   }));
+  if (firstError) throw firstError;
   return results;
 }
 
-function getIndexConcurrency() {
-  const threads = typeof navigator === 'undefined' ? 8 : Math.max(1, navigator.hardwareConcurrency || 8);
+function getIndexConcurrency(appInfo?: AppInfo | null, backend?: 'cpu' | 'vulkan') {
+  const threads = appInfo?.cpuThreads || (typeof navigator === 'undefined' ? 8 : Math.max(1, navigator.hardwareConcurrency || 8));
+  const memoryGb = appInfo ? appInfo.totalMemory / 1024 / 1024 / 1024 : 16;
   return {
     text: Math.max(2, Math.min(8, Math.ceil(threads / 2))),
-    ocr: Math.max(1, Math.min(4, Math.floor(threads / 4))),
+    ocr: Math.max(1, Math.min(appInfo?.ocrWorkers || 4, memoryGb < 8 ? 1 : memoryGb < 16 ? 2 : Math.floor(threads / 4))),
+    embedding: backend === 'vulkan' ? 8 : Math.max(1, Math.min(appInfo?.embeddingSlots || 4, Math.floor(threads / 4))),
   };
+}
+
+const INDEX_STAGE_LABELS: Record<IndexTaskStage, string> = {
+  queued: '排队', preparing: '准备', extracting: '文本提取', ocr: 'OCR', chunking: '整理文本', embedding: '向量生成', writing: '写入 SQLite', complete: '完成',
+};
+
+function indexTaskStatusLabel(task: IndexTask) {
+  if (task.status === 'queued') return '等待中';
+  if (task.status === 'running') return INDEX_STAGE_LABELS[task.stage];
+  if (task.status === 'pausing') return '正在暂停';
+  if (task.status === 'paused') return '已暂停';
+  if (task.status === 'completed') return '已完成';
+  if (task.status === 'cancelled') return '已取消';
+  return '需要处理';
 }
 
 function MarkdownMessage({ content }: { content: string }) {
@@ -112,7 +142,7 @@ function MarkdownMessage({ content }: { content: string }) {
   return <div className="message-content"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer">{children}</a> }}>{normalized}</ReactMarkdown></div>;
 }
 
-async function renderPageImage(pdfPage: PDFPageProxy, format: 'png' | 'jpeg' = 'png'): Promise<{ bytes: Uint8Array; mimeType: string }> {
+async function renderPageImage(pdfPage: PDFPageProxy, format: 'png' | 'jpeg' = 'png', inspectBlank = false): Promise<{ bytes: Uint8Array; mimeType: string; inkRatio?: number }> {
   const baseViewport = pdfPage.getViewport({ scale: 1 });
   const scale = Math.max(1.5, Math.min(2.5, 2000 / Math.max(baseViewport.width, baseViewport.height)));
   const viewport = pdfPage.getViewport({ scale });
@@ -123,10 +153,29 @@ async function renderPageImage(pdfPage: PDFPageProxy, format: 'png' | 'jpeg' = '
   if (!context) throw new Error('无法创建 OCR 页面画布');
   await pdfPage.render({ canvas, canvasContext: context, viewport, background: '#ffffff', intent: 'print' }).promise;
   const mimeType = format === 'jpeg' ? 'image/jpeg' : 'image/png';
+  let inkRatio: number | undefined;
+  if (inspectBlank) {
+    const sampleScale = Math.min(1, 320 / Math.max(canvas.width, canvas.height));
+    const sample = document.createElement('canvas');
+    sample.width = Math.max(1, Math.round(canvas.width * sampleScale));
+    sample.height = Math.max(1, Math.round(canvas.height * sampleScale));
+    const sampleContext = sample.getContext('2d', { alpha: false });
+    if (sampleContext) {
+      sampleContext.drawImage(canvas, 0, 0, sample.width, sample.height);
+      inkRatio = estimateInkRatio(sampleContext.getImageData(0, 0, sample.width, sample.height).data, sample.width, sample.height);
+    }
+    sample.width = 1;
+    sample.height = 1;
+  }
+  if (inspectBlank && isProbablyBlankPage(inkRatio || 0)) {
+    canvas.width = 1;
+    canvas.height = 1;
+    return { bytes: new Uint8Array(), mimeType, inkRatio };
+  }
   const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('无法编码识别页面')), mimeType, format === 'jpeg' ? 0.92 : undefined));
   canvas.width = 1;
   canvas.height = 1;
-  return { bytes: new Uint8Array(await blob.arrayBuffer()), mimeType };
+  return { bytes: new Uint8Array(await blob.arrayBuffer()), mimeType, inkRatio };
 }
 
 type PdfPageCanvasProps = {
@@ -291,8 +340,10 @@ export default function Home() {
   const embeddingProviderRef = useRef<EmbeddingProvider | null>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
-  const indexAbortRef = useRef(false);
-  const indexProgressRef = useRef(0);
+  const indexTasksRef = useRef<IndexTask[]>([]);
+  const indexTaskRunnerRef = useRef(false);
+  const processIndexQueueRef = useRef<() => Promise<void>>(async () => undefined);
+  const indexTaskControlRef = useRef(new Map<string, 'pause' | 'cancel'>());
   const pageIndicatorTimerRef = useRef<number | null>(null);
   const readerScrollTimerRef = useRef<number | null>(null);
   const deepReadCacheRef = useRef(new Map<string, string>());
@@ -319,15 +370,20 @@ export default function Home() {
   const [scanWarning, setScanWarning] = useState('');
   const [deepReadStatus, setDeepReadStatus] = useState('');
   const [appVersion, setAppVersion] = useState('');
+  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [chatModelList, setChatModelList] = useState<string[]>([]);
   const [chatModelListLoading, setChatModelListLoading] = useState(false);
   const [chatModelListError, setChatModelListError] = useState('');
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
+  const [indexTasks, setIndexTasks] = useState<IndexTask[]>(readIndexTasks);
   const [showPageIndicator, setShowPageIndicator] = useState(false);
   const [chatHistory, setChatHistory] = useState<ChatHistoryRecord[]>(readChatHistory);
   const [regionSelectMode, setRegionSelectMode] = useState(false);
   const [selectedRegion, setSelectedRegion] = useState<SelectedRegion | null>(null);
   const [regionActionBusy, setRegionActionBusy] = useState<RegionAction | null>(null);
+
+  useEffect(() => { indexTasksRef.current = indexTasks; }, [indexTasks]);
 
   const glmConfig = useCallback((): GlmOcrConfig => ({
     provider: settings.glmOcrProvider,
@@ -341,12 +397,6 @@ export default function Home() {
     setShowPageIndicator(true);
     if (pageIndicatorTimerRef.current !== null) window.clearTimeout(pageIndicatorTimerRef.current);
     pageIndicatorTimerRef.current = window.setTimeout(() => setShowPageIndicator(false), 900);
-  }, []);
-
-  const advanceIndexProgress = useCallback((next: number) => {
-    const bounded = Math.min(100, Math.max(indexProgressRef.current, Math.round(next)));
-    indexProgressRef.current = bounded;
-    setIndexProgress(bounded);
   }, []);
 
   const saveChatHistory = useCallback((bookId: string, bookName: string, nextMessages: Message[]) => {
@@ -393,10 +443,50 @@ export default function Home() {
     const bridge = window.marginDesktop;
     if (!bridge?.modelStatus) return;
     window.queueMicrotask(() => void bridge.modelStatus?.().then(setModelStatus));
-    window.queueMicrotask(() => void bridge.appInfo?.().then((info) => setAppVersion(info.version)));
+    window.queueMicrotask(() => void bridge.appInfo?.().then((info) => { setAppVersion(info.version); setAppInfo(info); }));
     return bridge.onModelProgress?.((progress) => {
       setModelStatus((current) => current ? { ...current, ...progress } : current);
     });
+  }, []);
+
+  const mutateIndexTasks = useCallback((updater: (current: IndexTask[]) => IndexTask[]) => {
+    const next = updater(indexTasksRef.current);
+    indexTasksRef.current = next;
+    localStorage.setItem(INDEX_TASKS_KEY, JSON.stringify(next));
+    setIndexTasks(next);
+    return next;
+  }, []);
+
+  const patchIndexTask = useCallback((taskId: string, changes: Partial<IndexTask>) => mutateIndexTasks((current) => current.map((task) => task.id === taskId ? { ...task, ...changes, updatedAt: new Date().toISOString() } : task)), [mutateIndexTasks]);
+
+  useEffect(() => {
+    const bridge = window.marginDesktop;
+    if (!bridge?.modelStatus || !bridge.glmOcrStatus) return;
+    let cancelled = false;
+    const managedConfig: GlmOcrConfig = { provider: 'managed', endpoint: '', model: 'ggml-org/GLM-OCR-GGUF', apiKey: '', autoStart: true };
+    window.queueMicrotask(() => void Promise.all([bridge.modelStatus!(), bridge.glmOcrStatus!(managedConfig)]).then(([embedding, glm]) => {
+      if (cancelled) return;
+      setModelStatus(embedding);
+      let raw: Partial<ModelSettings> = {};
+      try { raw = JSON.parse(localStorage.getItem('margin-ai-settings') ?? '{}'); } catch { /* Use safe defaults. */ }
+      const discovered: Partial<ModelSettings> = {};
+      if (embedding.installed && !Object.prototype.hasOwnProperty.call(raw, 'embeddingKind')) discovered.embeddingKind = 'local-qwen3-embedding-4b';
+      if (glm.modelInstalled && !Object.prototype.hasOwnProperty.call(raw, 'glmOcrMode')) {
+        discovered.glmOcrMode = 'auto';
+        discovered.glmOcrProvider = 'managed';
+        discovered.glmOcrEndpoint = '';
+        discovered.glmOcrModel = 'ggml-org/GLM-OCR-GGUF';
+        discovered.glmOcrAutoStart = true;
+      }
+      const next = { ...DEFAULT_SETTINGS, ...raw, ...discovered };
+      localStorage.setItem('margin-ai-settings', JSON.stringify(next));
+      localStorage.setItem('margin-settings-schema', '3');
+      if (Object.keys(discovered).length > 0) {
+        setSettings(next);
+        window.marginDesktop?.logEvent?.('models-auto-associated', { embeddingInstalled: embedding.installed, glmInstalled: glm.modelInstalled, dataRoot: embedding.root });
+      }
+    }).catch((reason) => window.marginDesktop?.logEvent?.('models-auto-association-failed', { message: reason instanceof Error ? reason.message : String(reason) }, 'error')));
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -565,6 +655,15 @@ export default function Home() {
           }
         } catch { /* A changed or incomplete provider simply requires rebuilding the index. */ }
       }
+      if (book) {
+        const task = indexTasksRef.current.find((candidate) => candidate.bookId === book.id);
+        if (task && ['queued', 'running', 'pausing', 'paused', 'failed'].includes(task.status)) {
+          setIndexProgress(task.progress);
+          setIndexMessage(task.message);
+          setHasIndexCheckpoint(task.status === 'paused');
+          setIndexStatus(task.status === 'running' || task.status === 'pausing' || task.status === 'queued' ? 'indexing' : task.status === 'failed' ? 'error' : 'idle');
+        }
+      }
       window.setTimeout(() => scrollToPage(initialPage, 'auto'), 0);
     } catch (reason) {
       console.error('Failed to open PDF', reason);
@@ -616,10 +715,17 @@ export default function Home() {
   }
 
   async function removeLibraryBook(book: LibraryEntry) {
+    if (indexTasksRef.current.some((task) => task.bookId === book.id && ['queued', 'running', 'pausing'].includes(task.status))) {
+      setError('这本书正在索引队列中，请先在“任务”里取消后再移除。');
+      setLibraryOpen(false);
+      setTaskCenterOpen(true);
+      return;
+    }
     if (!window.marginDesktop?.libraryRemove || !window.confirm(`从本地书架移除《${book.name}》？PDF 副本与已保存索引会从 Margin 数据目录删除。`)) return;
     try {
       await window.marginDesktop.libraryRemove(book.id);
       setLibrary((current) => current.filter((entry) => entry.id !== book.id));
+      mutateIndexTasks((current) => current.filter((task) => task.bookId !== book.id));
       setChatHistory((current) => {
         const next = current.filter((entry) => entry.bookId !== book.id);
         localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(next));
@@ -650,7 +756,7 @@ export default function Home() {
       || previous.glmOcrEndpoint !== settings.glmOcrEndpoint
       || previous.glmOcrModel !== settings.glmOcrModel;
     localStorage.setItem('margin-ai-settings', JSON.stringify(settings));
-    localStorage.setItem('margin-settings-schema', '2');
+    localStorage.setItem('margin-settings-schema', '3');
     if (vectorConfigChanged) {
       vectorIndexRef.current.clear(); embeddingProviderRef.current = null;
       setIndexStatus('idle'); setIndexProgress(0); setIndexMessage('向量模型配置已变化，请重新建立索引');
@@ -729,215 +835,345 @@ export default function Home() {
     deepReadCacheRef.current.clear();
   }
 
-  async function buildIndex() {
-    if (!pdf || indexStatus === 'indexing') return;
-    indexAbortRef.current = false;
-    const startingProgress = hasIndexCheckpoint ? indexProgressRef.current : 0;
-    indexProgressRef.current = startingProgress;
-    setError(''); setIndexStatus('indexing'); setIndexProgress(startingProgress); setIndexMessage('正在提取 PDF 文本');
-    let phase = 'starting';
+  async function runIndexTask(task: IndexTask) {
+    const targetBookId = task.bookId;
+    const targetName = task.bookName;
+    let targetPdf: PDFDocumentProxy | null = null;
+    let ownsDocument = false;
     let persistentBuildStarted = false;
-    const indexStartedAt = new Date().getTime();
+    let runtimeBackend = modelStatus?.backend || appInfo?.runtimeBackend;
+    let taskProgress = task.progress;
+    let currentStage: Exclude<IndexTaskStage, 'queued' | 'complete'> = 'preparing';
+    let stageStartedAt = Date.now();
+    const timings = { ...task.timings };
+    const startedAt = Date.now();
     let extractionElapsedMs = 0;
     let ocrElapsedMs = 0;
     let embeddingElapsedMs = 0;
     let persistenceElapsedMs = 0;
-    let runtimeBackend = modelStatus?.backend;
-    const concurrency = getIndexConcurrency();
-    window.marginDesktop?.logEvent?.('index-started', {
-      bookId: activeBookId,
-      fileName,
-      pageCount: pdf.numPages,
-      embeddingKind: settings.embeddingKind,
-    });
+    const failedPages: number[] = [];
+    let skippedPages = 0;
+    let ocrPages = 0;
+    const allChunks: RagChunk[] = [];
+    let completedChunks = 0;
+
+    const isActiveBook = () => activeBookIdRef.current === targetBookId;
+    const report = (changes: Partial<IndexTask>) => {
+      if (typeof changes.progress === 'number') {
+        taskProgress = Math.max(taskProgress, Math.min(100, Math.round(changes.progress)));
+        changes.progress = taskProgress;
+      }
+      patchIndexTask(task.id, changes);
+      if (isActiveBook()) {
+        if (typeof changes.progress === 'number') setIndexProgress(changes.progress);
+        if (changes.message !== undefined) setIndexMessage(changes.message);
+        if (changes.status === 'running' || changes.status === 'pausing') setIndexStatus('indexing');
+        else if (changes.status === 'completed') setIndexStatus('ready');
+        else if (changes.status === 'failed') setIndexStatus('error');
+        else if (changes.status === 'paused' || changes.status === 'cancelled') setIndexStatus('idle');
+      }
+    };
+    const enterStage = (stage: typeof currentStage, message: string, progress: number) => {
+      const now = Date.now();
+      timings[currentStage] = (timings[currentStage] || 0) + now - stageStartedAt;
+      currentStage = stage;
+      stageStartedAt = now;
+      report({ stage, message, progress, timings: { ...timings } });
+    };
+    const assertContinue = () => {
+      const action = indexTaskControlRef.current.get(task.id);
+      if (action) throw new DOMException(action === 'cancel' ? '索引已取消' : '索引已暂停', 'AbortError');
+    };
+
+    const preliminaryLanes = getIndexConcurrency(appInfo, runtimeBackend);
+    report({ status: 'running', stage: 'preparing', message: '正在后台打开 PDF 并检查模型', progress: Math.max(1, taskProgress), lanes: preliminaryLanes, backend: runtimeBackend });
+    window.marginDesktop?.logEvent?.('index-task-started', { bookId: targetBookId, fileName: targetName, embeddingKind: settings.embeddingKind, background: !isActiveBook() });
+
     try {
+      if (isActiveBook() && pdf) targetPdf = pdf;
+      else {
+        const pdfJs = await import('pdfjs-dist');
+        pdfJs.GlobalWorkerOptions.workerSrc = new URL(pdfWorkerUrl, window.location.href).toString();
+        targetPdf = await pdfJs.getDocument({ url: `margin://app/library/${targetBookId}/document.pdf` }).promise;
+        ownsDocument = true;
+      }
+      assertContinue();
+      const pageCountForTask = targetPdf.numPages;
+      report({ pageCount: pageCountForTask });
+      const book = library.find((entry) => entry.id === targetBookId);
+      if (book && book.pageCount !== pageCountForTask) {
+        const updated = await window.marginDesktop?.libraryUpdate?.(targetBookId, { pageCount: pageCountForTask });
+        if (updated) setLibrary((current) => current.map((entry) => entry.id === updated.id ? updated : entry));
+      }
+
       if (settings.embeddingKind === 'local-qwen3-embedding-4b' && window.marginDesktop?.modelPrepare) {
-        phase = 'model-prepare';
-        setIndexMessage('正在检查本地模型与运行时');
         const unsubscribe = window.marginDesktop.onModelProgress?.((progress) => {
-          if (progress.state === 'downloading') setIndexMessage(`正在下载本地向量模型：${progress.progress}%`);
-          else if (progress.state === 'installing') setIndexMessage('正在安装 llama.cpp 运行时');
-          else if (progress.state === 'checking') setIndexMessage('正在校验本地文件');
+          const message = progress.state === 'downloading' ? `正在下载本地向量模型：${progress.progress}%` : progress.state === 'installing' ? '正在安装 llama.cpp 运行时' : '正在校验本地模型文件';
+          report({ message });
         });
         try {
           const prepared = await window.marginDesktop.modelPrepare();
           runtimeBackend = prepared.backend;
           setModelStatus(prepared);
-        } finally {
-          unsubscribe?.();
-        }
+        } finally { unsubscribe?.(); }
       }
-      phase = 'text-extraction';
+      assertContinue();
+      const concurrency = getIndexConcurrency(appInfo, runtimeBackend);
+      report({ backend: runtimeBackend, lanes: concurrency });
+
+      enterStage('extracting', '正在并发提取 PDF 文本', 2);
       const provider = createConfiguredProvider();
-      embeddingProviderRef.current = provider;
-      vectorIndexRef.current.clear();
-      const allChunks: RagChunk[] = [];
-      const buildKey = `ocr:${settings.ocrMode}:${settings.ocrLanguage}|chunks:1200:180`;
+      if (isActiveBook()) { embeddingProviderRef.current = provider; vectorIndexRef.current.clear(); }
+      const buildKey = `ocr:${settings.ocrMode}:${settings.ocrLanguage}|classifier:2|chunks:1200:180`;
       let cachedPages = new Map<number, { pageNumber: number; text: string; source: 'pdf' | 'ocr' }>();
       let completedChunkIds = new Set<string>();
       let resumedChunks = 0;
-      if (activeBookId && window.marginDesktop?.libraryIndexStart && window.marginDesktop.libraryIndexAppend && window.marginDesktop.libraryIndexFinish) {
-        const checkpoint = await window.marginDesktop.libraryIndexStart(activeBookId, provider.id, 0, buildKey);
+      if (window.marginDesktop?.libraryIndexStart && window.marginDesktop.libraryIndexAppend && window.marginDesktop.libraryIndexFinish) {
+        const checkpoint = await window.marginDesktop.libraryIndexStart(targetBookId, provider.id, 0, buildKey);
         persistentBuildStarted = true;
         cachedPages = new Map(checkpoint.pages.map((entry) => [entry.page, { pageNumber: entry.page, text: entry.text, source: entry.source }]));
         completedChunkIds = new Set(checkpoint.completedChunkIds);
         resumedChunks = checkpoint.chunks;
-        if (checkpoint.resumed && (checkpoint.pages.length > 0 || checkpoint.chunks > 0)) setIndexMessage(`已恢复检查点：${checkpoint.pages.length} 页文本 · ${checkpoint.chunks} 个向量`);
-        setHasIndexCheckpoint(checkpoint.resumed && (checkpoint.pages.length > 0 || checkpoint.chunks > 0));
+        if (checkpoint.resumed && (checkpoint.pages.length > 0 || checkpoint.chunks > 0)) report({ message: `已恢复检查点：${checkpoint.pages.length} 页文本 · ${checkpoint.chunks} 个向量` });
+        if (isActiveBook()) setHasIndexCheckpoint(checkpoint.resumed && (checkpoint.pages.length > 0 || checkpoint.chunks > 0));
       }
-      let emptyPages = 0;
-      let ocrPages = [...cachedPages.values()].filter((entry) => entry.source === 'ocr').length;
-      let ocrFailures = 0;
-      const extractionStartedAt = new Date().getTime();
+
+      const extractionStartedAt = Date.now();
       let extractedPages = cachedPages.size;
-      advanceIndexProgress((extractedPages / pdf.numPages) * 10);
-      const extracted = await mapWithConcurrency(pdf.numPages, concurrency.text, async (pageNumber) => {
-        if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
+      const extracted = await mapWithConcurrency(targetPdf.numPages, concurrency.text, async (pageNumber) => {
+        assertContinue();
         const cached = cachedPages.get(pageNumber);
         if (cached) return cached;
-        const pdfPage = await pdf.getPage(pageNumber);
+        const pdfPage = await targetPdf!.getPage(pageNumber);
         const content = await pdfPage.getTextContent();
         const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim();
         extractedPages += 1;
-        advanceIndexProgress(Math.round((extractedPages / pdf.numPages) * 10));
-        setIndexMessage(`正在并发提取文本：${extractedPages} / ${pdf.numPages} 页`);
-        if (text && activeBookId) await window.marginDesktop?.libraryIndexSavePages?.(activeBookId, [{ page: pageNumber, text, source: 'pdf' }]);
+        const message = `${concurrency.text} 路文本提取：${extractedPages} / ${targetPdf!.numPages} 页`;
+        report({ completedPages: extractedPages, progress: 2 + (extractedPages / targetPdf!.numPages) * 13, message });
+        if (text) await window.marginDesktop?.libraryIndexSavePages?.(targetBookId, [{ page: pageNumber, text, source: 'pdf' }]);
         return { pageNumber, text, source: 'pdf' as const };
       });
-      const ocrCandidates = extracted.filter((entry) => !entry.text);
+      extractionElapsedMs = Date.now() - extractionStartedAt;
+
+      const ocrCandidates = extracted.filter((entry) => shouldInspectWithOcr(entry.text));
       if (ocrCandidates.length > 0 && settings.ocrMode === 'auto' && window.marginDesktop?.ocrRecognize) {
-        phase = 'ocr';
-        const ocrStartedAt = new Date().getTime();
+        enterStage('ocr', `正在分析 ${ocrCandidates.length} 个疑似扫描页`, 15);
+        const ocrStartedAt = Date.now();
         let ocrCompleted = 0;
         const updateOcrMessage = (detail = '') => {
-          const elapsedSeconds = Math.max((new Date().getTime() - ocrStartedAt) / 1000, 0.001);
+          const elapsedSeconds = Math.max((Date.now() - ocrStartedAt) / 1000, 0.001);
           const pagesPerMinute = (ocrCompleted / elapsedSeconds) * 60;
-          const remaining = ocrCompleted > 0 ? formatRemaining(((ocrCandidates.length - ocrCompleted) / pagesPerMinute) * 60) : '';
-          setIndexMessage(`${concurrency.ocr} 路 OCR：${ocrCompleted} / ${ocrCandidates.length} 页${pagesPerMinute > 0 ? ` · ${pagesPerMinute.toFixed(1)} 页/分钟` : ''}${remaining ? ` · ${remaining}` : ''}${detail}`);
+          const remaining = ocrCompleted > 0 ? formatRemaining(((ocrCandidates.length - ocrCompleted) / Math.max(pagesPerMinute, 0.01)) * 60) : '';
+          report({
+            progress: 15 + (ocrCompleted / ocrCandidates.length) * 30,
+            message: `${concurrency.ocr} 路 OCR：${ocrCompleted} / ${ocrCandidates.length} 页${pagesPerMinute > 0 ? ` · ${pagesPerMinute.toFixed(1)} 页/分钟` : ''}${remaining ? ` · ${remaining}` : ''}${detail}`,
+            ocrPages,
+            skippedPages,
+            failedPages: [...failedPages],
+          });
         };
-        updateOcrMessage(' · 正在准备页面图像');
-        const unsubscribe = window.marginDesktop.onOcrProgress?.(() => updateOcrMessage(` · ${concurrency.ocr} 个页面并行处理中`));
+        updateOcrMessage(' · 正在判断页面密度');
+        const unsubscribe = window.marginDesktop.onOcrProgress?.(() => updateOcrMessage(' · 页面并行识别中'));
         try {
           await mapWithConcurrency(ocrCandidates.length, concurrency.ocr, async (candidateNumber) => {
-            if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
+            assertContinue();
             const candidate = ocrCandidates[candidateNumber - 1];
             const pageNumber = candidate.pageNumber;
+            let lastFailure: unknown;
             try {
-              const pdfPage = await pdf.getPage(pageNumber);
-              const image = await renderPageImage(pdfPage);
-              const result = await window.marginDesktop!.ocrRecognize!(image.bytes, settings.ocrLanguage, pageNumber);
-              candidate.text = result.text;
-              if (result.text) {
-                ocrPages += 1;
-                candidate.source = 'ocr';
-                pageTextsRef.current.set(pageNumber, result.text);
-                if (pageNumber === page) setPageText(result.text);
-                if (activeBookId) await window.marginDesktop?.libraryIndexSavePages?.(activeBookId, [{ page: pageNumber, text: result.text, source: 'ocr' }]);
-              } else ocrFailures += 1;
-            } catch (reason) {
-              ocrFailures += 1;
-              window.marginDesktop?.logEvent?.('ocr-page-failed', { bookId: activeBookId, page: pageNumber, message: reason instanceof Error ? reason.message : String(reason) }, 'error');
-            }
+              const pdfPage = await targetPdf!.getPage(pageNumber);
+              const image = await renderPageImage(pdfPage, 'png', true);
+              if (image.bytes.length === 0) {
+                skippedPages += 1;
+                window.marginDesktop?.logEvent?.('ocr-page-skipped-blank', { bookId: targetBookId, page: pageNumber, inkRatio: image.inkRatio });
+              } else {
+                for (let attempt = 1; attempt <= 2; attempt += 1) {
+                  assertContinue();
+                  try {
+                    const result = await window.marginDesktop!.ocrRecognize!(image.bytes, settings.ocrLanguage, pageNumber);
+                    if (!result.text && !candidate.text) throw new Error('OCR 未识别出文本');
+                    if (result.text && (result.text.length > candidate.text.length || !candidate.text)) {
+                      candidate.text = result.text;
+                      candidate.source = 'ocr';
+                      ocrPages += 1;
+                      if (isActiveBook()) {
+                        pageTextsRef.current.set(pageNumber, result.text);
+                        if (pageNumber === page) setPageText(result.text);
+                      }
+                      await window.marginDesktop?.libraryIndexSavePages?.(targetBookId, [{ page: pageNumber, text: result.text, source: 'ocr' }]);
+                    }
+                    lastFailure = undefined;
+                    break;
+                  } catch (reason) {
+                    lastFailure = reason;
+                    window.marginDesktop?.logEvent?.(attempt === 1 ? 'ocr-page-retrying' : 'ocr-page-failed', { bookId: targetBookId, page: pageNumber, attempt, message: reason instanceof Error ? reason.message : String(reason) }, attempt === 1 ? 'info' : 'error');
+                  }
+                }
+              }
+            } catch (reason) { lastFailure = reason; }
+            if (lastFailure && !candidate.text) failedPages.push(pageNumber);
             ocrCompleted += 1;
-            advanceIndexProgress(10 + Math.round((ocrCompleted / ocrCandidates.length) * 25));
             updateOcrMessage();
             return candidate;
           });
-        } finally {
-          unsubscribe?.();
-        }
-        ocrElapsedMs = new Date().getTime() - ocrStartedAt;
+        } finally { unsubscribe?.(); }
+        ocrElapsedMs = Date.now() - ocrStartedAt;
       }
+
+      enterStage('chunking', '正在整理文本片段', 45);
+      let emptyPages = 0;
       for (const extractedPage of extracted) {
-        if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
-        const { pageNumber, text } = extractedPage;
-        if (!text) emptyPages += 1;
-        allChunks.push(...chunkPage(text, pageNumber));
-        advanceIndexProgress(35);
-        setIndexMessage(`正在整理文本：第 ${pageNumber} / ${pdf.numPages} 页${ocrPages ? ` · OCR ${ocrPages} 页` : ''}`);
+        assertContinue();
+        if (!extractedPage.text) emptyPages += 1;
+        allChunks.push(...chunkPage(extractedPage.text, extractedPage.pageNumber));
       }
-      extractionElapsedMs = new Date().getTime() - extractionStartedAt;
       if (allChunks.length === 0) throw new Error(settings.ocrMode === 'off' ? '这个 PDF 没有可提取文本；请在模型设置中启用 OCR。' : 'OCR 完成，但没有识别出可索引文本。请尝试切换 OCR 语言或使用更清晰的扫描件。');
-      window.marginDesktop?.logEvent?.('index-text-extracted', { bookId: activeBookId, chunks: allChunks.length, emptyPages, ocrPages, ocrFailures, elapsedMs: Math.round(extractionElapsedMs), ocrElapsedMs: Math.round(ocrElapsedMs), textConcurrency: concurrency.text, ocrConcurrency: concurrency.ocr });
-      phase = 'embedding';
-      // Vulkan has enough parallelism for eight llama.cpp slots. CPU stays at four
-      // to avoid oversubscription; remote providers use their existing larger batch.
-      const batchSize = settings.embeddingKind === 'local-qwen3-embedding-4b' ? (runtimeBackend === 'vulkan' ? 8 : 4) : 16;
-      const embeddingStartedAt = new Date().getTime();
+      report({ chunks: allChunks.length, message: `已整理 ${allChunks.length} 个文本片段` });
+      window.marginDesktop?.logEvent?.('index-text-extracted', { bookId: targetBookId, chunks: allChunks.length, emptyPages, ocrPages, ocrFailures: failedPages.length, skippedBlankPages: skippedPages, elapsedMs: extractionElapsedMs, ocrElapsedMs, textConcurrency: concurrency.text, ocrConcurrency: concurrency.ocr });
+
+      enterStage('embedding', '正在生成向量', 46);
+      const batchSize = settings.embeddingKind === 'local-qwen3-embedding-4b' ? concurrency.embedding : 16;
+      const embeddingStartedAt = Date.now();
       const pendingEntries: Array<RagChunk & { vector: Float32Array }> = [];
       const chunksToEmbed = allChunks.filter((chunk) => !completedChunkIds.has(chunk.id));
       const alreadyCompleted = allChunks.length - chunksToEmbed.length;
-      if (alreadyCompleted > 0) {
-        advanceIndexProgress(35 + (alreadyCompleted / allChunks.length) * 64);
-        setIndexMessage(`从检查点继续：已完成 ${alreadyCompleted} / ${allChunks.length} 个向量`);
-      }
+      completedChunks = alreadyCompleted;
+      if (alreadyCompleted > 0) report({ progress: 46 + (alreadyCompleted / allChunks.length) * 52, completedChunks, message: `从检查点继续：已完成 ${alreadyCompleted} / ${allChunks.length} 个向量` });
       for (let start = 0; start < chunksToEmbed.length; start += batchSize) {
-        if (indexAbortRef.current) throw new DOMException('索引已由用户停止', 'AbortError');
+        assertContinue();
         const chunks = chunksToEmbed.slice(start, start + batchSize);
-        const vectors = await provider.embed(chunks.map((chunk) => chunk.text), 'document');
-        if (vectors.length !== chunks.length || !vectors[0]?.length) throw new Error('向量模型返回了无效批次');
-        if (activeBookId && persistentBuildStarted && window.marginDesktop?.libraryIndexAppend) {
-          pendingEntries.push(...chunks.map((chunk, index) => ({ ...chunk, vector: Float32Array.from(vectors[index]) })));
-          if (pendingEntries.length >= 64 || start + batchSize >= chunksToEmbed.length) {
-            await window.marginDesktop.libraryIndexAppend(activeBookId, pendingEntries.splice(0, pendingEntries.length));
+        let vectors: number[][] | undefined;
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+          try { vectors = await provider.embed(chunks.map((chunk) => chunk.text), 'document'); break; }
+          catch (reason) {
+            if (attempt === 2) throw reason;
+            report({ message: '向量服务切换后正在自动恢复当前批次…' });
           }
-        } else {
-          vectorIndexRef.current.addVectors(chunks, vectors);
         }
+        if (!vectors || vectors.length !== chunks.length || !vectors[0]?.length) throw new Error('向量模型返回了无效批次');
+        if (persistentBuildStarted && window.marginDesktop?.libraryIndexAppend) {
+          pendingEntries.push(...chunks.map((chunk, index) => ({ ...chunk, vector: Float32Array.from(vectors![index]) })));
+          if (pendingEntries.length >= 64 || start + batchSize >= chunksToEmbed.length) await window.marginDesktop.libraryIndexAppend(targetBookId, pendingEntries.splice(0, pendingEntries.length));
+        } else if (isActiveBook()) vectorIndexRef.current.addVectors(chunks, vectors);
         const completedNow = Math.min(start + batchSize, chunksToEmbed.length);
-        const completed = alreadyCompleted + completedNow;
-        const elapsedSeconds = Math.max((new Date().getTime() - embeddingStartedAt) / 1000, 0.001);
+        completedChunks = alreadyCompleted + completedNow;
+        const elapsedSeconds = Math.max((Date.now() - embeddingStartedAt) / 1000, 0.001);
         const chunksPerSecond = completedNow / elapsedSeconds;
-        const remaining = formatRemaining((chunksToEmbed.length - completedNow) / chunksPerSecond);
-        advanceIndexProgress(35 + Math.round((completed / Math.max(allChunks.length, 1)) * 64));
-        setIndexMessage(`正在生成向量：${completed} / ${allChunks.length} · ${chunksPerSecond.toFixed(1)} 片段/秒${remaining ? ` · ${remaining}` : ''}`);
+        const remaining = formatRemaining((chunksToEmbed.length - completedNow) / Math.max(chunksPerSecond, 0.01));
+        report({ progress: 46 + (completedChunks / allChunks.length) * 52, completedChunks, message: `${runtimeBackend === 'vulkan' ? 'Vulkan' : 'CPU'} ${batchSize} 路向量：${completedChunks} / ${allChunks.length} · ${chunksPerSecond.toFixed(1)} 片段/秒${remaining ? ` · ${remaining}` : ''}` });
       }
-      embeddingElapsedMs = new Date().getTime() - embeddingStartedAt;
-      setScanWarning(emptyPages > 0 ? `${ocrPages > 0 ? `OCR 已识别 ${ocrPages} 页；` : ''}仍有 ${emptyPages} 页没有可提取文本。${ocrFailures ? ` ${ocrFailures} 页识别失败。` : ''}` : ocrPages > 0 ? `OCR 已识别并索引 ${ocrPages} 个扫描页。` : '');
+      embeddingElapsedMs = Date.now() - embeddingStartedAt;
+
+      enterStage('writing', '正在完成 SQLite 索引', 99);
       let persistedInfo;
-      if (persistentBuildStarted && activeBookId && window.marginDesktop?.libraryIndexFinish) {
-        phase = 'persistence';
-        setIndexMessage('正在完成 SQLite 索引');
-        const persistenceStartedAt = new Date().getTime();
-        persistedInfo = await window.marginDesktop.libraryIndexFinish(activeBookId);
-        persistenceElapsedMs = new Date().getTime() - persistenceStartedAt;
+      if (persistentBuildStarted && window.marginDesktop?.libraryIndexFinish) {
+        const persistenceStartedAt = Date.now();
+        persistedInfo = await window.marginDesktop.libraryIndexFinish(targetBookId);
+        persistenceElapsedMs = Date.now() - persistenceStartedAt;
         persistentBuildStarted = false;
         await refreshLibrary();
       }
+      timings[currentStage] = (timings[currentStage] || 0) + Date.now() - stageStartedAt;
       const storageLabel = persistedInfo ? ` · SQLite ${(persistedInfo.bytes / 1024 / 1024).toFixed(1)} MB` : '';
-      advanceIndexProgress(100); setHasIndexCheckpoint(false); setIndexStatus('ready'); setIndexMessage(`索引完成：${allChunks.length} 个片段${storageLabel}${ocrPages ? ` · OCR ${ocrPages} 页` : ''}`);
-      window.marginDesktop?.logEvent?.('index-succeeded', {
-        bookId: activeBookId,
-        providerId: provider.id,
-        chunks: allChunks.length,
-        resumedChunks,
-        persisted: Boolean(activeBookId),
-        batchSize,
-        runtimeBackend,
-        extractionElapsedMs: Math.round(extractionElapsedMs),
-        ocrElapsedMs: Math.round(ocrElapsedMs),
-        embeddingElapsedMs: Math.round(embeddingElapsedMs),
-        persistenceElapsedMs: Math.round(persistenceElapsedMs),
-        totalElapsedMs: Math.round(new Date().getTime() - indexStartedAt),
-      });
+      const completionMessage = `索引完成：${allChunks.length} 个片段${storageLabel}${ocrPages ? ` · OCR ${ocrPages} 页` : ''}${skippedPages ? ` · 跳过空白 ${skippedPages} 页` : ''}`;
+      report({ status: 'completed', stage: 'complete', progress: 100, message: completionMessage, chunks: allChunks.length, completedChunks: allChunks.length, ocrPages, skippedPages, failedPages, timings: { ...timings } });
+      if (isActiveBook()) {
+        setHasIndexCheckpoint(false);
+        setScanWarning(emptyPages > 0 ? `${ocrPages > 0 ? `OCR 已识别 ${ocrPages} 页；` : ''}仍有 ${emptyPages} 页没有可提取文本。${failedPages.length ? ` ${failedPages.length} 页重试后仍失败。` : ''}` : ocrPages > 0 ? `OCR 已识别并索引 ${ocrPages} 个扫描页。` : '');
+      }
+      window.marginDesktop?.logEvent?.('index-task-succeeded', { bookId: targetBookId, providerId: provider.id, chunks: allChunks.length, resumedChunks, batchSize, runtimeBackend, extractionElapsedMs, ocrElapsedMs, embeddingElapsedMs, persistenceElapsedMs, totalElapsedMs: Date.now() - startedAt, skippedBlankPages: skippedPages, failedPages });
       if (settings.embeddingKind === 'local-qwen3-embedding-4b') setModelStatus(await window.marginDesktop?.modelStatus?.() ?? modelStatus);
     } catch (reason) {
-      if (persistentBuildStarted && activeBookId) await window.marginDesktop?.libraryIndexCancel?.(activeBookId).catch(() => undefined);
-      const message = reason instanceof Error ? reason.message.slice(0, 180) : '未知错误';
-      window.marginDesktop?.logEvent?.('index-failed', { bookId: activeBookId, phase, message }, 'error');
-      if (reason instanceof DOMException && reason.name === 'AbortError') {
-        setHasIndexCheckpoint(true); setIndexStatus('idle'); setIndexMessage(`索引已暂停在 ${indexProgressRef.current}%，可从已有进度继续`);
-      } else {
-        setIndexStatus('error'); setIndexMessage(message);
-        setError(`建立索引失败：${message}`);
+      const control = indexTaskControlRef.current.get(task.id);
+      if (persistentBuildStarted) {
+        if (control === 'cancel') await window.marginDesktop?.libraryIndexDiscard?.(targetBookId).catch(() => undefined);
+        else await window.marginDesktop?.libraryIndexCancel?.(targetBookId).catch(() => undefined);
       }
+      timings[currentStage] = (timings[currentStage] || 0) + Date.now() - stageStartedAt;
+      const message = reason instanceof Error ? reason.message.slice(0, 180) : '未知错误';
+      window.marginDesktop?.logEvent?.('index-task-failed', { bookId: targetBookId, stage: currentStage, control, message }, control ? 'info' : 'error');
+      if (reason instanceof DOMException && reason.name === 'AbortError') {
+        const cancelled = control === 'cancel';
+        report({ status: cancelled ? 'cancelled' : 'paused', message: cancelled ? '索引已取消，未完成检查点已清除' : `索引已暂停在 ${taskProgress}%，可从 SQLite 检查点继续`, timings: { ...timings }, failedPages, skippedPages, ocrPages });
+        if (isActiveBook()) setHasIndexCheckpoint(!cancelled);
+      } else {
+        report({ status: 'failed', message, timings: { ...timings }, failedPages, skippedPages, ocrPages });
+        if (isActiveBook()) setError(`建立索引失败：${message}`);
+      }
+    } finally {
+      indexTaskControlRef.current.delete(task.id);
+      if (ownsDocument && targetPdf) await targetPdf.destroy().catch(() => undefined);
     }
   }
 
-  function stopIndexing() {
-    indexAbortRef.current = true;
-    setIndexMessage('正在安全暂停，当前步骤完成后退出…');
+  async function processIndexQueue() {
+    if (indexTaskRunnerRef.current) return;
+    indexTaskRunnerRef.current = true;
+    try {
+      while (true) {
+        const next = indexTasksRef.current.find((task) => task.status === 'queued');
+        if (!next) break;
+        await runIndexTask(next);
+      }
+    } finally { indexTaskRunnerRef.current = false; }
   }
+
+  function enqueueIndexBooks(books: LibraryEntry[], revealTaskCenter = true) {
+    const eligible = books.filter((book) => !indexTasksRef.current.some((task) => task.bookId === book.id && ['queued', 'running', 'pausing'].includes(task.status)));
+    if (eligible.length === 0) return;
+    mutateIndexTasks((current) => queueBooks(current, eligible));
+    if (revealTaskCenter) { setLibraryOpen(false); setTaskCenterOpen(true); }
+    window.queueMicrotask(() => void processIndexQueue());
+  }
+
+  function buildIndex() {
+    const book = library.find((entry) => entry.id === activeBookIdRef.current);
+    if (!book) { setError('请先把 PDF 导入本地书架，再建立可恢复的后台索引。'); return; }
+    enqueueIndexBooks([book], false);
+  }
+
+  function pauseIndexTask(task: IndexTask) {
+    if (task.status !== 'running' && task.status !== 'pausing') return;
+    indexTaskControlRef.current.set(task.id, 'pause');
+    if (task.stage === 'preparing' && settings.embeddingKind === 'local-qwen3-embedding-4b') void window.marginDesktop?.modelPause?.();
+    patchIndexTask(task.id, { status: 'pausing', message: '正在安全暂停，当前批次完成后写入检查点…' });
+    if (task.bookId === activeBookIdRef.current) setIndexMessage('正在安全暂停，当前批次完成后写入检查点…');
+  }
+
+  async function cancelIndexTask(task: IndexTask) {
+    if (task.status === 'running' || task.status === 'pausing') {
+      indexTaskControlRef.current.set(task.id, 'cancel');
+      if (task.stage === 'preparing' && settings.embeddingKind === 'local-qwen3-embedding-4b') void window.marginDesktop?.modelPause?.();
+      patchIndexTask(task.id, { status: 'pausing', message: '正在取消并清除未完成检查点…' });
+      return;
+    }
+    patchIndexTask(task.id, { status: 'cancelled', stage: 'queued', progress: 0, message: '索引已取消，未完成检查点已清除', completedPages: 0, completedChunks: 0, chunks: 0, timings: {} });
+    await window.marginDesktop?.libraryIndexDiscard?.(task.bookId);
+  }
+
+  function resumeIndexTask(task: IndexTask) {
+    const book = library.find((entry) => entry.id === task.bookId);
+    if (book) enqueueIndexBooks([book]);
+  }
+
+  function stopIndexing() {
+    const task = indexTasksRef.current.find((candidate) => candidate.bookId === activeBookIdRef.current && ['queued', 'running', 'pausing'].includes(candidate.status));
+    if (!task) return;
+    if (task.status === 'queued') {
+      patchIndexTask(task.id, { status: 'paused', message: '任务已在队列中暂停，可随时继续' });
+      setIndexStatus('idle');
+      setIndexMessage('任务已在队列中暂停，可随时继续');
+      return;
+    }
+    pauseIndexTask(task);
+  }
+
+  useEffect(() => { processIndexQueueRef.current = processIndexQueue; });
+
+  useEffect(() => {
+    if (!indexTasks.some((task) => task.status === 'queued')) return;
+    window.queueMicrotask(() => void processIndexQueueRef.current());
+  }, [indexTasks]);
 
   async function createDeepReadContext(matches: RagMatch[], prompt: string) {
     if (!pdf || settings.glmOcrMode === 'off') return '';
@@ -1126,6 +1362,8 @@ export default function Home() {
   const historyQuestions = chatHistory
     .flatMap((record) => record.messages.map((message, index) => ({ record, message, index })).filter(({ message }) => message.role === 'user'))
     .sort((a, b) => (b.message.createdAt ?? b.record.updatedAt).localeCompare(a.message.createdAt ?? a.record.updatedAt));
+  const pendingIndexTaskCount = indexTasks.filter((task) => ['queued', 'running', 'pausing', 'paused', 'failed'].includes(task.status)).length;
+  const activeBookTask = indexTasks.find((task) => task.bookId === activeBookId && ['queued', 'running', 'pausing', 'paused', 'failed'].includes(task.status));
 
   return (
     <main className="app-shell">
@@ -1136,17 +1374,42 @@ export default function Home() {
             <DialogTrigger render={<button className="sidebar-module-button" aria-label="本地书架" title="本地书架" />}><Library /><span>书架</span>{library.length > 0 && <strong>{library.length}</strong>}</DialogTrigger>
             <DialogContent className="library-dialog">
               <DialogHeader><DialogTitle>本地书架</DialogTitle><DialogDescription>集中管理保存在本机的 PDF、阅读进度与全文向量索引。</DialogDescription></DialogHeader>
-              <div className="library-dialog-actions"><Button onClick={() => fileInputRef.current?.click()}><Plus />导入 PDF</Button><span>{library.length} 本书 · 数据仅保存在本机</span></div>
+              <div className="library-dialog-actions"><div><Button onClick={() => fileInputRef.current?.click()}><Plus />导入 PDF</Button>{library.some((book) => !book.indexProviderId) && <Button variant="outline" onClick={() => enqueueIndexBooks(library.filter((book) => !book.indexProviderId))}><ListTodo />索引未处理书籍</Button>}</div><span>{library.length} 本书 · 数据仅保存在本机</span></div>
               <div className="book-list">
                 {library.length === 0 ? <div className="bookshelf-empty"><BookOpen /><p>还没有书籍。导入的 PDF 会保存在本机，并记住阅读进度与向量索引。</p></div> : library.map((book) =>
                   <div className="book-row" key={book.id}><button className={book.id === activeBookId ? 'book-item active' : 'book-item'} onClick={() => void openLibraryBook(book)}>
                     <span className="book-icon"><FileText /></span><span className="book-copy"><strong>{book.name}</strong><small>{book.pageCount ? `${book.lastPage} / ${book.pageCount} 页` : '等待首次打开'}</small></span>
                     {book.indexProviderId && <span className="book-index" title="已保存向量索引"><HardDrive /></span>}
-                  </button><button className="book-remove" onClick={() => void removeLibraryBook(book)} aria-label={`从书架移除 ${book.name}`}><Trash2 /></button></div>)}
+                  </button><button className="book-action" onClick={() => enqueueIndexBooks([book])} aria-label={`后台索引 ${book.name}`} title="加入后台索引队列"><ListTodo /></button><button className="book-remove" onClick={() => void removeLibraryBook(book)} aria-label={`从书架移除 ${book.name}`}><Trash2 /></button></div>)}
               </div>
             </DialogContent>
           </Dialog>
-          <div className="sidebar-future-slots" aria-hidden="true"><span /><span /></div>
+          <Dialog open={taskCenterOpen} onOpenChange={setTaskCenterOpen}>
+            <DialogTrigger render={<button className="sidebar-module-button" aria-label="索引任务" title="索引任务" />}><ListTodo /><span>任务</span>{pendingIndexTaskCount > 0 && <strong>{pendingIndexTaskCount}</strong>}</DialogTrigger>
+            <DialogContent className="task-center-dialog">
+              <DialogHeader><DialogTitle>后台索引任务</DialogTitle><DialogDescription>书籍按队列逐本处理；关闭弹窗或切换阅读书籍都不会打断当前任务。</DialogDescription></DialogHeader>
+              <div className="task-center-summary">
+                <span><Gauge />{appInfo?.runtimeBackend === 'vulkan' ? 'Vulkan GPU' : 'CPU'} · {appInfo?.cpuThreads || (typeof navigator === 'undefined' ? 1 : navigator.hardwareConcurrency) || 1} 线程</span>
+                <span>{appInfo ? `${(appInfo.freeMemory / 1024 / 1024 / 1024).toFixed(1)} / ${(appInfo.totalMemory / 1024 / 1024 / 1024).toFixed(1)} GB 可用` : '正在读取设备信息'}</span>
+                <div><Button size="sm" variant="outline" onClick={() => enqueueIndexBooks(library.filter((book) => !book.indexProviderId))} disabled={!library.some((book) => !book.indexProviderId)}>索引未处理书籍</Button>{indexTasks.some((task) => ['completed', 'cancelled'].includes(task.status)) && <Button size="sm" variant="ghost" onClick={() => mutateIndexTasks((current) => current.filter((task) => !['completed', 'cancelled'].includes(task.status)))}>清理已结束</Button>}</div>
+              </div>
+              <div className="task-list">
+                {indexTasks.length === 0 ? <div className="task-empty"><ListTodo /><p>暂无索引任务。可从书架为单本书排队，或一次索引全部未处理书籍。</p></div> : [...indexTasks].reverse().map((task) => <article className={`index-task-card ${task.status}`} key={task.id}>
+                  <div className="index-task-heading"><span className="task-state-icon">{task.status === 'completed' ? <CheckCircle2 /> : task.status === 'running' || task.status === 'pausing' ? <Gauge /> : <Clock3 />}</span><div><strong title={task.bookName}>{task.bookName}</strong><small>{indexTaskStatusLabel(task)} · {task.progress}%</small></div><div className="task-actions">
+                    {task.status === 'running' && <Button size="icon-sm" variant="outline" onClick={() => pauseIndexTask(task)} aria-label="暂停任务" title="暂停"><Pause /></Button>}
+                    {['paused', 'failed', 'cancelled'].includes(task.status) && <Button size="icon-sm" variant="outline" onClick={() => resumeIndexTask(task)} aria-label="继续任务" title={task.failedPages.length ? '重试失败页并继续' : '继续'}>{task.status === 'failed' ? <RotateCcw /> : <Play />}</Button>}
+                    {['queued', 'running', 'pausing', 'paused', 'failed'].includes(task.status) && <Button size="icon-sm" variant="ghost" onClick={() => void cancelIndexTask(task)} aria-label="取消任务" title="取消并清除检查点"><Square /></Button>}
+                  </div></div>
+                  <div className="task-progress"><i style={{ width: `${task.progress}%` }} /></div>
+                  <p>{task.message}</p>
+                  <div className="task-metrics"><span>{task.completedPages} / {task.pageCount || '?'} 页</span><span>{task.completedChunks} / {task.chunks || '?'} 片段</span>{task.ocrPages > 0 && <span>OCR {task.ocrPages} 页</span>}{task.skippedPages > 0 && <span>跳过空白 {task.skippedPages} 页</span>}{task.failedPages.length > 0 && <span className="failed">失败页 {task.failedPages.join('、')}</span>}</div>
+                  {Object.keys(task.timings).length > 0 && <div className="task-timings">{Object.entries(task.timings).map(([stage, elapsed]) => <span key={stage}>{INDEX_STAGE_LABELS[stage as IndexTaskStage]} {formatElapsed(elapsed || 0)}</span>)}</div>}
+                  {task.lanes && <small className="task-runtime">{task.backend === 'vulkan' ? 'Vulkan' : 'CPU'} · 文本 {task.lanes.text} 路 / OCR {task.lanes.ocr} 路 / 向量 {task.lanes.embedding} 路</small>}
+                </article>)}
+              </div>
+            </DialogContent>
+          </Dialog>
+          <div className="sidebar-future-slots" aria-hidden="true"><span /></div>
         </nav>
         <div className="sidebar-bottom">
           <Dialog>
@@ -1267,8 +1530,8 @@ export default function Home() {
             <span className={pdf ? 'sync-badge active' : 'sync-badge'}>{pdf ? '已定位' : '未连接'}</span>
           </div></div>
           {pdf && <div className={`index-strip ${indexStatus}`}>
-            <div><strong>{indexStatus === 'ready' ? '全文索引已就绪' : indexStatus === 'indexing' ? `正在建立索引 ${indexProgress}%` : indexStatus === 'error' ? '索引建立失败' : '尚未建立全文索引'}</strong><span title={indexMessage}>{indexMessage || (settings.embeddingKind === 'local-qwen3-embedding-4b' ? '本地 Qwen3-Embedding-4B · Q4_K_M' : settings.embeddingModel)}</span>{indexStatus === 'indexing' && <span className="index-progress"><i style={{ width: `${indexProgress}%` }} /></span>}</div>
-            <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" onClick={() => indexStatus === 'indexing' ? stopIndexing() : void buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? '暂停' : indexStatus === 'error' ? '重试' : hasIndexCheckpoint ? '继续索引' : '建立索引'}</Button>
+            <div><strong>{indexStatus === 'ready' ? '全文索引已就绪' : indexStatus === 'indexing' ? `后台索引 ${indexProgress}%` : indexStatus === 'error' ? '索引建立失败' : activeBookTask?.status === 'paused' ? '索引已暂停' : '尚未建立全文索引'}</strong><span title={indexMessage}>{indexMessage || (settings.embeddingKind === 'local-qwen3-embedding-4b' ? '本地 Qwen3-Embedding-4B · Q4_K_M' : settings.embeddingModel)}</span>{indexStatus === 'indexing' && <span className="index-progress"><i style={{ width: `${indexProgress}%` }} /></span>}</div>
+            <Button variant={indexStatus === 'ready' ? 'ghost' : 'outline'} size="sm" onClick={() => indexStatus === 'indexing' ? stopIndexing() : buildIndex()}>{indexStatus === 'ready' ? '重新索引' : indexStatus === 'indexing' ? '暂停' : indexStatus === 'error' ? '重试' : hasIndexCheckpoint || activeBookTask?.status === 'paused' ? '继续索引' : '建立索引'}</Button>
           </div>}
           {scanWarning && <p className="scan-warning">{scanWarning}</p>}
           {pdf && (settings.glmOcrMode === 'auto' || deepReadStatus) && <p className={deepReadStatus.includes('失败') ? 'deep-read-status error' : 'deep-read-status'}><Sparkles />{deepReadStatus || 'GLM-OCR 已待命 · 复杂页面将自动精读'}</p>}
