@@ -20,6 +20,7 @@ const child = spawn(
     stdio: 'ignore',
     env: {
       ...process.env,
+      MARGIN_DATA_ROOT: path.join(captureRoot, 'data'),
       MARGIN_LIBRARY_ROOT: path.join(captureRoot, 'library'),
     },
   },
@@ -142,6 +143,19 @@ try {
       throw new Error('Demo PDF has not opened');
     return state.entries[0];
   });
+  const demoLibrary = await evaluate(
+    `(async () => {
+    const bytes = Uint8Array.from(atob('${pdfBase64}'), character => character.charCodeAt(0));
+    const calculus = await window.marginDesktop.libraryImport('微积分公式手册.pdf', bytes.buffer);
+    const geometry = await window.marginDesktop.libraryImport('解析几何讲义.pdf', bytes.buffer);
+    const core = await window.marginDesktop.knowledgeCreate({ name: '高等数学核心', description: '代数、微积分与公式推导的跨书问答' });
+    await window.marginDesktop.knowledgeUpdate(core.id, { bookIds: [${JSON.stringify(book.id)}, calculus.id] });
+    const review = await window.marginDesktop.knowledgeCreate({ name: '期末复习资料', description: '只检索本次复习范围' });
+    await window.marginDesktop.knowledgeUpdate(review.id, { bookIds: [calculus.id, geometry.id] });
+    return { calculus: calculus.id, geometry: geometry.id, core: core.id, review: review.id };
+  })()`,
+    true,
+  );
   await evaluate(
     `(async () => {
     const now = new Date().toISOString();
@@ -175,7 +189,9 @@ try {
     return ready;
   });
   await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
-  await evaluate(`document.querySelector('.book-item')?.click()`);
+  await evaluate(
+    `[...document.querySelectorAll('.book-item')].find((item) => item.textContent?.includes('Margin-Reader-Demo'))?.click()`,
+  );
   await retry(async () => {
     const state = await evaluate(
       `({ page: document.querySelector('.page-scroll-indicator')?.textContent || '', messages: document.querySelectorAll('.message').length })`,
@@ -185,6 +201,33 @@ try {
     return state;
   });
   await capture('reader-overview.jpg');
+
+  await evaluate(
+    `document.querySelector('[aria-label="跨书知识包"]')?.click()`,
+  );
+  await retry(async () => {
+    const state = await evaluate(
+      `({ dialog: Boolean(document.querySelector('.knowledge-dialog')), nodes: document.querySelectorAll('.knowledge-pack-node').length, members: document.querySelectorAll('.knowledge-tree-books button').length })`,
+    );
+    if (!state.dialog || state.nodes !== 2 || state.members !== 4)
+      throw new Error(
+        `Knowledge pack demo has not opened: ${JSON.stringify(state)}`,
+      );
+    return state;
+  });
+  await delay(800);
+  await capture('knowledge-packs.jpg');
+  await evaluate(
+    `document.querySelector('[role="dialog"][data-open] [data-slot="dialog-close"]')?.click()`,
+  );
+  await retry(async () => {
+    const open = await evaluate(
+      `Boolean(document.querySelector('[role="dialog"][data-open]'))`,
+    );
+    if (open) throw new Error('Knowledge pack dialog is still closing');
+    return true;
+  });
+  await delay(600);
 
   const canvas = await retry(async () => {
     const bounds = await evaluate(
@@ -303,7 +346,9 @@ try {
   );
   await delay(200);
   await capture('model-settings.jpg');
-  console.log(`Captured README screenshots in ${outputDirectory}`);
+  console.log(
+    `Captured README screenshots in ${outputDirectory}; knowledge demo ${JSON.stringify(demoLibrary)}`,
+  );
 } finally {
   await Promise.race([
     command('Browser.close').catch(() => undefined),

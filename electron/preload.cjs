@@ -41,6 +41,13 @@ contextBridge.exposeInMainWorld('marginDesktop', {
     return () => ipcRenderer.removeListener('glm:progress', handler);
   },
   libraryList: () => ipcRenderer.invoke('library:list'),
+  knowledgeList: () => ipcRenderer.invoke('knowledge:list'),
+  knowledgeCreate: (input) => ipcRenderer.invoke('knowledge:create', input),
+  knowledgeUpdate: (id, changes) =>
+    ipcRenderer.invoke('knowledge:update', id, changes),
+  knowledgeRemove: (id) => ipcRenderer.invoke('knowledge:remove', id),
+  knowledgeSearch: (id, providerId, vector, limit) =>
+    ipcRenderer.invoke('knowledge:search', id, providerId, vector, limit),
   libraryImport: (name, data) =>
     ipcRenderer.invoke('library:import', { name, data }),
   libraryImportFile: async (file) => {

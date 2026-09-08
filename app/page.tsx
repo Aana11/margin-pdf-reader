@@ -14,10 +14,13 @@ import {
   BookOpen,
   Bot,
   CheckCircle2,
+  ChevronDown,
   Clock3,
   Code2,
   Download,
   FileText,
+  Folder,
+  FolderPlus,
   Gauge,
   HardDrive,
   Highlighter,
@@ -104,6 +107,9 @@ import type {
   GlmOcrConfig,
   GlmOcrProvider,
   GlmOcrStatus,
+  KnowledgeMatch,
+  KnowledgePack,
+  KnowledgeSource,
   LibraryEntry,
   ModelInstallStatus,
   WorkspaceHistoryItem,
@@ -118,6 +124,7 @@ type Message = {
   page: number;
   createdAt?: string;
   citation?: RegionCitation;
+  sources?: KnowledgeSource[];
 };
 type ChatHistoryRecord = {
   bookId: string;
@@ -779,6 +786,7 @@ export default function Home() {
   const readerScrollTimerRef = useRef<number | null>(null);
   const deepReadCacheRef = useRef(new Map<string, string>());
   const activeBookIdRef = useRef<string | null>(null);
+  const selectedKnowledgePackIdRef = useRef<string | null>(null);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [fileName, setFileName] = useState('');
   const [page, setPage] = useState(1);
@@ -811,6 +819,18 @@ export default function Home() {
   const [chatModelListLoading, setChatModelListLoading] = useState(false);
   const [chatModelListError, setChatModelListError] = useState('');
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [knowledgeOpen, setKnowledgeOpen] = useState(false);
+  const [knowledgePacks, setKnowledgePacks] = useState<KnowledgePack[]>([]);
+  const [selectedKnowledgePackId, setSelectedKnowledgePackId] = useState<
+    string | null
+  >(null);
+  const [activeKnowledgePackId, setActiveKnowledgePackId] = useState<
+    string | null
+  >(null);
+  const [newKnowledgePackName, setNewKnowledgePackName] = useState('');
+  const [knowledgePackName, setKnowledgePackName] = useState('');
+  const [knowledgePackDescription, setKnowledgePackDescription] = useState('');
+  const [knowledgeSearchStatus, setKnowledgeSearchStatus] = useState('');
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [workspaceQuery, setWorkspaceQuery] = useState('');
@@ -869,10 +889,7 @@ export default function Home() {
   const saveChatHistory = useCallback(
     (bookId: string, bookName: string, nextMessages: Message[]) => {
       if (!bookId || nextMessages.length === 0) return;
-      if (
-        window.marginDesktop?.workspaceChatReplace &&
-        activeBookIdRef.current
-      ) {
+      if (window.marginDesktop?.workspaceChatReplace) {
         void window.marginDesktop
           .workspaceChatReplace(bookId, bookName, nextMessages.slice(-100))
           .catch((reason) =>
@@ -955,9 +972,28 @@ export default function Home() {
     }
   }, []);
 
+  const refreshKnowledgePacks = useCallback(async () => {
+    if (!window.marginDesktop?.knowledgeList) return;
+    const packs = await window.marginDesktop.knowledgeList();
+    setKnowledgePacks(packs);
+    const selected =
+      packs.find((pack) => pack.id === selectedKnowledgePackIdRef.current) ||
+      packs[0];
+    selectedKnowledgePackIdRef.current = selected?.id || null;
+    setSelectedKnowledgePackId(selected?.id || null);
+    setKnowledgePackName(selected?.name || '');
+    setKnowledgePackDescription(selected?.description || '');
+    setActiveKnowledgePackId((current) =>
+      current && packs.some((pack) => pack.id === current) ? current : null,
+    );
+  }, []);
+
   useEffect(() => {
-    window.queueMicrotask(() => void refreshLibrary());
-  }, [refreshLibrary]);
+    window.queueMicrotask(() => {
+      void refreshLibrary();
+      void refreshKnowledgePacks();
+    });
+  }, [refreshKnowledgePacks, refreshLibrary]);
 
   useEffect(() => {
     if (
@@ -1562,6 +1598,15 @@ export default function Home() {
   }
 
   async function openHistoryRecord(message: WorkspaceHistoryItem) {
+    if (message.bookId.startsWith('pack_')) {
+      const pack = knowledgePacks.find(
+        (candidate) => `pack_${candidate.id}` === message.bookId,
+      );
+      if (pack) await activateKnowledgePack(pack);
+      else setError('这个提问所属的知识包已被删除。');
+      setHistoryOpen(false);
+      return;
+    }
     const book = library.find((entry) => entry.id === message.bookId);
     if (book && book.id !== activeBookId) {
       await openLibraryBook(book);
@@ -1591,6 +1636,136 @@ export default function Home() {
         scrollToPage(note.page);
       },
       book && book.id !== activeBookId ? 80 : 0,
+    );
+  }
+
+  async function createKnowledgePackFromInput() {
+    const name = newKnowledgePackName.trim();
+    if (!name || !window.marginDesktop?.knowledgeCreate) return;
+    try {
+      const created = await window.marginDesktop.knowledgeCreate({ name });
+      setKnowledgePacks((current) => [created, ...current]);
+      selectedKnowledgePackIdRef.current = created.id;
+      setSelectedKnowledgePackId(created.id);
+      setKnowledgePackName(created.name);
+      setKnowledgePackDescription(created.description);
+      setNewKnowledgePackName('');
+      setWorkspaceNotice(`知识包“${created.name}”已创建`);
+    } catch (reason) {
+      setError(
+        `创建知识包失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    }
+  }
+
+  function selectKnowledgePack(pack: KnowledgePack) {
+    selectedKnowledgePackIdRef.current = pack.id;
+    setSelectedKnowledgePackId(pack.id);
+    setKnowledgePackName(pack.name);
+    setKnowledgePackDescription(pack.description);
+  }
+
+  async function saveKnowledgePackDetails() {
+    if (!selectedKnowledgePackId || !window.marginDesktop?.knowledgeUpdate)
+      return;
+    try {
+      const updated = await window.marginDesktop.knowledgeUpdate(
+        selectedKnowledgePackId,
+        {
+          name: knowledgePackName,
+          description: knowledgePackDescription,
+        },
+      );
+      setKnowledgePacks((current) =>
+        current.map((pack) => (pack.id === updated.id ? updated : pack)),
+      );
+      setWorkspaceNotice(`知识包“${updated.name}”已保存`);
+    } catch (reason) {
+      setError(
+        `保存知识包失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    }
+  }
+
+  async function toggleKnowledgePackBook(pack: KnowledgePack, bookId: string) {
+    if (!window.marginDesktop?.knowledgeUpdate) return;
+    const bookIds = pack.bookIds.includes(bookId)
+      ? pack.bookIds.filter((id) => id !== bookId)
+      : [...pack.bookIds, bookId];
+    try {
+      const updated = await window.marginDesktop.knowledgeUpdate(pack.id, {
+        bookIds,
+      });
+      setKnowledgePacks((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      );
+    } catch (reason) {
+      setError(
+        `更新知识包成员失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    }
+  }
+
+  async function removeKnowledgePack(pack: KnowledgePack) {
+    if (
+      !window.marginDesktop?.knowledgeRemove ||
+      !window.confirm(
+        `删除知识包“${pack.name}”？只会删除组合关系，不会删除其中的 PDF、索引或阅读资料。`,
+      )
+    )
+      return;
+    try {
+      await window.marginDesktop.knowledgeRemove(pack.id);
+      const remaining = knowledgePacks.filter((item) => item.id !== pack.id);
+      setKnowledgePacks(remaining);
+      selectedKnowledgePackIdRef.current = remaining[0]?.id || null;
+      setSelectedKnowledgePackId(remaining[0]?.id || null);
+      setKnowledgePackName(remaining[0]?.name || '');
+      setKnowledgePackDescription(remaining[0]?.description || '');
+      if (activeKnowledgePackId === pack.id) {
+        setActiveKnowledgePackId(null);
+        setKnowledgeSearchStatus('');
+      }
+    } catch (reason) {
+      setError(
+        `删除知识包失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    }
+  }
+
+  async function activateKnowledgePack(pack: KnowledgePack | null) {
+    setActiveKnowledgePackId(pack?.id || null);
+    setKnowledgeSearchStatus('');
+    if (pack) {
+      const restored = await window.marginDesktop?.workspaceChatLoad?.(
+        `pack_${pack.id}`,
+        100,
+      );
+      setMessages(restored || []);
+      setKnowledgeOpen(false);
+      return;
+    }
+    if (activeBookId) {
+      const restored = await window.marginDesktop?.workspaceChatLoad?.(
+        activeBookId,
+        100,
+      );
+      setMessages(restored || []);
+    } else setMessages([]);
+  }
+
+  async function openKnowledgeSource(source: KnowledgeSource) {
+    const book = library.find((entry) => entry.id === source.bookId);
+    if (!book) {
+      setError('来源书籍已不在本地书架中。');
+      return;
+    }
+    const packMessages = activeKnowledgePackId ? messages : null;
+    if (book.id !== activeBookId) await openLibraryBook(book);
+    if (packMessages) setMessages(packMessages);
+    window.setTimeout(
+      () => scrollToPage(source.page),
+      book.id !== activeBookId ? 80 : 0,
     );
   }
 
@@ -1768,6 +1943,7 @@ export default function Home() {
     try {
       await window.marginDesktop.libraryRemove(book.id);
       setLibrary((current) => current.filter((entry) => entry.id !== book.id));
+      void refreshKnowledgePacks();
       mutateIndexTasks((current) =>
         current.filter((task) => task.bookId !== book.id),
       );
@@ -2777,13 +2953,16 @@ export default function Home() {
   ) {
     event?.preventDefault();
     const prompt = (preset ?? question).trim();
-    if (!prompt || !pdf || asking) return false;
+    const knowledgePack = knowledgePacks.find(
+      (pack) => pack.id === activeKnowledgePackId,
+    );
+    if (!prompt || (!pdf && !knowledgePack) || asking) return false;
     if (!settings.apiKey.trim()) {
       setError('请先在模型设置中填入 API Key。');
       return false;
     }
     const askedAt = new Date().toISOString();
-    const targetPage = regionContext?.citation.page ?? page;
+    const targetPage = regionContext?.citation.page ?? (pdf ? page : 1);
     const citation = regionContext?.citation;
     const userMessage: Message = {
       role: 'user',
@@ -2809,8 +2988,35 @@ export default function Home() {
     // thinking indicator and the scroll area keeps the composer visible.
     setMessages((current) => [...current, userMessage, assistantMessage]);
     try {
-      let matches: RagMatch[] = [];
-      if (
+      let matches: Array<RagMatch | KnowledgeMatch> = [];
+      if (!regionContext && knowledgePack) {
+        if (knowledgePack.bookIds.length === 0)
+          throw new Error('当前知识包还没有加入书籍');
+        const provider = createConfiguredProvider();
+        if (
+          settings.embeddingKind === 'local-qwen3-embedding-4b' &&
+          window.marginDesktop?.modelPrepare
+        )
+          setModelStatus(await window.marginDesktop.modelPrepare());
+        setKnowledgeSearchStatus(
+          `正在检索“${knowledgePack.name}”中的 ${knowledgePack.bookIds.length} 本书…`,
+        );
+        const [queryVector] = await provider.embed([prompt], 'query');
+        const result = await window.marginDesktop?.knowledgeSearch?.(
+          knowledgePack.id,
+          provider.id,
+          Float32Array.from(queryVector),
+          8,
+        );
+        if (!result) throw new Error('当前环境不支持跨书知识包检索');
+        matches = result.matches;
+        const skipped = result.skippedBooks.length;
+        setKnowledgeSearchStatus(
+          `已检索 ${result.searchedBooks} / ${result.memberBooks} 本书 · ${result.matches.length} 条来源 · ${result.elapsedMs} ms${skipped ? ` · 跳过 ${skipped} 本未索引或模型不匹配书籍` : ''}`,
+        );
+        if (result.searchedBooks === 0)
+          throw new Error('知识包内没有使用当前向量模型完成索引的书籍');
+      } else if (
         !regionContext &&
         indexStatus === 'ready' &&
         embeddingProviderRef.current
@@ -2834,7 +3040,7 @@ export default function Home() {
           );
       }
       let deepReadContext = '';
-      if (!regionContext && settings.glmOcrMode === 'auto') {
+      if (!regionContext && !knowledgePack && settings.glmOcrMode === 'auto') {
         try {
           deepReadContext = await createDeepReadContext(matches, prompt);
         } catch (reason) {
@@ -2852,7 +3058,7 @@ export default function Home() {
         ? matches
             .map(
               (match) =>
-                `[第 ${match.page} 页，相似度 ${match.score.toFixed(2)}]\n${match.text}`,
+                `${'bookName' in match ? `[《${match.bookName}》· 第 ${match.page} 页，相似度 ${match.score.toFixed(2)}]` : `[第 ${match.page} 页，相似度 ${match.score.toFixed(2)}]`}\n${match.text}`,
             )
             .join('\n\n')
         : regionContext
@@ -2860,7 +3066,9 @@ export default function Home() {
           : '（尚未建立全文向量索引）';
       const requestContent = regionContext
         ? `我框选了第 ${targetPage} 页的一处区域。\n\nGLM-OCR 对该区域的识别结果：\n${regionContext.recognized.slice(0, 16000)}\n\n任务：${prompt}\n\n回答必须以识别结果为依据，不要补造看不清的内容。行内公式使用 $...$，独立公式使用 $$...$$；代码使用带语言标记的代码块；表格使用 Markdown。`
-        : `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。行内公式使用 $...$，独立公式使用 $$...$$，以便阅读器渲染。\n\n我的问题：${prompt}`;
+        : knowledgePack
+          ? `你正在回答跨书知识包“${knowledgePack.name}”中的问题。只依据下列由用户明确加入知识包的书籍片段作答，不要引用书架中的其他书。每个关键结论都要在句末标注来源，格式为【《书名》· 第 N 页】；若证据不足，明确说明。\n\n跨书检索片段：\n${ragContext.slice(0, 24000)}\n\n行内公式使用 $...$，独立公式使用 $$...$$；代码使用带语言标记的代码块；表格使用 Markdown。\n\n我的问题：${prompt}`
+          : `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。行内公式使用 $...$，独立公式使用 $$...$$，以便阅读器渲染。\n\n我的问题：${prompt}`;
       const response = await fetch(
         `${settings.endpoint.replace(/\/$/, '')}/chat/completions`,
         {
@@ -2940,16 +3148,41 @@ export default function Home() {
       setMessages((current) => {
         const next = [...current];
         const last = next[next.length - 1];
-        if (last?.role === 'assistant' && !last.content)
-          next[next.length - 1] = { ...last, content: '（模型未返回文本）' };
+        if (last?.role === 'assistant')
+          next[next.length - 1] = {
+            ...last,
+            content: last.content || '（模型未返回文本）',
+            sources: knowledgePack
+              ? matches.slice(0, 8).map((match) => ({
+                  bookId: (match as KnowledgeMatch).bookId,
+                  bookName: (match as KnowledgeMatch).bookName,
+                  page: match.page,
+                  score: match.score,
+                  excerpt: match.text.slice(0, 320),
+                }))
+              : undefined,
+          };
         return next;
       });
       const savedAnswer = answerText || '（模型未返回文本）';
-      saveChatHistory(activeBookId ?? fileName, fileName, [
-        ...previousMessages,
-        userMessage,
-        { ...assistantMessage, content: savedAnswer },
-      ]);
+      const sources = knowledgePack
+        ? matches.slice(0, 8).map((match) => ({
+            bookId: (match as KnowledgeMatch).bookId,
+            bookName: (match as KnowledgeMatch).bookName,
+            page: match.page,
+            score: match.score,
+            excerpt: match.text.slice(0, 320),
+          }))
+        : undefined;
+      saveChatHistory(
+        knowledgePack ? `pack_${knowledgePack.id}` : (activeBookId ?? fileName),
+        knowledgePack ? `知识包：${knowledgePack.name}` : fileName,
+        [
+          ...previousMessages,
+          userMessage,
+          { ...assistantMessage, content: savedAnswer, sources },
+        ],
+      );
       return true;
     } catch (reason) {
       setError(
@@ -2978,6 +3211,13 @@ export default function Home() {
         task.status,
       ),
   );
+  const selectedKnowledgePack = knowledgePacks.find(
+    (pack) => pack.id === selectedKnowledgePackId,
+  );
+  const activeKnowledgePack = knowledgePacks.find(
+    (pack) => pack.id === activeKnowledgePackId,
+  );
+  const currentEmbeddingProviderId = createConfiguredProvider().id;
 
   return (
     <main className="app-shell">
@@ -3090,6 +3330,234 @@ export default function Home() {
                     </div>
                   ))
                 )}
+              </div>
+            </DialogContent>
+          </Dialog>
+          <Dialog open={knowledgeOpen} onOpenChange={setKnowledgeOpen}>
+            <DialogTrigger
+              render={
+                <button
+                  className="sidebar-module-button"
+                  aria-label="跨书知识包"
+                  title="跨书知识包"
+                />
+              }
+            >
+              <Folder />
+              <span>知识包</span>
+              {knowledgePacks.length > 0 && (
+                <strong>{knowledgePacks.length}</strong>
+              )}
+            </DialogTrigger>
+            <DialogContent className="knowledge-dialog">
+              <DialogHeader>
+                <DialogTitle>跨书知识包</DialogTitle>
+                <DialogDescription>
+                  像文件夹一样自由组合书籍。AI
+                  只检索当前选中的知识包，不会扫描整个书架。
+                </DialogDescription>
+              </DialogHeader>
+              <div className="knowledge-create">
+                <FolderPlus />
+                <Input
+                  value={newKnowledgePackName}
+                  onChange={(event) =>
+                    setNewKnowledgePackName(event.target.value)
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      void createKnowledgePackFromInput();
+                    }
+                  }}
+                  placeholder="新知识包名称，例如：高等代数专题"
+                  aria-label="新知识包名称"
+                />
+                <Button
+                  onClick={() => void createKnowledgePackFromInput()}
+                  disabled={!newKnowledgePackName.trim()}
+                >
+                  创建
+                </Button>
+              </div>
+              <div className="knowledge-layout">
+                <div className="knowledge-tree" aria-label="知识包包含关系">
+                  {knowledgePacks.length === 0 ? (
+                    <div className="knowledge-empty">
+                      <Folder />
+                      <p>创建第一个知识包，再从右侧书架勾选要一起检索的书。</p>
+                    </div>
+                  ) : (
+                    knowledgePacks.map((pack) => {
+                      const memberBooks = pack.bookIds
+                        .map((id) => library.find((book) => book.id === id))
+                        .filter(Boolean) as LibraryEntry[];
+                      const selected = pack.id === selectedKnowledgePackId;
+                      return (
+                        <div
+                          className={`knowledge-tree-node${selected ? ' selected' : ''}`}
+                          key={pack.id}
+                        >
+                          <button
+                            className="knowledge-pack-node"
+                            onClick={() => selectKnowledgePack(pack)}
+                          >
+                            <ChevronDown />
+                            <Folder />
+                            <span>
+                              <strong>{pack.name}</strong>
+                              <small>{memberBooks.length} 本书</small>
+                            </span>
+                            {pack.id === activeKnowledgePackId && <i>使用中</i>}
+                          </button>
+                          <div className="knowledge-tree-books">
+                            {memberBooks.length === 0 ? (
+                              <span>空文件包</span>
+                            ) : (
+                              memberBooks.map((book) => (
+                                <button
+                                  key={book.id}
+                                  onClick={() => {
+                                    setKnowledgeOpen(false);
+                                    void openLibraryBook(book);
+                                  }}
+                                  title={`打开《${book.name}》`}
+                                >
+                                  <FileText />
+                                  <span>{book.name}</span>
+                                  {book.indexProviderId ===
+                                  currentEmbeddingProviderId ? (
+                                    <CheckCircle2 />
+                                  ) : (
+                                    <Clock3 />
+                                  )}
+                                </button>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+                <div className="knowledge-editor">
+                  {selectedKnowledgePack ? (
+                    <>
+                      <div className="knowledge-editor-heading">
+                        <div>
+                          <Label htmlFor="knowledge-pack-name">
+                            知识包名称
+                          </Label>
+                          <Input
+                            id="knowledge-pack-name"
+                            value={knowledgePackName}
+                            onChange={(event) =>
+                              setKnowledgePackName(event.target.value)
+                            }
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="knowledge-pack-description">
+                            用途说明
+                          </Label>
+                          <Input
+                            id="knowledge-pack-description"
+                            value={knowledgePackDescription}
+                            onChange={(event) =>
+                              setKnowledgePackDescription(event.target.value)
+                            }
+                            placeholder="这个知识包要解决什么问题？"
+                          />
+                        </div>
+                        <Button
+                          variant="outline"
+                          onClick={() => void saveKnowledgePackDetails()}
+                        >
+                          保存
+                        </Button>
+                      </div>
+                      <div className="knowledge-members-heading">
+                        <div>
+                          <strong>从本地书架选择成员</strong>
+                          <span>
+                            已选 {selectedKnowledgePack.bookIds.length} /{' '}
+                            {library.length} 本
+                          </span>
+                        </div>
+                        <span>勾选变化会立即保存</span>
+                      </div>
+                      <div className="knowledge-members">
+                        {library.length === 0 ? (
+                          <p>书架还没有 PDF，请先从“书架”导入。</p>
+                        ) : (
+                          library.map((book) => {
+                            const checked =
+                              selectedKnowledgePack.bookIds.includes(book.id);
+                            const compatible =
+                              book.indexProviderId ===
+                              currentEmbeddingProviderId;
+                            return (
+                              <label
+                                className={`knowledge-member${checked ? ' checked' : ''}`}
+                                key={book.id}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() =>
+                                    void toggleKnowledgePackBook(
+                                      selectedKnowledgePack,
+                                      book.id,
+                                    )
+                                  }
+                                />
+                                <span className="book-icon">
+                                  <FileText />
+                                </span>
+                                <span>
+                                  <strong>{book.name}</strong>
+                                  <small>
+                                    {compatible
+                                      ? `索引可用 · ${book.pageCount || '?'} 页`
+                                      : book.indexProviderId
+                                        ? '索引模型不匹配，需重新索引'
+                                        : '尚未建立索引'}
+                                  </small>
+                                </span>
+                                {compatible ? <CheckCircle2 /> : <Clock3 />}
+                              </label>
+                            );
+                          })
+                        )}
+                      </div>
+                      <div className="knowledge-editor-actions">
+                        <Button
+                          variant="destructive"
+                          onClick={() =>
+                            void removeKnowledgePack(selectedKnowledgePack)
+                          }
+                        >
+                          <Trash2 />
+                          删除组合
+                        </Button>
+                        <Button
+                          onClick={() =>
+                            void activateKnowledgePack(selectedKnowledgePack)
+                          }
+                          disabled={selectedKnowledgePack.bookIds.length === 0}
+                        >
+                          <Sparkles />
+                          用此知识包提问
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="knowledge-editor-empty">
+                      <Folder />
+                      <p>在左侧选择或新建知识包。</p>
+                    </div>
+                  )}
+                </div>
               </div>
             </DialogContent>
           </Dialog>
@@ -4215,7 +4683,35 @@ export default function Home() {
               </span>
             </div>
           </div>
-          {pdf && (
+          <div className={activeKnowledgePack ? 'ai-scope pack' : 'ai-scope'}>
+            <span>
+              {activeKnowledgePack ? <Folder /> : <BookOpen />}
+              <span>
+                <small>当前问答范围</small>
+                <strong>
+                  {activeKnowledgePack
+                    ? `${activeKnowledgePack.name} · ${activeKnowledgePack.bookIds.length} 本书`
+                    : pdf
+                      ? `当前书籍 · ${fileName}`
+                      : '尚未选择书籍或知识包'}
+                </strong>
+              </span>
+            </span>
+            {activeKnowledgePack ? (
+              <button onClick={() => void activateKnowledgePack(null)}>
+                切回当前书籍
+              </button>
+            ) : (
+              <button onClick={() => setKnowledgeOpen(true)}>选择知识包</button>
+            )}
+          </div>
+          {activeKnowledgePack && knowledgeSearchStatus && (
+            <p className="knowledge-search-status">
+              <Search />
+              {knowledgeSearchStatus}
+            </p>
+          )}
+          {!activeKnowledgePack && pdf && (
             <div className={`index-strip ${indexStatus}`}>
               <div>
                 <strong>
@@ -4282,11 +4778,15 @@ export default function Home() {
             {messages.length === 0 ? (
               <div className="chat-welcome">
                 <MessageSquareText />
-                <h3>我会跟着你的页码</h3>
+                <h3>
+                  {activeKnowledgePack ? '跨书问答已就绪' : '我会跟着你的页码'}
+                </h3>
                 <p>
-                  {pdf
-                    ? '直接提问，我会优先根据当前页原文解释。'
-                    : '打开 PDF 后，这里会自动获取你当前阅读的页面。'}
+                  {activeKnowledgePack
+                    ? `只会检索“${activeKnowledgePack.name}”中由你选定的 ${activeKnowledgePack.bookIds.length} 本书。`
+                    : pdf
+                      ? '直接提问，我会优先根据当前页原文解释。'
+                      : '打开 PDF 后，这里会自动获取你当前阅读的页面。'}
                 </p>
               </div>
             ) : (
@@ -4321,6 +4821,30 @@ export default function Home() {
                         ) : (
                           <p>{message.content}</p>
                         )}
+                        {message.role === 'assistant' &&
+                          message.sources &&
+                          message.sources.length > 0 && (
+                            <div className="message-sources">
+                              <strong>检索来源</strong>
+                              <div>
+                                {message.sources.map((source, sourceIndex) => (
+                                  <button
+                                    key={`${source.bookId}-${source.page}-${sourceIndex}`}
+                                    onClick={() =>
+                                      void openKnowledgeSource(source)
+                                    }
+                                    title={source.excerpt}
+                                  >
+                                    <FileText />
+                                    <span>
+                                      《{source.bookName}》· 第 {source.page} 页
+                                    </span>
+                                    <small>{source.score.toFixed(2)}</small>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                         <div className="message-meta-actions">
                           {message.citation && (
                             <button
@@ -4331,15 +4855,17 @@ export default function Home() {
                               查看框选来源
                             </button>
                           )}
-                          {message.role === 'assistant' && message.content && (
-                            <button
-                              className="message-save-card"
-                              onClick={() => void saveSummaryCard(message)}
-                            >
-                              <BookMarked />
-                              存为摘要卡片
-                            </button>
-                          )}
+                          {message.role === 'assistant' &&
+                            message.content &&
+                            !message.sources?.length && (
+                              <button
+                                className="message-save-card"
+                                onClick={() => void saveSummaryCard(message)}
+                              >
+                                <BookMarked />
+                                存为摘要卡片
+                              </button>
+                            )}
                         </div>
                       </div>
                     </div>
@@ -4363,7 +4889,7 @@ export default function Home() {
                 <button
                   key={prompt}
                   onClick={() => void askAi(undefined, prompt)}
-                  disabled={!pdf || asking}
+                  disabled={(!pdf && !activeKnowledgePack) || asking}
                 >
                   {prompt}
                 </button>
@@ -4379,22 +4905,31 @@ export default function Home() {
                     void askAi();
                   }
                 }}
-                disabled={!pdf || asking}
-                placeholder={pdf ? `针对第 ${page} 页提问…` : '请先打开 PDF'}
+                disabled={(!pdf && !activeKnowledgePack) || asking}
+                placeholder={
+                  activeKnowledgePack
+                    ? `向“${activeKnowledgePack.name}”中的 ${activeKnowledgePack.bookIds.length} 本书提问…`
+                    : pdf
+                      ? `针对第 ${page} 页提问…`
+                      : '请先打开 PDF 或选择知识包'
+                }
                 aria-label="输入问题"
               />
               <Button
                 type="submit"
                 size="icon-lg"
-                disabled={!pdf || !question.trim() || asking}
+                disabled={
+                  (!pdf && !activeKnowledgePack) || !question.trim() || asking
+                }
                 aria-label="发送"
               >
                 <Send />
               </Button>
             </form>
             <p className="privacy-note">
-              普通提问仅发送文本；框选精读只把裁剪区域交给
-              GLM-OCR，不发送整页图片。
+              {activeKnowledgePack
+                ? '知识包只检索你勾选的书；来源可点击回到原书页。'
+                : '普通提问仅发送文本；框选精读只把裁剪区域交给 GLM-OCR，不发送整页图片。'}
             </p>
           </div>
         </aside>

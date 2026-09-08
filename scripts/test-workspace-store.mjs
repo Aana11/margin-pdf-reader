@@ -23,6 +23,42 @@ try {
   ]);
   assert.equal(workspaceStore.loadChat(root, bookId).length, 2);
   assert.equal(workspaceStore.searchHistory(root, '线性', 20, 0).total, 1);
+  const sourceChatId = 'pack_029';
+  workspaceStore.replaceChat(root, sourceChatId, '知识包：代数', [
+    {
+      role: 'assistant',
+      content: '跨书回答',
+      page: 1,
+      sources: [
+        {
+          bookId,
+          bookName: '高等代数.pdf',
+          page: 12,
+          score: 0.91,
+          excerpt: '线性空间',
+        },
+      ],
+    },
+  ]);
+  assert.deepEqual(workspaceStore.loadChat(root, sourceChatId)[0].sources, [
+    {
+      bookId,
+      bookName: '高等代数.pdf',
+      page: 12,
+      score: 0.91,
+      excerpt: '线性空间',
+    },
+  ]);
+
+  const pack = workspaceStore.createKnowledgePack(root, {
+    name: '代数核心',
+    description: '只组合指定教材',
+  });
+  const updatedPack = workspaceStore.updateKnowledgePack(root, pack.id, {
+    bookIds: [bookId, 'book_030'],
+  });
+  assert.deepEqual(updatedPack.bookIds, [bookId, 'book_030']);
+  assert.equal(workspaceStore.listKnowledgePacks(root).length, 1);
 
   const highlight = workspaceStore.saveNote(root, bookId, '高等代数.pdf', {
     kind: 'highlight',
@@ -55,6 +91,10 @@ try {
   workspaceStore.removeBookData(root, bookId);
   assert.equal(workspaceStore.loadChat(root, bookId).length, 0);
   assert.equal(workspaceStore.listNotes(root, { bookId }).total, 0);
+  assert.deepEqual(workspaceStore.getKnowledgePack(root, pack.id).bookIds, [
+    'book_030',
+  ]);
+  assert.equal(workspaceStore.removeKnowledgePack(root, pack.id).removed, true);
   console.log(
     'Workspace SQLite persistence, search, pagination, export, and cleanup passed.',
   );

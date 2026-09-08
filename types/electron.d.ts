@@ -9,6 +9,36 @@ export type LibraryEntry = {
   updatedAt: string;
   indexProviderId: string | null;
 };
+export type KnowledgePack = {
+  id: string;
+  name: string;
+  description: string;
+  bookIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+export type KnowledgeMatch = {
+  id: string;
+  chunkId: string;
+  bookId: string;
+  bookName: string;
+  page: number;
+  text: string;
+  score: number;
+};
+export type KnowledgeSearchResult = {
+  packId: string;
+  memberBooks: number;
+  searchedBooks: number;
+  elapsedMs: number;
+  matches: KnowledgeMatch[];
+  skippedBooks: Array<{
+    bookId: string;
+    bookName: string;
+    reason: 'not-indexed' | 'provider-mismatch' | 'index-error';
+    detail?: string;
+  }>;
+};
 
 export type StoredIndexEntry = {
   id: string;
@@ -72,6 +102,14 @@ export type WorkspaceMessage = {
   page: number;
   createdAt?: string;
   citation?: WorkspaceCitation;
+  sources?: KnowledgeSource[];
+};
+export type KnowledgeSource = {
+  bookId: string;
+  bookName: string;
+  page: number;
+  score: number;
+  excerpt: string;
 };
 export type WorkspaceHistoryItem = {
   id: string;
@@ -164,6 +202,22 @@ declare global {
         listener: (progress: Partial<GlmOcrStatus>) => void,
       ) => () => void;
       libraryList?: () => Promise<LibraryEntry[]>;
+      knowledgeList?: () => Promise<KnowledgePack[]>;
+      knowledgeCreate?: (input: {
+        name: string;
+        description?: string;
+      }) => Promise<KnowledgePack>;
+      knowledgeUpdate?: (
+        id: string,
+        changes: { name?: string; description?: string; bookIds?: string[] },
+      ) => Promise<KnowledgePack>;
+      knowledgeRemove?: (id: string) => Promise<{ removed: boolean }>;
+      knowledgeSearch?: (
+        id: string,
+        providerId: string,
+        vector: number[] | Float32Array,
+        limit: number,
+      ) => Promise<KnowledgeSearchResult>;
       libraryImport?: (
         name: string,
         data: ArrayBuffer,
