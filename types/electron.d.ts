@@ -23,7 +23,7 @@ declare global {
     marginDesktop?: {
       platform: string;
       isDesktop: boolean;
-      appInfo?: () => Promise<{ version: string; packaged: boolean; logPath: string }>;
+      appInfo?: () => Promise<{ version: string; packaged: boolean; logPath: string; dataRoot: string; cpuThreads: number; totalMemory: number; freeMemory: number; runtimeBackend: 'cpu' | 'vulkan'; ocrWorkers: number; embeddingSlots: number }>;
       openLogs?: () => Promise<{ opened: boolean; path: string }>;
       logEvent?: (event: string, details?: Record<string, unknown>, level?: 'info' | 'error') => void;
       embed?: (texts: string[]) => Promise<number[][]>;
@@ -58,6 +58,7 @@ declare global {
       libraryIndexAppend?: (id: string, entries: StoredIndexEntry[]) => Promise<{ chunks: number }>;
       libraryIndexFinish?: (id: string) => Promise<IndexInfo>;
       libraryIndexCancel?: (id: string) => Promise<{ cancelled: boolean; resumable?: boolean }>;
+      libraryIndexDiscard?: (id: string) => Promise<{ discarded: boolean }>;
       libraryIndexSearch?: (id: string, providerId: string, vector: number[] | Float32Array, limit: number) => Promise<Array<{ id: string; page: number; text: string; score: number }>>;
     };
   }

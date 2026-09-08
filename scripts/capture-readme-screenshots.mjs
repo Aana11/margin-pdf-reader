@@ -106,7 +106,7 @@ try {
         { role: 'assistant', content: '当前页展示了一个简洁的本地 PDF 阅读示例。阅读区与页码保持同步，左侧书架保存文档进度，右侧助手可结合当前页和全文索引回答问题。', page: 1, createdAt: now }
       ]
     }]));
-    localStorage.setItem('margin-settings-schema', '2');
+    localStorage.setItem('margin-settings-schema', '3');
     localStorage.setItem('margin-ai-settings', JSON.stringify({
       glmOcrMode: 'auto',
       glmOcrProvider: 'managed',
@@ -154,6 +154,36 @@ try {
   });
   await capture('region-reading.jpg');
 
+  await evaluate(`(() => {
+    const now = new Date().toISOString();
+    localStorage.setItem('margin-index-tasks-v1', JSON.stringify([{
+      id: 'demo-index-task', bookId: ${JSON.stringify(book.id)}, bookName: 'Margin-Reader-Demo.pdf', status: 'paused', stage: 'embedding', progress: 63,
+      message: '索引已暂停在 63%，可从 SQLite 检查点继续', pageCount: 186, completedPages: 186, chunks: 428, completedChunks: 271,
+      ocrPages: 38, skippedPages: 6, failedPages: [117], backend: 'vulkan', lanes: { text: 8, ocr: 4, embedding: 8 },
+      timings: { preparing: 1320, extracting: 6840, ocr: 92400, chunking: 380, embedding: 48100 }, createdAt: now, updatedAt: now
+    }]));
+    window.location.reload();
+  })()`);
+  await retry(async () => {
+    const ready = await evaluate(`Boolean(document.querySelector('[aria-label="索引任务"]'))`);
+    if (!ready) throw new Error('Task center trigger has not restored');
+    return ready;
+  });
+  await delay(500);
+  await evaluate(`document.querySelector('[aria-label="索引任务"]')?.click()`);
+  await retry(async () => {
+    const visible = await evaluate(`Boolean(document.querySelector('.index-task-card'))`);
+    if (!visible) throw new Error('Task center has not opened');
+    return visible;
+  });
+  await capture('index-task-center.jpg');
+  await evaluate(`window.location.reload()`);
+  await retry(async () => {
+    const ready = await evaluate(`Boolean(document.querySelector('[aria-label="模型设置"]'))`);
+    if (!ready) throw new Error('Settings trigger has not restored');
+    return ready;
+  });
+  await delay(500);
   await evaluate(`document.querySelector('[aria-label="模型设置"]')?.click()`);
   await retry(async () => {
     const visible = await evaluate(`Boolean(document.querySelector('#system-prompt'))`);

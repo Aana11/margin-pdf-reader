@@ -9,7 +9,7 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { Readable, Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
-const { appendIndexBatch, finishIndexBuild, getIndexCheckpoint, openIndex, pauseIndexBuild, saveIndexPages, searchIndex, startIndexBuild } = require('./index-store.cjs');
+const { appendIndexBatch, cancelIndexBuild, finishIndexBuild, getIndexCheckpoint, openIndex, pauseIndexBuild, saveIndexPages, searchIndex, startIndexBuild } = require('./index-store.cjs');
 
 const isDevelopment = !app.isPackaged;
 const embeddingModel = 'Qwen/Qwen3-Embedding-4B';
@@ -882,7 +882,18 @@ async function recognizeGlm(payload) {
 }
 
 ipcMain.handle('embedding:status', getModelStatus);
-ipcMain.handle('app:info', () => ({ version: app.getVersion(), packaged: app.isPackaged, logPath: logFile() }));
+ipcMain.handle('app:info', () => ({
+  version: app.getVersion(),
+  packaged: app.isPackaged,
+  logPath: logFile(),
+  dataRoot: dataRoot(),
+  cpuThreads: os.cpus().length,
+  totalMemory: os.totalmem(),
+  freeMemory: os.freemem(),
+  runtimeBackend,
+  ocrWorkers: OCR_WORKER_COUNT,
+  embeddingSlots: runtimeBackend === 'vulkan' ? 8 : Math.max(1, Math.min(4, Math.floor(os.cpus().length / 4))),
+}));
 ipcMain.handle('glm:status', (_event, payload) => getGlmStatus(assertGlmConfig(payload)));
 ipcMain.handle('glm:prepare', (event, payload) => prepareGlm(assertGlmConfig(payload), event.sender));
 ipcMain.handle('glm:recognize', (_event, payload) => recognizeGlm(payload));
@@ -1154,6 +1165,16 @@ ipcMain.handle('library:index-cancel', (_event, id) => {
   if (build) pauseIndexBuild(build);
   indexBuilds.delete(bookId);
   return { cancelled: Boolean(build), resumable: Boolean(build) };
+});
+
+ipcMain.handle('library:index-discard', async (_event, id) => {
+  const bookId = assertBookId(id);
+  const build = indexBuilds.get(bookId);
+  if (build) cancelIndexBuild(build);
+  indexBuilds.delete(bookId);
+  if (!build) await rm(path.join(bookDirectory(bookId), 'index.sqlite.building'), { force: true });
+  await logEvent('info', 'index.checkpoint-discarded', { bookId, activeBuild: Boolean(build) });
+  return { discarded: true };
 });
 
 ipcMain.handle('library:index-search', (_event, id, providerId, vector, limit) => {

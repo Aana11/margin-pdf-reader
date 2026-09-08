@@ -18,18 +18,19 @@ An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Elec
 
 ## OCR and RAG pipeline
 
-1. PDF.js extracts selectable text with an adaptive two-to-eight-page concurrency window while preserving page order.
-2. If a page has no text and OCR is enabled, the renderer rasterizes it to a capped offscreen canvas and transfers a PNG to the main process.
-3. A bounded pool of one to four Tesseract.js workers (selected from the logical processor count) recognizes simplified Chinese plus English, traditional Chinese plus English, or English. Language data ships with the application; no OCR image leaves the machine.
-4. Text is normalized and split into overlapping, page-addressable chunks.
-5. The selected embedding provider generates vectors in bounded batches (8 for Vulkan Qwen, 4 for CPU Qwen, 16 for remote providers).
-6. Completed vectors are transferred as `Float32Array` and accumulated into SQLite transactions of at most 64 entries.
-7. Query search streams rows from SQLite, computes cosine similarity, and retains only the best K matches.
-8. When optional GLM-OCR deep reading is enabled, the renderer classifies retrieved text for formulas, code, tables, or an explicit deep-reading request. It rasterizes at most two unique candidates and sends them to the configured GLM-OCR endpoint.
-9. The current page, top-ranked chunks, and successful visual-recognition results are sent to the configured chat model only after the user asks a question.
-10. Explicit region reading crops the already-rendered page canvas, caps the longest edge at 1,800 pixels, and sends only that JPEG region to GLM-OCR before task-specific chat processing.
+1. A persistent renderer-side task queue opens managed books through `margin://` and processes one book at a time without changing the document shown in the reader. Jobs survive renderer restarts as paused tasks and resume from the SQLite checkpoint.
+2. PDF.js extracts selectable text with an adaptive two-to-eight-page concurrency window while preserving page order.
+3. Pages with no text or only a small footer/page number are rasterized to a capped offscreen canvas. A downscaled luminance sample rejects near-blank pages before PNG encoding or OCR.
+4. A bounded pool of one to four Tesseract.js workers (selected from logical processor count and installed memory) recognizes simplified Chinese plus English, traditional Chinese plus English, or English. Language data ships with the application; no OCR image leaves the machine. A failed page is retried once and then recorded in the task.
+5. Text is normalized and split into overlapping, page-addressable chunks.
+6. The selected embedding provider generates vectors in bounded batches (8 for Vulkan Qwen, adaptive 1–4 for CPU Qwen, 16 for remote providers).
+7. Completed vectors are transferred as `Float32Array` and accumulated into SQLite transactions of at most 64 entries.
+8. Query search streams rows from SQLite, computes cosine similarity, and retains only the best K matches.
+9. When optional GLM-OCR deep reading is enabled, the renderer classifies retrieved text for formulas, code, tables, or an explicit deep-reading request. It rasterizes at most two unique candidates and sends them to the configured GLM-OCR endpoint.
+10. The current page, top-ranked chunks, and successful visual-recognition results are sent to the configured chat model only after the user asks a question.
+11. Explicit region reading crops the already-rendered page canvas, caps the longest edge at 1,800 pixels, and sends only that JPEG region to GLM-OCR before task-specific chat processing.
 
-Tesseract OCR runs only when PDF.js finds no text layer. Its output is used for assistant context and retrieval; Margin does not write an invisible selectable-text layer back into the PDF.
+Tesseract OCR runs only when PDF.js finds no meaningful text layer and the page-density preflight indicates visible content. Its output is used for assistant context and retrieval; Margin does not write an invisible selectable-text layer back into the PDF.
 
 ## Optional GLM-OCR deep reading
 
@@ -37,7 +38,7 @@ GLM-OCR is a query-time precision layer, not a replacement for the embedding ind
 
 GLM requests cross the context-isolated preload bridge and execute in the Electron main process, avoiding renderer CORS restrictions. The default managed mode uses llama.cpp's multimodal `/v1/chat/completions` endpoint; legacy Ollama mode follows `/api/generate`, while vLLM, SGLang, and remote providers use multimodal `/chat/completions`. The feature is disabled by default, sends at most two JPEG page images per question, runs sequentially, and caches results by book/page/task/provider/endpoint/model for the current session. A recognition error is logged with an actionable service/runtime/model diagnosis and degrades to ordinary RAG instead of failing the chat request.
 
-GLM-OCR weights are not packaged by Margin. Managed mode downloads checksum-pinned `GLM-OCR-Q8_0.gguf` and `mmproj-GLM-OCR-Q8_0.gguf`, reuses the pinned llama.cpp CPU/Vulkan runtime, and starts a loopback-only sidecar on a random port. Downloads resume from partial files; the sidecar exits after five idle minutes or explicit unload. Starting GLM-OCR stops the embedding sidecar and vice versa so both large models do not compete for GPU memory. Existing Ollama and OpenAI-compatible services remain optional advanced providers and are never terminated by managed mode.
+GLM-OCR weights are not packaged by Margin. Managed mode downloads checksum-pinned `GLM-OCR-Q8_0.gguf` and `mmproj-GLM-OCR-Q8_0.gguf`, reuses the pinned llama.cpp CPU/Vulkan runtime, and starts a loopback-only sidecar on a random port. Downloads resume from partial files; the sidecar exits after five idle minutes or explicit unload. Starting GLM-OCR stops the embedding sidecar and vice versa so both large models do not compete for GPU memory. On startup, complete files in the stable Margin data root are auto-associated for legacy profiles that never chose a GLM mode; an explicit off setting remains authoritative. Existing Ollama and OpenAI-compatible services remain optional advanced providers and are never terminated by managed mode.
 
 Manual region reading is independent of vector-index state. The renderer stores a normalized page rectangle plus a single in-memory crop, dispatches formula/table/text recognition according to the selected action, and caches recognition by SHA-256 + task + provider identity. Chat history stores the normalized rectangle but never the image bytes. Citation buttons restore the page and overlay exactly from these normalized coordinates.
 
@@ -45,7 +46,7 @@ Manual region reading is independent of vector-index state. The renderer stores 
 
 Each completed book index is stored beside the managed PDF as `index.sqlite`. Metadata records the schema version, provider identity, vector dimensions, completion state, and timestamps. Chunk rows contain page, ordinal, text, norm, and a little-endian Float32 BLOB.
 
-Builds write to `index.sqlite.building` and replace the previous database only after a successful commit and close. The building database contains page-text checkpoints (including whether text came from PDF.js or OCR) and completed vector rows. Pause, process exit, and recoverable failure close but retain this database; the next compatible run resumes missing pages/chunks. A completed index also retains page text so changing only the vector provider can reuse compatible OCR work. A version-1 `index.json` is migrated on first open; the JSON source is deleted only after the SQLite replacement succeeds.
+Builds write to `index.sqlite.building` and replace the previous database only after a successful commit and close. The building database contains page-text checkpoints (including whether text came from PDF.js or OCR) and completed vector rows. Pause, process exit, and recoverable failure close but retain this database; the next compatible run resumes missing pages/chunks. Explicit cancellation removes only the building file through a separate IPC operation, preserving any previous complete index. A completed index also retains page text so changing only the vector provider can reuse compatible OCR work. A version-1 `index.json` is migrated on first open; the JSON source is deleted only after the SQLite replacement succeeds.
 
 Provider identity remains an invariant: an index opens only when its embedding provider/model/version matches the current selection. Search stays in the main process so the renderer does not deserialize or retain every vector. Measured results and the reproducible command are in [`index-benchmark.md`](index-benchmark.md).
 
