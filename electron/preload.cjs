@@ -46,8 +46,17 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   knowledgeUpdate: (id, changes) =>
     ipcRenderer.invoke('knowledge:update', id, changes),
   knowledgeRemove: (id) => ipcRenderer.invoke('knowledge:remove', id),
-  knowledgeSearch: (id, providerId, vector, limit) =>
-    ipcRenderer.invoke('knowledge:search', id, providerId, vector, limit),
+  knowledgeExport: (id) => ipcRenderer.invoke('knowledge:export', id),
+  knowledgeImport: () => ipcRenderer.invoke('knowledge:import'),
+  knowledgeSearch: (id, providerId, vector, limit, filters) =>
+    ipcRenderer.invoke(
+      'knowledge:search',
+      id,
+      providerId,
+      vector,
+      limit,
+      filters,
+    ),
   libraryImport: (name, data) =>
     ipcRenderer.invoke('library:import', { name, data }),
   libraryImportFile: async (file) => {

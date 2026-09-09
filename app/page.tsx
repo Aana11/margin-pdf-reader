@@ -83,6 +83,7 @@ import {
 } from '@/lib/indexing/tasks';
 import type { IndexTask, IndexTaskStage } from '@/lib/indexing/tasks';
 import {
+  classifyRichContent,
   recognizeWithGlmOcr,
   selectDeepReadCandidates,
 } from '@/lib/rag/deep-reading';
@@ -831,6 +832,12 @@ export default function Home() {
   const [knowledgePackName, setKnowledgePackName] = useState('');
   const [knowledgePackDescription, setKnowledgePackDescription] = useState('');
   const [knowledgeSearchStatus, setKnowledgeSearchStatus] = useState('');
+  const [knowledgeExcludedBookIds, setKnowledgeExcludedBookIds] = useState<
+    string[]
+  >([]);
+  const [knowledgePageFrom, setKnowledgePageFrom] = useState('');
+  const [knowledgePageTo, setKnowledgePageTo] = useState('');
+  const [knowledgeNotice, setKnowledgeNotice] = useState('');
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [workspaceQuery, setWorkspaceQuery] = useState('');
@@ -1650,7 +1657,7 @@ export default function Home() {
       setKnowledgePackName(created.name);
       setKnowledgePackDescription(created.description);
       setNewKnowledgePackName('');
-      setWorkspaceNotice(`知识包“${created.name}”已创建`);
+      setKnowledgeNotice(`知识包“${created.name}”已创建`);
     } catch (reason) {
       setError(
         `创建知识包失败：${reason instanceof Error ? reason.message : String(reason)}`,
@@ -1679,7 +1686,7 @@ export default function Home() {
       setKnowledgePacks((current) =>
         current.map((pack) => (pack.id === updated.id ? updated : pack)),
       );
-      setWorkspaceNotice(`知识包“${updated.name}”已保存`);
+      setKnowledgeNotice(`知识包“${updated.name}”已保存`);
     } catch (reason) {
       setError(
         `保存知识包失败：${reason instanceof Error ? reason.message : String(reason)}`,
@@ -1699,9 +1706,43 @@ export default function Home() {
       setKnowledgePacks((current) =>
         current.map((item) => (item.id === updated.id ? updated : item)),
       );
+      setKnowledgeExcludedBookIds((current) =>
+        current.filter((id) => updated.bookIds.includes(id)),
+      );
     } catch (reason) {
       setError(
         `更新知识包成员失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    }
+  }
+
+  async function exportSelectedKnowledgePack(pack: KnowledgePack) {
+    if (!window.marginDesktop?.knowledgeExport) return;
+    try {
+      const result = await window.marginDesktop.knowledgeExport(pack.id);
+      if (result.exported)
+        setKnowledgeNotice(`知识包清单已导出：${result.path}`);
+    } catch (reason) {
+      setError(
+        `导出知识包失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    }
+  }
+
+  async function importKnowledgePackFile() {
+    if (!window.marginDesktop?.knowledgeImport) return;
+    try {
+      const result = await window.marginDesktop.knowledgeImport();
+      if (!result.imported || !result.pack) return;
+      await refreshKnowledgePacks();
+      selectKnowledgePack(result.pack);
+      const missing = result.unmatchedBooks?.length || 0;
+      setKnowledgeNotice(
+        `已导入“${result.pack.name}”并关联 ${result.matchedBooks || 0} 本书${missing ? `；${missing} 本未在当前书架找到` : ''}`,
+      );
+    } catch (reason) {
+      setError(
+        `导入知识包失败：${reason instanceof Error ? reason.message : String(reason)}`,
       );
     }
   }
@@ -1736,6 +1777,9 @@ export default function Home() {
   async function activateKnowledgePack(pack: KnowledgePack | null) {
     setActiveKnowledgePackId(pack?.id || null);
     setKnowledgeSearchStatus('');
+    setKnowledgeExcludedBookIds([]);
+    setKnowledgePageFrom('');
+    setKnowledgePageTo('');
     if (pack) {
       const restored = await window.marginDesktop?.workspaceChatLoad?.(
         `pack_${pack.id}`,
@@ -2859,6 +2903,97 @@ export default function Home() {
     return results.join('\n\n');
   }
 
+  async function createKnowledgeDeepReadContext(
+    matches: KnowledgeMatch[],
+    prompt: string,
+  ) {
+    if (settings.glmOcrMode === 'off' || matches.length === 0) return '';
+    const candidates = matches
+      .map((match) => ({
+        match,
+        classification: classifyRichContent(match.text, prompt),
+      }))
+      .filter(({ classification }) => classification.rich)
+      .filter(
+        ({ match }, index, values) =>
+          values.findIndex(
+            (candidate) =>
+              candidate.match.bookId === match.bookId &&
+              candidate.match.page === match.page,
+          ) === index,
+      )
+      .slice(0, 2);
+    if (candidates.length === 0) {
+      setDeepReadStatus('GLM-OCR 待命 · 跨书来源不需要视觉精读');
+      return '';
+    }
+    setDeepReadStatus(
+      `GLM-OCR 正在精读 ${candidates.map(({ match }) => `《${match.bookName}》第 ${match.page} 页`).join('、')}…`,
+    );
+    const pdfJs = await import('pdfjs-dist');
+    pdfJs.GlobalWorkerOptions.workerSrc = new URL(
+      pdfWorkerUrl,
+      window.location.href,
+    ).toString();
+    const documents = new Map<string, PDFDocumentProxy>();
+    const results: string[] = [];
+    try {
+      for (const { match, classification } of candidates) {
+        let targetPdf = documents.get(match.bookId);
+        if (!targetPdf) {
+          targetPdf = await pdfJs.getDocument({
+            url: `margin://app/library/${match.bookId}/document.pdf`,
+          }).promise;
+          documents.set(match.bookId, targetPdf);
+        }
+        const cacheKey = `pack:${match.bookId}:${match.page}:${classification.task}:${settings.glmOcrProvider}:${settings.glmOcrEndpoint}:${settings.glmOcrModel}`;
+        let recognized = deepReadCacheRef.current.get(cacheKey);
+        if (!recognized) {
+          const pdfPage = await targetPdf.getPage(match.page);
+          const image = await renderPageImage(pdfPage, 'jpeg');
+          const result = window.marginDesktop?.glmOcrRecognize
+            ? await window.marginDesktop.glmOcrRecognize({
+                ...glmConfig(),
+                image: image.bytes,
+                mimeType: image.mimeType,
+                task: classification.task,
+              })
+            : await recognizeWithGlmOcr(
+                {
+                  endpoint: settings.glmOcrEndpoint,
+                  model: settings.glmOcrModel,
+                  apiKey: settings.glmOcrApiKey,
+                },
+                image.bytes,
+                image.mimeType,
+                classification.task,
+              );
+          recognized = result.text;
+          deepReadCacheRef.current.set(cacheKey, recognized);
+        }
+        results.push(
+          `[GLM-OCR 精读《${match.bookName}》· 第 ${match.page} 页 · ${classification.reasons.join('、')}]\n${recognized.slice(0, 12000)}`,
+        );
+      }
+    } finally {
+      await Promise.all(
+        [...documents.values()].map((document) => document.destroy()),
+      );
+    }
+    setDeepReadStatus(
+      `GLM-OCR 已精读 ${candidates.length} 条跨书来源 · 结果已加入回答上下文`,
+    );
+    window.marginDesktop?.logEvent?.('glm-ocr-knowledge-deep-read-succeeded', {
+      packId: activeKnowledgePackId,
+      sources: candidates.map(({ match, classification }) => ({
+        bookId: match.bookId,
+        page: match.page,
+        task: classification.task,
+      })),
+    });
+    return results.join('\n\n');
+  }
+
   async function runRegionAction(action: RegionAction) {
     const selection = selectedRegion;
     if (
@@ -2989,9 +3124,31 @@ export default function Home() {
     setMessages((current) => [...current, userMessage, assistantMessage]);
     try {
       let matches: Array<RagMatch | KnowledgeMatch> = [];
+      let knowledgeFiltersApplied = false;
       if (!regionContext && knowledgePack) {
         if (knowledgePack.bookIds.length === 0)
           throw new Error('当前知识包还没有加入书籍');
+        const filteredBookIds = knowledgePack.bookIds.filter(
+          (id) => !knowledgeExcludedBookIds.includes(id),
+        );
+        if (filteredBookIds.length === 0)
+          throw new Error('检索筛选至少需要保留一本书');
+        const pageFrom = knowledgePageFrom
+          ? Number(knowledgePageFrom)
+          : undefined;
+        const pageTo = knowledgePageTo ? Number(knowledgePageTo) : undefined;
+        knowledgeFiltersApplied =
+          filteredBookIds.length !== knowledgePack.bookIds.length ||
+          pageFrom !== undefined ||
+          pageTo !== undefined;
+        if (
+          (pageFrom !== undefined &&
+            (!Number.isInteger(pageFrom) || pageFrom <= 0)) ||
+          (pageTo !== undefined &&
+            (!Number.isInteger(pageTo) || pageTo <= 0)) ||
+          (pageFrom !== undefined && pageTo !== undefined && pageTo < pageFrom)
+        )
+          throw new Error('页码范围无效，请检查起止页');
         const provider = createConfiguredProvider();
         if (
           settings.embeddingKind === 'local-qwen3-embedding-4b' &&
@@ -2999,7 +3156,7 @@ export default function Home() {
         )
           setModelStatus(await window.marginDesktop.modelPrepare());
         setKnowledgeSearchStatus(
-          `正在检索“${knowledgePack.name}”中的 ${knowledgePack.bookIds.length} 本书…`,
+          `正在检索“${knowledgePack.name}”中的 ${filteredBookIds.length} 本书…`,
         );
         const [queryVector] = await provider.embed([prompt], 'query');
         const result = await window.marginDesktop?.knowledgeSearch?.(
@@ -3007,12 +3164,13 @@ export default function Home() {
           provider.id,
           Float32Array.from(queryVector),
           8,
+          { bookIds: filteredBookIds, pageFrom, pageTo },
         );
         if (!result) throw new Error('当前环境不支持跨书知识包检索');
         matches = result.matches;
         const skipped = result.skippedBooks.length;
         setKnowledgeSearchStatus(
-          `已检索 ${result.searchedBooks} / ${result.memberBooks} 本书 · ${result.matches.length} 条来源 · ${result.elapsedMs} ms${skipped ? ` · 跳过 ${skipped} 本未索引或模型不匹配书籍` : ''}`,
+          `已检索 ${result.searchedBooks} / ${result.filteredBooks} 本筛选书籍 · ${result.matches.length} 条来源 · ${result.elapsedMs} ms · ${result.workerCount} 路并行${skipped ? ` · 跳过 ${skipped} 本未索引或模型不匹配书籍` : ''}`,
         );
         if (result.searchedBooks === 0)
           throw new Error('知识包内没有使用当前向量模型完成索引的书籍');
@@ -3040,16 +3198,21 @@ export default function Home() {
           );
       }
       let deepReadContext = '';
-      if (!regionContext && !knowledgePack && settings.glmOcrMode === 'auto') {
+      if (!regionContext && settings.glmOcrMode === 'auto') {
         try {
-          deepReadContext = await createDeepReadContext(matches, prompt);
+          deepReadContext = knowledgePack
+            ? await createKnowledgeDeepReadContext(
+                matches as KnowledgeMatch[],
+                prompt,
+              )
+            : await createDeepReadContext(matches, prompt);
         } catch (reason) {
           const message =
             reason instanceof Error ? reason.message.slice(0, 160) : '未知错误';
           setDeepReadStatus(`GLM-OCR 精读失败，已回退普通检索：${message}`);
           window.marginDesktop?.logEvent?.(
             'glm-ocr-deep-read-failed',
-            { bookId: activeBookId, message },
+            { bookId: activeBookId, packId: knowledgePack?.id, message },
             'error',
           );
         }
@@ -3067,7 +3230,7 @@ export default function Home() {
       const requestContent = regionContext
         ? `我框选了第 ${targetPage} 页的一处区域。\n\nGLM-OCR 对该区域的识别结果：\n${regionContext.recognized.slice(0, 16000)}\n\n任务：${prompt}\n\n回答必须以识别结果为依据，不要补造看不清的内容。行内公式使用 $...$，独立公式使用 $$...$$；代码使用带语言标记的代码块；表格使用 Markdown。`
         : knowledgePack
-          ? `你正在回答跨书知识包“${knowledgePack.name}”中的问题。只依据下列由用户明确加入知识包的书籍片段作答，不要引用书架中的其他书。每个关键结论都要在句末标注来源，格式为【《书名》· 第 N 页】；若证据不足，明确说明。\n\n跨书检索片段：\n${ragContext.slice(0, 24000)}\n\n行内公式使用 $...$，独立公式使用 $$...$$；代码使用带语言标记的代码块；表格使用 Markdown。\n\n我的问题：${prompt}`
+          ? `你正在回答跨书知识包“${knowledgePack.name}”中的问题。只依据下列由用户明确加入知识包且符合当前筛选的书籍片段作答，不要引用书架中的其他书。每个关键结论都要在句末标注来源，格式为【《书名》· 第 N 页】；若证据不足，明确说明。\n\n跨书检索片段：\n${ragContext.slice(0, 20000)}\n\nGLM-OCR 跨书视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次来源不需要视觉精读）'}\n\n精读结果优先用于还原公式、表格和代码结构。行内公式使用 $...$，独立公式使用 $$...$$；代码使用带语言标记的代码块；表格使用 Markdown。\n\n我的问题：${prompt}`
           : `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。行内公式使用 $...$，独立公式使用 $$...$$，以便阅读器渲染。\n\n我的问题：${prompt}`;
       const response = await fetch(
         `${settings.endpoint.replace(/\/$/, '')}/chat/completions`,
@@ -3087,9 +3250,11 @@ export default function Home() {
                 content:
                   settings.systemPrompt.trim() || DEFAULT_SETTINGS.systemPrompt,
               },
-              ...messages
-                .slice(-6)
-                .map(({ role, content }) => ({ role, content })),
+              ...(knowledgePack && knowledgeFiltersApplied
+                ? []
+                : messages
+                    .slice(-6)
+                    .map(({ role, content }) => ({ role, content }))),
               { role: 'user', content: requestContent },
             ],
           }),
@@ -3357,6 +3522,30 @@ export default function Home() {
                   只检索当前选中的知识包，不会扫描整个书架。
                 </DialogDescription>
               </DialogHeader>
+              <div className="knowledge-toolbar">
+                <Button
+                  variant="outline"
+                  onClick={() => void importKnowledgePackFile()}
+                >
+                  <Upload />
+                  导入清单
+                </Button>
+                <Button
+                  variant="outline"
+                  disabled={!selectedKnowledgePack}
+                  onClick={() =>
+                    selectedKnowledgePack &&
+                    void exportSelectedKnowledgePack(selectedKnowledgePack)
+                  }
+                >
+                  <Download />
+                  导出当前知识包
+                </Button>
+                <span>只导出组合清单，不复制 PDF、索引或模型。</span>
+              </div>
+              {knowledgeNotice && (
+                <p className="knowledge-notice">{knowledgeNotice}</p>
+              )}
               <div className="knowledge-create">
                 <FolderPlus />
                 <Input
@@ -4705,6 +4894,80 @@ export default function Home() {
               <button onClick={() => setKnowledgeOpen(true)}>选择知识包</button>
             )}
           </div>
+          {activeKnowledgePack && (
+            <details className="knowledge-filters">
+              <summary>
+                <span>
+                  <Search />
+                  检索筛选
+                </span>
+                <small>
+                  {activeKnowledgePack.bookIds.length -
+                    knowledgeExcludedBookIds.length}{' '}
+                  本书
+                  {knowledgePageFrom || knowledgePageTo
+                    ? ` · 第 ${knowledgePageFrom || 1}–${knowledgePageTo || '末'} 页`
+                    : ' · 全部页码'}
+                </small>
+              </summary>
+              <div className="knowledge-filter-content">
+                <div className="knowledge-filter-pages">
+                  <Label htmlFor="knowledge-page-from">页码范围</Label>
+                  <Input
+                    id="knowledge-page-from"
+                    type="number"
+                    min="1"
+                    value={knowledgePageFrom}
+                    onChange={(event) =>
+                      setKnowledgePageFrom(event.target.value)
+                    }
+                    placeholder="起始"
+                  />
+                  <span>至</span>
+                  <Input
+                    type="number"
+                    min="1"
+                    value={knowledgePageTo}
+                    onChange={(event) => setKnowledgePageTo(event.target.value)}
+                    placeholder="结束"
+                    aria-label="检索结束页"
+                  />
+                  <button
+                    onClick={() => {
+                      setKnowledgePageFrom('');
+                      setKnowledgePageTo('');
+                      setKnowledgeExcludedBookIds([]);
+                    }}
+                  >
+                    重置
+                  </button>
+                </div>
+                <div className="knowledge-filter-books">
+                  {activeKnowledgePack.bookIds.map((bookId) => {
+                    const book = library.find((item) => item.id === bookId);
+                    if (!book) return null;
+                    const checked = !knowledgeExcludedBookIds.includes(bookId);
+                    return (
+                      <label key={bookId}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() =>
+                            setKnowledgeExcludedBookIds((current) =>
+                              checked
+                                ? [...current, bookId]
+                                : current.filter((id) => id !== bookId),
+                            )
+                          }
+                        />
+                        <span>{book.name}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            </details>
+          )}
           {activeKnowledgePack && knowledgeSearchStatus && (
             <p className="knowledge-search-status">
               <Search />
@@ -4758,18 +5021,19 @@ export default function Home() {
             </div>
           )}
           {scanWarning && <p className="scan-warning">{scanWarning}</p>}
-          {pdf && (settings.glmOcrMode === 'auto' || deepReadStatus) && (
-            <p
-              className={
-                deepReadStatus.includes('失败')
-                  ? 'deep-read-status error'
-                  : 'deep-read-status'
-              }
-            >
-              <Sparkles />
-              {deepReadStatus || 'GLM-OCR 已待命 · 复杂页面将自动精读'}
-            </p>
-          )}
+          {(pdf || activeKnowledgePack) &&
+            (settings.glmOcrMode === 'auto' || deepReadStatus) && (
+              <p
+                className={
+                  deepReadStatus.includes('失败')
+                    ? 'deep-read-status error'
+                    : 'deep-read-status'
+                }
+              >
+                <Sparkles />
+                {deepReadStatus || 'GLM-OCR 已待命 · 复杂页面将自动精读'}
+              </p>
+            )}
           <div
             className="chat-area"
             ref={chatAreaRef}

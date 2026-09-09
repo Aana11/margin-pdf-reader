@@ -43,7 +43,9 @@ const {
 } = require('./index-store.cjs');
 const {
   createKnowledgePack,
+  exportKnowledgePack,
   getKnowledgePack,
+  importKnowledgePack,
   listNotes,
   listKnowledgePacks,
   loadChat,
@@ -690,7 +692,7 @@ function updateCatalog(mutator) {
   return operation;
 }
 
-function runKnowledgeSearch(books, providerId, vector, limit) {
+function runKnowledgeSearchWorker(books, providerId, vector, limit, filters) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(
       path.join(__dirname, 'knowledge-search-worker.cjs'),
@@ -703,6 +705,8 @@ function runKnowledgeSearch(books, providerId, vector, limit) {
           providerId,
           vector: Array.from(vector),
           limit,
+          pageFrom: filters.pageFrom,
+          pageTo: filters.pageTo,
         },
       },
     );
@@ -716,6 +720,35 @@ function runKnowledgeSearch(books, providerId, vector, limit) {
         reject(new Error(`Knowledge search worker exited (${code})`));
     });
   });
+}
+
+async function runKnowledgeSearch(books, providerId, vector, limit, filters) {
+  const startedAt = Date.now();
+  const workerCount = Math.max(
+    1,
+    Math.min(4, Math.ceil(os.cpus().length / 4), books.length),
+  );
+  const shards = Array.from({ length: workerCount }, () => []);
+  books.forEach((book, index) => shards[index % workerCount].push(book));
+  const results = await Promise.all(
+    shards
+      .filter((shard) => shard.length > 0)
+      .map((shard) =>
+        runKnowledgeSearchWorker(shard, providerId, vector, limit, filters),
+      ),
+  );
+  const matches = results.flatMap((result) => result.matches);
+  matches.sort((left, right) => right.score - left.score);
+  return {
+    matches: matches.slice(0, limit),
+    searchedBooks: results.reduce(
+      (sum, result) => sum + result.searchedBooks,
+      0,
+    ),
+    skippedBooks: results.flatMap((result) => result.skippedBooks),
+    elapsedMs: Date.now() - startedAt,
+    workerCount,
+  };
 }
 
 async function getFreePort() {
@@ -1860,9 +1893,46 @@ ipcMain.handle('knowledge:remove', (_event, packId) =>
   removeKnowledgePack(dataRoot(), packId),
 );
 
+ipcMain.handle('knowledge:export', async (_event, packId) => {
+  const manifest = exportKnowledgePack(dataRoot(), packId, await readCatalog());
+  const safeName = manifest.pack.name.replace(/[<>:"/\\|?*]+/g, '-');
+  const result = await dialog.showSaveDialog({
+    title: '导出知识包',
+    defaultPath: path.join(
+      app.getPath('documents'),
+      `${safeName || 'Margin-知识包'}.margin-pack.json`,
+    ),
+    filters: [{ name: 'Margin 知识包', extensions: ['json'] }],
+  });
+  if (result.canceled || !result.filePath) return { exported: false };
+  await writeFile(result.filePath, JSON.stringify(manifest, null, 2), 'utf8');
+  return { exported: true, path: result.filePath };
+});
+
+ipcMain.handle('knowledge:import', async () => {
+  const result = await dialog.showOpenDialog({
+    title: '导入知识包',
+    properties: ['openFile'],
+    filters: [{ name: 'Margin 知识包', extensions: ['json'] }],
+  });
+  if (result.canceled || result.filePaths.length === 0)
+    return { imported: false };
+  const filePath = result.filePaths[0];
+  const fileInfo = await stat(filePath);
+  if (!fileInfo.isFile() || fileInfo.size > 1024 * 1024)
+    throw new Error('知识包文件无效或超过 1 MB');
+  const manifest = JSON.parse(await readFile(filePath, 'utf8'));
+  const imported = importKnowledgePack(
+    dataRoot(),
+    manifest,
+    await readCatalog(),
+  );
+  return { imported: true, path: filePath, ...imported };
+});
+
 ipcMain.handle(
   'knowledge:search',
-  async (_event, packId, providerId, vector, limit = 8) => {
+  async (_event, packId, providerId, vector, limit = 8, filters = {}) => {
     if (
       typeof providerId !== 'string' ||
       providerId.length < 2 ||
@@ -1876,20 +1946,49 @@ ipcMain.handle(
     )
       throw new Error('Invalid knowledge search request');
     const pack = getKnowledgePack(dataRoot(), packId);
-    const bookIds = new Set(pack.bookIds);
+    const requestedBookIds = filters.bookIds ?? pack.bookIds;
+    if (
+      !Array.isArray(requestedBookIds) ||
+      requestedBookIds.length === 0 ||
+      requestedBookIds.length > 200 ||
+      requestedBookIds.some((bookId) => !pack.bookIds.includes(bookId))
+    )
+      throw new Error('Invalid knowledge search book filter');
+    const pageFrom =
+      filters.pageFrom === undefined ? 1 : Number(filters.pageFrom);
+    const pageTo =
+      filters.pageTo === undefined ? 2_147_483_647 : Number(filters.pageTo);
+    if (
+      !Number.isInteger(pageFrom) ||
+      !Number.isInteger(pageTo) ||
+      pageFrom <= 0 ||
+      pageTo < pageFrom
+    )
+      throw new Error('Invalid knowledge search page filter');
+    const bookIds = new Set(requestedBookIds);
     const books = (await readCatalog()).filter((book) => bookIds.has(book.id));
     const startedAt = Date.now();
-    const result = await runKnowledgeSearch(books, providerId, vector, limit);
+    const result = await runKnowledgeSearch(books, providerId, vector, limit, {
+      pageFrom,
+      pageTo,
+    });
     await logEvent('info', 'knowledge.search-succeeded', {
       packId,
       memberBooks: pack.bookIds.length,
+      filteredBooks: requestedBookIds.length,
       searchedBooks: result.searchedBooks,
       skippedBooks: result.skippedBooks.length,
       matches: result.matches.length,
       workerElapsedMs: result.elapsedMs,
+      workerCount: result.workerCount,
       elapsedMs: Date.now() - startedAt,
     });
-    return { ...result, packId, memberBooks: pack.bookIds.length };
+    return {
+      ...result,
+      packId,
+      memberBooks: pack.bookIds.length,
+      filteredBooks: requestedBookIds.length,
+    };
   },
 );
 

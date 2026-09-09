@@ -2,6 +2,22 @@
 
 All notable changes to Margin are documented here.
 
+## [0.3.1] - 2026-09-09
+
+### Added
+
+- Query-level knowledge-pack filters. Users can temporarily include or exclude member books and constrain a search to a page range without changing the saved pack.
+- Versioned `.margin-pack.json` import and export. Manifests contain only pack metadata and book identity hints; import relinks exact IDs or uniquely named local books and reports anything missing.
+- Cross-book GLM-OCR refinement. Formula-, table-, and code-heavy Top-K sources now open their actual managed PDFs and contribute at most two visual recognition results to the answer context.
+- Unit coverage for page-bounded vector scanning, manifest portability, missing-book reporting, and the existing strict pack-isolation guarantees.
+
+### Changed
+
+- Eligible knowledge-pack books are sharded across up to four worker threads. Page bounds are applied in SQLite before Float32 vector scoring, and only the global Top-K is returned to the renderer.
+- Cross-book status now reports the filtered scope, elapsed time, worker count, skipped incompatible indexes, and returned source count.
+- The README now leads with downloads, a five-minute setup, common user workflows, plain-language model choices, privacy, and troubleshooting; developer detail is condensed into an expandable final section.
+- The index benchmark records full-index and page-filtered query time separately.
+
 ## [0.3.0] - 2026-09-09
 
 ### Added
