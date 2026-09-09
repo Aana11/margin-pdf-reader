@@ -21,6 +21,7 @@ function searchKnowledgeBooks(input) {
         input.providerId,
         Float32Array.from(input.vector),
         input.limit,
+        { pageFrom: input.pageFrom, pageTo: input.pageTo },
       );
       searchedBooks += 1;
       for (const match of results)
@@ -46,6 +47,7 @@ function searchKnowledgeBooks(input) {
     searchedBooks,
     skippedBooks,
     elapsedMs: Date.now() - startedAt,
+    workerCount: 1,
   };
 }
 

@@ -29,8 +29,10 @@ export type KnowledgeMatch = {
 export type KnowledgeSearchResult = {
   packId: string;
   memberBooks: number;
+  filteredBooks: number;
   searchedBooks: number;
   elapsedMs: number;
+  workerCount: number;
   matches: KnowledgeMatch[];
   skippedBooks: Array<{
     bookId: string;
@@ -212,11 +214,26 @@ declare global {
         changes: { name?: string; description?: string; bookIds?: string[] },
       ) => Promise<KnowledgePack>;
       knowledgeRemove?: (id: string) => Promise<{ removed: boolean }>;
+      knowledgeExport?: (
+        id: string,
+      ) => Promise<{ exported: boolean; path?: string }>;
+      knowledgeImport?: () => Promise<{
+        imported: boolean;
+        path?: string;
+        pack?: KnowledgePack;
+        matchedBooks?: number;
+        unmatchedBooks?: string[];
+      }>;
       knowledgeSearch?: (
         id: string,
         providerId: string,
         vector: number[] | Float32Array,
         limit: number,
+        filters?: {
+          bookIds?: string[];
+          pageFrom?: number;
+          pageTo?: number;
+        },
       ) => Promise<KnowledgeSearchResult>;
       libraryImport?: (
         name: string,

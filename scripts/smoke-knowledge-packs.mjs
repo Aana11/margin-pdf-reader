@@ -244,12 +244,44 @@ try {
   assert.doesNotMatch(context, /未纳入但更相似/);
   assert.ok(ui.sources.every((source) => !source.includes('未纳入')));
 
+  await evaluate(
+    `document.querySelector('.knowledge-filters summary')?.click()`,
+  );
+  await evaluate(`(() => {
+    const label = [...document.querySelectorAll('.knowledge-filter-books label')].find((item) => item.textContent?.includes('解析几何.pdf'));
+    label?.querySelector('input')?.click();
+    const input = document.querySelector('[aria-label="输入问题"]');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(input, '只从高等代数中说明线性空间。');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await evaluate(`document.querySelector('[aria-label="发送"]')?.click()`);
+  const filteredUi = await retry(async () => {
+    const state = await evaluate(`({
+      sources: [...document.querySelectorAll('.message.assistant')].at(-1)?.querySelectorAll('.message-sources button').length || 0,
+      status: document.querySelector('.knowledge-search-status')?.textContent || '',
+      error: document.querySelector('.error-message')?.textContent || ''
+    })`);
+    if (state.error) throw new Error(state.error);
+    if (state.sources !== 1 || !state.status.includes('1 / 1'))
+      throw new Error(
+        `Filtered knowledge answer is not ready: ${JSON.stringify(state)}`,
+      );
+    return state;
+  });
+  assert.equal(requests.embedding.length, 2);
+  assert.equal(requests.chat.length, 2);
+  const filteredContext = JSON.stringify(requests.chat[1]);
+  assert.match(filteredContext, /高等代数\.pdf/);
+  assert.doesNotMatch(filteredContext, /解析几何\.pdf/);
+
   const storedMessages = await evaluate(
     `window.marginDesktop.workspaceChatLoad(${JSON.stringify(`pack_${seeded.pack.id}`)}, 100)`,
     true,
   );
-  assert.equal(storedMessages.length, 2);
+  assert.equal(storedMessages.length, 4);
   assert.equal(storedMessages[1].sources.length, 2);
+  assert.equal(storedMessages[3].sources.length, 1);
   await evaluate('window.location.reload()');
   await retry(async () => {
     const ready = await evaluate(
@@ -277,7 +309,7 @@ try {
     const sourceCount = await evaluate(
       `document.querySelectorAll('.message.assistant .message-sources button').length`,
     );
-    if (sourceCount !== 2)
+    if (sourceCount !== 3)
       throw new Error('Persisted source cards did not restore');
     return sourceCount;
   });
@@ -291,7 +323,7 @@ try {
       page: document.querySelector('.page-scroll-indicator')?.textContent || '',
       sources: document.querySelectorAll('.message.assistant .message-sources button').length
     })`);
-    if (!state.page.includes('1 / 2') || state.sources !== 2)
+    if (!state.page.includes('1 / 2') || state.sources !== 3)
       throw new Error(`Source navigation failed: ${JSON.stringify(state)}`);
     return state;
   });
@@ -305,6 +337,7 @@ try {
       chatRequests: requests.chat.length,
       persistedSources: storedMessages[1].sources.length,
       ui,
+      filteredUi,
       navigation,
     }),
   );

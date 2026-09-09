@@ -26,8 +26,8 @@ An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Elec
 6. The selected embedding provider generates vectors in bounded batches (8 for Vulkan Qwen, adaptive 1–4 for CPU Qwen, 16 for remote providers).
 7. Completed vectors are transferred as `Float32Array` and accumulated into SQLite transactions of at most 64 entries.
 8. Single-book search streams rows from SQLite, computes cosine similarity, and retains only the best K matches.
-9. Cross-book search first resolves one user-selected knowledge pack, computes the query vector once, and sends only its member indexes to a worker thread. The worker skips missing/provider-incompatible indexes and merges per-book candidates into a global Top-K carrying book and page identity.
-10. When optional GLM-OCR deep reading is enabled, single-book reading classifies retrieved text for formulas, code, tables, or an explicit deep-reading request. It rasterizes at most two unique candidates and sends them to the configured GLM-OCR endpoint.
+9. Cross-book search first resolves one user-selected knowledge pack, validates the query-level book/page filters as a subset of that pack, and computes the query vector once. It shards eligible indexes over at most four worker threads, applies page bounds inside SQLite, and merges per-book candidates into a global Top-K carrying book and page identity.
+10. When optional GLM-OCR deep reading is enabled, both single-book and cross-book reading classify retrieved text for formulas, code, tables, or an explicit deep-reading request. Margin opens the exact source PDF, rasterizes at most two unique candidates, and sends them to the configured GLM-OCR endpoint.
 11. The current page or user-selected knowledge-pack matches and successful visual-recognition results are sent to the configured chat model only after the user asks a question.
 12. Explicit region reading crops the already-rendered page canvas, caps the longest edge at 1,800 pixels, and sends only that JPEG region to GLM-OCR before task-specific chat processing.
 
@@ -57,7 +57,9 @@ Provider identity remains an invariant: an index opens only when its embedding p
 
 Knowledge packs are relational metadata in `workspace.sqlite`: `knowledge_packs` stores the user-visible folder and `knowledge_pack_books` stores its ordered book IDs. This avoids duplicating PDFs or vector BLOBs, permits one book to belong to several packs, and lets book deletion remove memberships transactionally without deleting the remaining pack.
 
-The renderer computes one query embedding and invokes a narrow `knowledge:search` bridge with the selected pack ID. The main process resolves membership against the current catalog, so renderer-supplied IDs cannot widen scope. Exact searches execute in `knowledge-search-worker.cjs`, keeping synchronous `node:sqlite` vector scans off the Electron main thread. Every result carries `bookId`, `bookName`, `page`, score, and text; the assistant persists a bounded source list beside its message for later page navigation.
+The renderer computes one query embedding and invokes a narrow `knowledge:search` bridge with the selected pack ID. The main process resolves membership against the current catalog and rejects filter IDs outside the pack, so renderer-supplied IDs cannot widen scope. Eligible books are split over up to four `knowledge-search-worker.cjs` workers. Page bounds are included in each SQLite query before vector scanning; worker results are merged into one global Top-K. Every result carries `bookId`, `bookName`, `page`, score, and text; the assistant persists a bounded source list beside its message for later page navigation.
+
+Knowledge-pack export is a versioned JSON manifest containing only the pack name, description, and book identity hints. Import matches current-library IDs first and then a unique normalized filename. It never embeds PDFs, indexes, model files, credentials, or chat history; unmatched books remain explicit in the import result.
 
 No all-library fallback exists. Empty packs fail with an actionable message, removed books disappear from memberships, and provider-incompatible indexes are returned as skipped diagnostics. Exact per-book SQLite remains the compatibility path; ANN will be considered only after real pack sizes justify its additional native dependency and migration cost.
 

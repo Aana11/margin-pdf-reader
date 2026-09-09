@@ -224,6 +224,75 @@ function getKnowledgePack(root, packId) {
   }
 }
 
+function exportKnowledgePack(root, packId, catalog = []) {
+  const pack = getKnowledgePack(root, packId);
+  const booksById = new Map(catalog.map((book) => [book.id, book]));
+  return {
+    format: 'margin-knowledge-pack',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    pack: {
+      name: pack.name,
+      description: pack.description,
+      books: pack.bookIds.map((bookId) => {
+        const book = booksById.get(bookId);
+        return {
+          id: bookId,
+          name: book?.name || '',
+        };
+      }),
+    },
+  };
+}
+
+function importKnowledgePack(root, manifest, catalog = []) {
+  if (
+    !manifest ||
+    manifest.format !== 'margin-knowledge-pack' ||
+    manifest.version !== 1 ||
+    !manifest.pack ||
+    !Array.isArray(manifest.pack.books) ||
+    manifest.pack.books.length > 200
+  )
+    throw new Error('Invalid Margin knowledge pack file');
+  const byId = new Map(catalog.map((book) => [book.id, book]));
+  const byName = new Map();
+  for (const book of catalog) {
+    const key = String(book.name || '')
+      .trim()
+      .toLocaleLowerCase();
+    if (!key) continue;
+    const values = byName.get(key) || [];
+    values.push(book);
+    byName.set(key, values);
+  }
+  const matchedIds = [];
+  const unmatchedBooks = [];
+  for (const source of manifest.pack.books) {
+    if (
+      !source ||
+      typeof source.id !== 'string' ||
+      typeof source.name !== 'string'
+    )
+      throw new Error('Invalid knowledge pack book entry');
+    const exact = byId.get(source.id);
+    const named = byName.get(source.name.trim().toLocaleLowerCase()) || [];
+    const match = exact || (named.length === 1 ? named[0] : undefined);
+    if (match && !matchedIds.includes(match.id)) matchedIds.push(match.id);
+    else unmatchedBooks.push(source.name || source.id);
+  }
+  const created = createKnowledgePack(root, {
+    name: cleanText(manifest.pack.name || '', 100, 'knowledge pack name'),
+    description: cleanText(
+      manifest.pack.description || '',
+      500,
+      'knowledge pack description',
+    ),
+  });
+  const pack = updateKnowledgePack(root, created.id, { bookIds: matchedIds });
+  return { pack, matchedBooks: matchedIds.length, unmatchedBooks };
+}
+
 function serializeCitation(value) {
   if (!value) return null;
   const page = Number(value.page);
@@ -623,7 +692,9 @@ function markdownExport(root, options = {}) {
 
 module.exports = {
   createKnowledgePack,
+  exportKnowledgePack,
   getKnowledgePack,
+  importKnowledgePack,
   listNotes,
   listKnowledgePacks,
   loadChat,
