@@ -20,8 +20,14 @@ contextBridge.exposeInMainWorld('marginDesktop', {
     ipcRenderer.on('model:progress', handler);
     return () => ipcRenderer.removeListener('model:progress', handler);
   },
-  ocrRecognize: (image, language, page) =>
-    ipcRenderer.invoke('ocr:recognize', { image, language, page }),
+  ocrRecognize: (image, language, page, pixelWidth, pixelHeight) =>
+    ipcRenderer.invoke('ocr:recognize', {
+      image,
+      language,
+      page,
+      pixelWidth,
+      pixelHeight,
+    }),
   onOcrProgress: (listener) => {
     const handler = (_event, progress) => listener(progress);
     ipcRenderer.on('ocr:progress', handler);
@@ -94,6 +100,8 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   libraryIndexDiscard: (id) => ipcRenderer.invoke('library:index-discard', id),
   libraryIndexSearch: (id, providerId, vector, limit) =>
     ipcRenderer.invoke('library:index-search', id, providerId, vector, limit),
+  libraryExportSearchablePdf: (id, range) =>
+    ipcRenderer.invoke('library:export-searchable-pdf', id, range),
   workspaceChatLoad: (bookId, limit) =>
     ipcRenderer.invoke('workspace:chat-load', bookId, limit),
   workspaceChatReplace: (bookId, bookName, messages) =>

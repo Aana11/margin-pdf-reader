@@ -21,7 +21,7 @@ An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Elec
 1. A persistent renderer-side task queue opens managed books through `margin://` and processes one book at a time without changing the document shown in the reader. Jobs survive renderer restarts as paused tasks and resume from the SQLite checkpoint.
 2. PDF.js extracts selectable text with an adaptive two-to-eight-page concurrency window while preserving page order.
 3. Pages with no text or only a small footer/page number are rasterized to a capped offscreen canvas. A downscaled luminance sample rejects near-blank pages before PNG encoding or OCR.
-4. A bounded pool of one to four Tesseract.js workers (selected from logical processor count and installed memory) recognizes simplified Chinese plus English, traditional Chinese plus English, or English. Language data ships with the application; no OCR image leaves the machine. A failed page is retried once and then recorded in the task.
+4. A bounded pool of one to four Tesseract.js workers (selected from logical processor count and installed memory) recognizes simplified Chinese plus English, traditional Chinese plus English, or English. Language data ships with the application; no OCR image leaves the machine. Along with structured text, the worker returns bounded line regions, confidence and pixel-space bounding boxes for layout-aware storage. A failed page is retried once and then recorded in the task.
 5. Text is normalized and split into overlapping, page-addressable chunks.
 6. The selected embedding provider generates vectors in bounded batches (8 for Vulkan Qwen, adaptive 1–4 for CPU Qwen, 16 for remote providers).
 7. Completed vectors are transferred as `Float32Array` and accumulated into SQLite transactions of at most 64 entries.
@@ -30,8 +30,10 @@ An opened book is exposed as `margin://app/library/<book-id>/document.pdf`. Elec
 10. When optional GLM-OCR deep reading is enabled, both single-book and cross-book reading classify retrieved text for formulas, code, tables, or an explicit deep-reading request. Margin opens the exact source PDF, rasterizes at most two unique candidates, and sends them to the configured GLM-OCR endpoint.
 11. The current page or user-selected knowledge-pack matches and successful visual-recognition results are sent to the configured chat model only after the user asks a question.
 12. Explicit region reading crops the already-rendered page canvas, caps the longest edge at 1,800 pixels, and sends only that JPEG region to GLM-OCR before task-specific chat processing.
+13. A manual OCR task can refresh an explicit page interval, including pages with an existing PDF text layer. Optional formula refinement sends at most 12 selected pages through GLM-OCR and stores its structured result while retaining Tesseract coordinates.
+14. Searchable-PDF export loads the original managed PDF, overlays invisible Unicode text at saved OCR line coordinates, and writes a new user-selected file. It never mutates the managed original.
 
-Tesseract OCR runs only when PDF.js finds no meaningful text layer and the page-density preflight indicates visible content. Its output is used for assistant context and retrieval; Margin does not write an invisible selectable-text layer back into the PDF.
+Automatic Tesseract OCR runs only when PDF.js finds no meaningful text layer and the page-density preflight indicates visible content. Manual range tasks can explicitly override that classifier. OCR output is used for assistant context and retrieval and may be exported into a separate searchable PDF; Margin never writes back into the source PDF.
 
 ## Optional GLM-OCR deep reading
 
@@ -49,7 +51,7 @@ The same normalized rectangle can be persisted without model inference as a high
 
 Each completed book index is stored beside the managed PDF as `index.sqlite`. Metadata records the schema version, provider identity, vector dimensions, completion state, and timestamps. Chunk rows contain page, ordinal, text, norm, and a little-endian Float32 BLOB.
 
-Builds write to `index.sqlite.building` and replace the previous database only after a successful commit and close. The building database contains page-text checkpoints (including whether text came from PDF.js or OCR) and completed vector rows. Pause, process exit, and recoverable failure close but retain this database; the next compatible run resumes missing pages/chunks. Explicit cancellation removes only the building file through a separate IPC operation, preserving any previous complete index. A completed index also retains page text so changing only the vector provider can reuse compatible OCR work. A version-1 `index.json` is migrated on first open; the JSON source is deleted only after the SQLite replacement succeeds.
+Builds write to `index.sqlite.building` and replace the previous database only after a successful commit and close. The building database contains page-text checkpoints (including whether text came from PDF.js or OCR), optional bounded OCR layout JSON, and completed vector rows. Pause, process exit, and recoverable failure close but retain this database; the next compatible run resumes missing pages/chunks. Explicit cancellation removes only the building file through a separate IPC operation, preserving any previous complete index. A completed index also retains page text and layout so changing only the vector provider can reuse compatible OCR work. A version-1 `index.json` is migrated on first open; the JSON source is deleted only after the SQLite replacement succeeds.
 
 Provider identity remains an invariant: an index opens only when its embedding provider/model/version matches the current selection. Search stays in the main process so the renderer does not deserialize or retain every vector. Measured results and the reproducible command are in [`index-benchmark.md`](index-benchmark.md).
 

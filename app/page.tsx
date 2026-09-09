@@ -113,6 +113,7 @@ import type {
   KnowledgeSource,
   LibraryEntry,
   ModelInstallStatus,
+  OcrPageLayout,
   WorkspaceHistoryItem,
   WorkspaceNote,
   WorkspaceNoteKind,
@@ -358,7 +359,13 @@ async function renderPageImage(
   pdfPage: PDFPageProxy,
   format: 'png' | 'jpeg' = 'png',
   inspectBlank = false,
-): Promise<{ bytes: Uint8Array; mimeType: string; inkRatio?: number }> {
+): Promise<{
+  bytes: Uint8Array;
+  mimeType: string;
+  inkRatio?: number;
+  pixelWidth: number;
+  pixelHeight: number;
+}> {
   const baseViewport = pdfPage.getViewport({ scale: 1 });
   const scale = Math.max(
     1.5,
@@ -402,7 +409,13 @@ async function renderPageImage(
   if (inspectBlank && isProbablyBlankPage(inkRatio || 0)) {
     canvas.width = 1;
     canvas.height = 1;
-    return { bytes: new Uint8Array(), mimeType, inkRatio };
+    return {
+      bytes: new Uint8Array(),
+      mimeType,
+      inkRatio,
+      pixelWidth: 0,
+      pixelHeight: 0,
+    };
   }
   const blob = await new Promise<Blob>((resolve, reject) =>
     canvas.toBlob(
@@ -412,12 +425,16 @@ async function renderPageImage(
       format === 'jpeg' ? 0.92 : undefined,
     ),
   );
+  const pixelWidth = canvas.width;
+  const pixelHeight = canvas.height;
   canvas.width = 1;
   canvas.height = 1;
   return {
     bytes: new Uint8Array(await blob.arrayBuffer()),
     mimeType,
     inkRatio,
+    pixelWidth,
+    pixelHeight,
   };
 }
 
@@ -819,6 +836,11 @@ export default function Home() {
   const [chatModelList, setChatModelList] = useState<string[]>([]);
   const [chatModelListLoading, setChatModelListLoading] = useState(false);
   const [chatModelListError, setChatModelListError] = useState('');
+  const [chatModelCheckLoading, setChatModelCheckLoading] = useState(false);
+  const [chatModelCheckResult, setChatModelCheckResult] = useState('');
+  const [localModelCheckLoading, setLocalModelCheckLoading] = useState(false);
+  const [localModelCheckResult, setLocalModelCheckResult] = useState('');
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [knowledgeOpen, setKnowledgeOpen] = useState(false);
   const [knowledgePacks, setKnowledgePacks] = useState<KnowledgePack[]>([]);
@@ -839,6 +861,13 @@ export default function Home() {
   const [knowledgePageTo, setKnowledgePageTo] = useState('');
   const [knowledgeNotice, setKnowledgeNotice] = useState('');
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
+  const [ocrToolsOpen, setOcrToolsOpen] = useState(false);
+  const [ocrPageFrom, setOcrPageFrom] = useState('1');
+  const [ocrPageTo, setOcrPageTo] = useState('1');
+  const [ocrForceRange, setOcrForceRange] = useState(true);
+  const [ocrGlmRefine, setOcrGlmRefine] = useState(false);
+  const [ocrToolNotice, setOcrToolNotice] = useState('');
+  const [ocrExporting, setOcrExporting] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [workspaceQuery, setWorkspaceQuery] = useState('');
   const [workspaceKind, setWorkspaceKind] = useState<'all' | WorkspaceNoteKind>(
@@ -892,6 +921,10 @@ export default function Home() {
       900,
     );
   }, []);
+
+  useEffect(() => {
+    document.title = `Margin${appVersion ? ` v${appVersion}` : ''}`;
+  }, [appVersion]);
 
   const saveChatHistory = useCallback(
     (bookId: string, bookName: string, nextMessages: Message[]) => {
@@ -2062,14 +2095,15 @@ export default function Home() {
         ? 'GLM-OCR 已待命，将按需精读公式、代码与表格页'
         : '',
     );
+    setSettingsOpen(false);
   }
 
   async function fetchChatModelList() {
     const endpoint = settings.endpoint.trim().replace(/\/+$/, '');
     const apiKey = settings.apiKey.trim();
-    if (!endpoint || !apiKey) {
+    if (!endpoint) {
       setChatModelList([]);
-      setChatModelListError('请先填写端点地址与 API Key。');
+      setChatModelListError('请先填写端点地址。');
       return;
     }
     setChatModelListLoading(true);
@@ -2077,7 +2111,7 @@ export default function Home() {
     setChatModelList([]);
     try {
       const response = await fetch(`${endpoint}/models`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
       });
       if (!response.ok)
         throw new Error((await response.text()) || `HTTP ${response.status}`);
@@ -2091,13 +2125,95 @@ export default function Home() {
           ? payload.models.map((item) => item.id)
           : [];
       if (ids.length === 0) throw new Error('端点未返回可用模型');
-      setChatModelList(ids);
+      setChatModelList([...new Set(ids.filter(Boolean))].sort());
     } catch (reason) {
       setChatModelListError(
         `获取模型列表失败：${reason instanceof Error ? reason.message.slice(0, 140) : '请检查端点与密钥'}`,
       );
     } finally {
       setChatModelListLoading(false);
+    }
+  }
+
+  async function testChatModelAvailability() {
+    const endpoint = settings.endpoint.trim().replace(/\/+$/, '');
+    const model = settings.model.trim();
+    const apiKey = settings.apiKey.trim();
+    if (!endpoint || !model) {
+      setChatModelCheckResult('请先填写端点地址和模型名称。');
+      return;
+    }
+    setChatModelCheckLoading(true);
+    setChatModelCheckResult('');
+    const startedAt = performance.now();
+    try {
+      const response = await fetch(`${endpoint}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: '仅回复 OK' }],
+          max_tokens: 4,
+          temperature: 0,
+          stream: false,
+        }),
+      });
+      if (!response.ok)
+        throw new Error((await response.text()) || `HTTP ${response.status}`);
+      const payload = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      if (!Array.isArray(payload.choices) || payload.choices.length === 0)
+        throw new Error('端点未返回有效的对话结果');
+      const elapsed = Math.round(performance.now() - startedAt);
+      setChatModelCheckResult(`可用 · ${model} · ${elapsed} ms`);
+    } catch (reason) {
+      setChatModelCheckResult(
+        `不可用：${reason instanceof Error ? reason.message.slice(0, 160) : '请检查端点、模型名与密钥'}`,
+      );
+    } finally {
+      setChatModelCheckLoading(false);
+    }
+  }
+
+  async function refreshLocalModelAvailability() {
+    if (
+      !window.marginDesktop?.modelStatus ||
+      !window.marginDesktop.glmOcrStatus
+    )
+      return;
+    setLocalModelCheckLoading(true);
+    setLocalModelCheckResult('');
+    try {
+      const [embedding, glm] = await Promise.all([
+        window.marginDesktop.modelStatus(),
+        window.marginDesktop.glmOcrStatus({
+          provider: 'managed',
+          endpoint: '',
+          model: 'ggml-org/GLM-OCR-GGUF',
+          apiKey: '',
+          autoStart: true,
+        }),
+      ]);
+      setModelStatus(embedding);
+      if (settings.glmOcrProvider === 'managed') setGlmOcrStatus(glm);
+      setLocalModelCheckResult(
+        `检测完成：向量模型${embedding.installed ? '已找到' : '未安装'}；GLM-OCR ${glm.modelInstalled ? '已找到' : '未安装'}。目录：${embedding.root}`,
+      );
+      window.marginDesktop.logEvent?.('model-availability-checked', {
+        embeddingInstalled: embedding.installed,
+        glmInstalled: glm.modelInstalled,
+        root: embedding.root,
+      });
+    } catch (reason) {
+      setLocalModelCheckResult(
+        `检测失败：${reason instanceof Error ? reason.message.slice(0, 160) : '无法读取模型目录'}`,
+      );
+    } finally {
+      setLocalModelCheckLoading(false);
     }
   }
 
@@ -2312,10 +2428,18 @@ export default function Home() {
         embeddingProviderRef.current = provider;
         vectorIndexRef.current.clear();
       }
-      const buildKey = `ocr:${settings.ocrMode}:${settings.ocrLanguage}|classifier:2|chunks:1200:180`;
+      const manualOcrRange = Boolean(task.ocrPageFrom && task.ocrPageTo);
+      // Page-range and GLM refinement jobs reuse the same per-page cache. They
+      // change which pages are refreshed, not the index's compatibility.
+      const buildKey = `ocr:${settings.ocrMode}:${settings.ocrLanguage}|classifier:3|chunks:1200:180`;
       let cachedPages = new Map<
         number,
-        { pageNumber: number; text: string; source: 'pdf' | 'ocr' }
+        {
+          pageNumber: number;
+          text: string;
+          source: 'pdf' | 'ocr';
+          layout?: OcrPageLayout;
+        }
       >();
       let completedChunkIds = new Set<string>();
       let resumedChunks = 0;
@@ -2334,7 +2458,12 @@ export default function Home() {
         cachedPages = new Map(
           checkpoint.pages.map((entry) => [
             entry.page,
-            { pageNumber: entry.page, text: entry.text, source: entry.source },
+            {
+              pageNumber: entry.page,
+              text: entry.text,
+              source: entry.source,
+              layout: entry.layout,
+            },
           ]),
         );
         completedChunkIds = new Set(checkpoint.completedChunkIds);
@@ -2385,12 +2514,17 @@ export default function Home() {
       );
       extractionElapsedMs = Date.now() - extractionStartedAt;
 
-      const ocrCandidates = extracted.filter((entry) =>
-        shouldInspectWithOcr(entry.text),
+      const inManualOcrRange = (pageNumber: number) =>
+        !manualOcrRange ||
+        (pageNumber >= task.ocrPageFrom! && pageNumber <= task.ocrPageTo!);
+      const ocrCandidates = extracted.filter(
+        (entry) =>
+          inManualOcrRange(entry.pageNumber) &&
+          (task.forceOcr || shouldInspectWithOcr(entry.text)),
       );
       if (
         ocrCandidates.length > 0 &&
-        settings.ocrMode === 'auto' &&
+        (settings.ocrMode === 'auto' || task.forceOcr) &&
         window.marginDesktop?.ocrRecognize
       ) {
         enterStage('ocr', `正在分析 ${ocrCandidates.length} 个疑似扫描页`, 15);
@@ -2449,28 +2583,58 @@ export default function Home() {
                         image.bytes,
                         settings.ocrLanguage,
                         pageNumber,
+                        image.pixelWidth,
+                        image.pixelHeight,
                       );
-                      if (!result.text && !candidate.text)
+                      let recognizedText = result.text;
+                      if (task.glmRefine && recognizedText) {
+                        updateOcrMessage(
+                          ` · GLM-OCR 正在精修第 ${pageNumber} 页`,
+                        );
+                        const refined = window.marginDesktop?.glmOcrRecognize
+                          ? await window.marginDesktop.glmOcrRecognize({
+                              ...glmConfig(),
+                              image: image.bytes,
+                              mimeType: image.mimeType,
+                              task: 'formula',
+                            })
+                          : await recognizeWithGlmOcr(
+                              {
+                                endpoint: settings.glmOcrEndpoint,
+                                model: settings.glmOcrModel,
+                                apiKey: settings.glmOcrApiKey,
+                              },
+                              image.bytes,
+                              image.mimeType,
+                              'formula',
+                            );
+                        recognizedText = `${recognizedText}\n\n[GLM-OCR 公式精修]\n${refined.text}`;
+                      }
+                      if (!recognizedText && !candidate.text)
                         throw new Error('OCR 未识别出文本');
                       if (
-                        result.text &&
-                        (result.text.length > candidate.text.length ||
+                        recognizedText &&
+                        (task.forceOcr ||
+                          task.glmRefine ||
+                          recognizedText.length > candidate.text.length ||
                           !candidate.text)
                       ) {
-                        candidate.text = result.text;
+                        candidate.text = recognizedText;
                         candidate.source = 'ocr';
+                        candidate.layout = result.layout;
                         ocrPages += 1;
                         if (isActiveBook()) {
-                          pageTextsRef.current.set(pageNumber, result.text);
-                          if (pageNumber === page) setPageText(result.text);
+                          pageTextsRef.current.set(pageNumber, recognizedText);
+                          if (pageNumber === page) setPageText(recognizedText);
                         }
                         await window.marginDesktop?.libraryIndexSavePages?.(
                           targetBookId,
                           [
                             {
                               page: pageNumber,
-                              text: result.text,
+                              text: recognizedText,
                               source: 'ocr',
+                              layout: result.layout,
                             },
                           ],
                         );
@@ -2540,6 +2704,10 @@ export default function Home() {
         ocrElapsedMs,
         textConcurrency: concurrency.text,
         ocrConcurrency: concurrency.ocr,
+        ocrPageFrom: task.ocrPageFrom,
+        ocrPageTo: task.ocrPageTo,
+        forcedOcr: task.forceOcr,
+        glmRefine: task.glmRefine,
       });
 
       enterStage('embedding', '正在生成向量', 46);
@@ -2767,6 +2935,94 @@ export default function Home() {
       return;
     }
     enqueueIndexBooks([book], false);
+  }
+
+  function enqueueOcrRange() {
+    const book = library.find((entry) => entry.id === activeBookIdRef.current);
+    if (!book || !pdf) {
+      setOcrToolNotice('请先从本地书架打开一本 PDF。');
+      return;
+    }
+    const pageFrom = Number(ocrPageFrom);
+    const pageTo = Number(ocrPageTo);
+    if (
+      !Number.isInteger(pageFrom) ||
+      !Number.isInteger(pageTo) ||
+      pageFrom <= 0 ||
+      pageTo < pageFrom ||
+      pageTo > pdf.numPages
+    ) {
+      setOcrToolNotice(`请输入 1–${pdf.numPages} 内的有效页码范围。`);
+      return;
+    }
+    if (ocrGlmRefine && pageTo - pageFrom + 1 > 12) {
+      setOcrToolNotice('公式批量精修一次最多处理 12 页，请缩小页码范围。');
+      return;
+    }
+    if (
+      indexTasksRef.current.some(
+        (task) =>
+          task.bookId === book.id &&
+          ['queued', 'running', 'pausing'].includes(task.status),
+      )
+    ) {
+      setOcrToolNotice('这本书已有任务正在排队或运行，请完成或取消后再试。');
+      return;
+    }
+    mutateIndexTasks((current) =>
+      queueBooks(current, [book]).map((task) =>
+        task.bookId === book.id && task.status === 'queued'
+          ? {
+              ...task,
+              ocrPageFrom: pageFrom,
+              ocrPageTo: pageTo,
+              forceOcr: ocrForceRange,
+              glmRefine: ocrGlmRefine,
+              message: `已加入 OCR 队列 · 第 ${pageFrom}–${pageTo} 页${ocrGlmRefine ? ' · GLM-OCR 公式精修' : ''}`,
+            }
+          : task,
+      ),
+    );
+    setOcrToolNotice('');
+    setOcrToolsOpen(false);
+    setTaskCenterOpen(true);
+    window.queueMicrotask(() => void processIndexQueue());
+  }
+
+  async function exportSearchablePdf() {
+    const book = library.find((entry) => entry.id === activeBookIdRef.current);
+    if (!book || !window.marginDesktop?.libraryExportSearchablePdf) {
+      setOcrToolNotice('请先打开已完成 OCR 索引的本地书籍。');
+      return;
+    }
+    const pageFrom = Number(ocrPageFrom);
+    const pageTo = Number(ocrPageTo);
+    if (!Number.isInteger(pageFrom) || !Number.isInteger(pageTo)) {
+      setOcrToolNotice('请输入有效的导出页码范围。');
+      return;
+    }
+    setOcrExporting(true);
+    setOcrToolNotice('');
+    try {
+      const result = await window.marginDesktop.libraryExportSearchablePdf(
+        book.id,
+        { pageFrom, pageTo },
+      );
+      if (result.exported)
+        setOcrToolNotice(
+          `已导出 ${result.pages} 个 OCR 页面文字层：${result.path}${
+            result.limitedCharset
+              ? '（当前系统缺少中文字体，中文文字层已跳过）'
+              : ''
+          }`,
+        );
+    } catch (reason) {
+      setOcrToolNotice(
+        `导出失败：${reason instanceof Error ? reason.message.slice(0, 180) : '未知错误'}`,
+      );
+    } finally {
+      setOcrExporting(false);
+    }
   }
 
   function pauseIndexTask(task: IndexTask) {
@@ -3004,9 +3260,9 @@ export default function Home() {
       regionActionBusy
     )
       return;
-    if (!settings.apiKey.trim()) {
+    if (!settings.endpoint.trim() || !settings.model.trim()) {
       setError(
-        '请先在模型设置中填入聊天模型 API Key，识别结果需要由聊天模型继续解释或整理。',
+        '请先在模型设置中填写聊天模型端点与模型名称，识别结果需要由聊天模型继续解释或整理。',
       );
       return;
     }
@@ -3092,8 +3348,8 @@ export default function Home() {
       (pack) => pack.id === activeKnowledgePackId,
     );
     if (!prompt || (!pdf && !knowledgePack) || asking) return false;
-    if (!settings.apiKey.trim()) {
-      setError('请先在模型设置中填入 API Key。');
+    if (!settings.endpoint.trim() || !settings.model.trim()) {
+      setError('请先在模型设置中填写端点地址与模型名称。');
       return false;
     }
     const askedAt = new Date().toISOString();
@@ -3238,7 +3494,9 @@ export default function Home() {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${settings.apiKey}`,
+            ...(settings.apiKey.trim()
+              ? { Authorization: `Bearer ${settings.apiKey.trim()}` }
+              : {}),
           },
           body: JSON.stringify({
             model: settings.model,
@@ -3392,9 +3650,7 @@ export default function Home() {
           title={`Margin${appVersion ? ` v${appVersion}` : ''}`}
         >
           <FileText />
-          <span className="sr-only">
-            Margin{appVersion ? ` v${appVersion}` : ''}
-          </span>
+          <span>{appVersion ? `v${appVersion}` : 'Margin'}</span>
         </div>
         <nav className="sidebar-modules" aria-label="功能模块">
           <Dialog open={libraryOpen} onOpenChange={setLibraryOpen}>
@@ -3913,6 +4169,12 @@ export default function Home() {
                       </div>
                       <p>{task.message}</p>
                       <div className="task-metrics">
+                        {task.ocrPageFrom && task.ocrPageTo && (
+                          <span>
+                            指定 OCR {task.ocrPageFrom}–{task.ocrPageTo} 页
+                          </span>
+                        )}
+                        {task.glmRefine && <span>GLM 公式精修</span>}
                         <span>
                           {task.completedPages} / {task.pageCount || '?'} 页
                         </span>
@@ -3954,6 +4216,115 @@ export default function Home() {
                   ))
                 )}
               </div>
+            </DialogContent>
+          </Dialog>
+          <Dialog
+            open={ocrToolsOpen}
+            onOpenChange={(open) => {
+              setOcrToolsOpen(open);
+              if (open) {
+                setOcrPageFrom(String(page || 1));
+                setOcrPageTo(String(page || 1));
+                setOcrToolNotice('');
+              }
+            }}
+          >
+            <DialogTrigger
+              render={
+                <button
+                  className="sidebar-module-button"
+                  aria-label="OCR 工具"
+                  title="OCR 版面识别、公式精修与文字层导出"
+                />
+              }
+            >
+              <ScanSearch />
+              <span>OCR</span>
+            </DialogTrigger>
+            <DialogContent className="ocr-tools-dialog">
+              <DialogHeader>
+                <DialogTitle>OCR 2.0 工具</DialogTitle>
+                <DialogDescription>
+                  指定页码进行版面识别，可选 GLM-OCR 公式精修；原 PDF
+                  不会被修改。
+                </DialogDescription>
+              </DialogHeader>
+              <div className="ocr-tool-book">
+                <FileText />
+                <div>
+                  <strong>{fileName || '尚未打开本地书籍'}</strong>
+                  <small>
+                    {pdf
+                      ? `${pageCount} 页 · 当前第 ${page} 页`
+                      : '请先从书架打开 PDF'}
+                  </small>
+                </div>
+              </div>
+              <div className="ocr-tool-fields">
+                <Label htmlFor="ocr-page-from">页码范围</Label>
+                <div className="ocr-range-inputs">
+                  <Input
+                    id="ocr-page-from"
+                    type="number"
+                    min={1}
+                    max={pageCount || undefined}
+                    value={ocrPageFrom}
+                    onChange={(event) => setOcrPageFrom(event.target.value)}
+                  />
+                  <span>至</span>
+                  <Input
+                    id="ocr-page-to"
+                    type="number"
+                    min={1}
+                    max={pageCount || undefined}
+                    value={ocrPageTo}
+                    onChange={(event) => setOcrPageTo(event.target.value)}
+                  />
+                </div>
+                <Label htmlFor="ocr-force-range">识别策略</Label>
+                <label className="checkbox-field">
+                  <input
+                    id="ocr-force-range"
+                    type="checkbox"
+                    checked={ocrForceRange}
+                    onChange={(event) => setOcrForceRange(event.target.checked)}
+                  />
+                  强制重新识别范围内页面（包括已有文本页）
+                </label>
+                <Label htmlFor="ocr-glm-refine">公式精修</Label>
+                <label className="checkbox-field">
+                  <input
+                    id="ocr-glm-refine"
+                    type="checkbox"
+                    checked={ocrGlmRefine}
+                    disabled={settings.glmOcrMode !== 'auto'}
+                    onChange={(event) => setOcrGlmRefine(event.target.checked)}
+                  />
+                  使用 GLM-OCR 批量还原公式结构（一次最多 12 页）
+                </label>
+              </div>
+              <p className="ocr-tool-hint">
+                Tesseract
+                会保存文本行坐标用于版面分析和可搜索文字层；重复建立相同范围的索引会复用
+                SQLite 检查点。
+              </p>
+              {ocrToolNotice && (
+                <p className="ocr-tool-notice">{ocrToolNotice}</p>
+              )}
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  onClick={() => void exportSearchablePdf()}
+                  disabled={!activeBookId || ocrExporting}
+                >
+                  <Download />
+                  {ocrExporting ? '正在导出…' : '导出可搜索 PDF'}
+                </Button>
+                <Button onClick={enqueueOcrRange} disabled={!activeBookId}>
+                  <ScanSearch />
+                  开始 OCR
+                </Button>
+              </DialogFooter>
             </DialogContent>
           </Dialog>
           <Dialog open={workspaceOpen} onOpenChange={setWorkspaceOpen}>
@@ -4069,7 +4440,7 @@ export default function Home() {
           </div>
         </nav>
         <div className="sidebar-bottom">
-          <Dialog>
+          <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
             <DialogTrigger
               render={
                 <button
@@ -4090,6 +4461,28 @@ export default function Home() {
                   端点。配置仅保存在本机浏览器。
                 </DialogDescription>
               </DialogHeader>
+              <div className="local-model-check">
+                <div>
+                  <strong>本地模型自动关联</strong>
+                  <small>
+                    固定检查 Margin 数据目录，便携版和安装版共用已下载模型。
+                  </small>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void refreshLocalModelAvailability()}
+                  disabled={localModelCheckLoading}
+                >
+                  <ScanSearch />
+                  {localModelCheckLoading ? '检测中…' : '重新检测'}
+                </Button>
+              </div>
+              {localModelCheckResult && (
+                <p className="local-model-check-result">
+                  {localModelCheckResult}
+                </p>
+              )}
               <div className="settings-fields">
                 <Label htmlFor="endpoint">端点地址</Label>
                 <Input
@@ -4108,46 +4501,63 @@ export default function Home() {
                     <Input
                       className="flex-1 min-w-0"
                       id="model"
+                      list="chat-model-options"
                       value={settings.model}
-                      onChange={(e) =>
-                        setSettings({ ...settings, model: e.target.value })
-                      }
+                      onChange={(e) => {
+                        setSettings({ ...settings, model: e.target.value });
+                        setChatModelCheckResult('');
+                      }}
                       placeholder="gpt-5-mini"
                     />
+                    <datalist id="chat-model-options">
+                      {chatModelList.map((id) => (
+                        <option key={id} value={id}>
+                          {id}
+                        </option>
+                      ))}
+                    </datalist>
                     <Button
                       size="sm"
                       variant="outline"
                       onClick={() => void fetchChatModelList()}
                       disabled={
-                        !settings.endpoint.trim() ||
-                        !settings.apiKey.trim() ||
-                        chatModelListLoading
+                        !settings.endpoint.trim() || chatModelListLoading
                       }
                     >
-                      {chatModelListLoading ? '获取中…' : '自动获取模型列表'}
+                      {chatModelListLoading ? '获取中…' : '获取列表'}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void testChatModelAvailability()}
+                      disabled={
+                        !settings.endpoint.trim() ||
+                        !settings.model.trim() ||
+                        chatModelCheckLoading
+                      }
+                    >
+                      {chatModelCheckLoading ? '检测中…' : '检测可用性'}
                     </Button>
                   </div>
                   {chatModelListError && (
                     <p className="field-error">{chatModelListError}</p>
                   )}
                   {chatModelList.length > 0 && (
-                    <NativeSelect
-                      id="chat-model-list"
-                      className="w-full"
-                      value={settings.model}
-                      onChange={(e) =>
-                        setSettings({ ...settings, model: e.target.value })
+                    <p className="field-success">
+                      已获取 {chatModelList.length}{' '}
+                      个模型；在同一输入框中输入或选择。
+                    </p>
+                  )}
+                  {chatModelCheckResult && (
+                    <p
+                      className={
+                        chatModelCheckResult.startsWith('可用')
+                          ? 'field-success'
+                          : 'field-error'
                       }
                     >
-                      <NativeSelectOption value="">
-                        从列表选择模型…
-                      </NativeSelectOption>
-                      {chatModelList.map((id) => (
-                        <NativeSelectOption key={id} value={id}>
-                          {id}
-                        </NativeSelectOption>
-                      ))}
-                    </NativeSelect>
+                      {chatModelCheckResult}
+                    </p>
                   )}
                 </div>
                 <Label htmlFor="api-key">API Key</Label>

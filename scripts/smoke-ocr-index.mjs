@@ -1,22 +1,42 @@
 import { rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
-const executable = process.env.MARGIN_PACKAGED_APP || path.resolve('release', 'win-unpacked', 'Margin.exe');
+const executable =
+  process.env.MARGIN_PACKAGED_APP ||
+  path.resolve('release', 'win-unpacked', 'Margin.exe');
 const port = 9666;
 const root = path.resolve('tmp', `smoke-ocr-${Date.now()}`);
-const child = spawn(executable, ['--disable-gpu', `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(root, 'profile')}`], {
-  stdio: 'ignore',
-  env: { ...process.env, MARGIN_DATA_ROOT: path.join(root, 'data'), MARGIN_LIBRARY_ROOT: path.join(root, 'library') },
-});
+const child = spawn(
+  executable,
+  [
+    '--disable-gpu',
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${path.join(root, 'profile')}`,
+  ],
+  {
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      MARGIN_DATA_ROOT: path.join(root, 'data'),
+      MARGIN_LIBRARY_ROOT: path.join(root, 'library'),
+    },
+  },
+);
 
-const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const delay = (milliseconds) =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 async function retry(operation, attempts = 180, interval = 500) {
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try { return await operation(); }
-    catch (error) { lastError = error; await delay(interval); }
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      await delay(interval);
+    }
   }
   throw lastError;
 }
@@ -26,20 +46,71 @@ function scannedPdf(jpeg, width, height) {
   const offsets = [0];
   const object = (number, body) => {
     offsets[number] = parts.reduce((sum, part) => sum + part.length, 0);
-    parts.push(Buffer.from(`${number} 0 obj\n`, 'ascii'), body, Buffer.from('\nendobj\n', 'ascii'));
+    parts.push(
+      Buffer.from(`${number} 0 obj\n`, 'ascii'),
+      body,
+      Buffer.from('\nendobj\n', 'ascii'),
+    );
   };
   object(1, Buffer.from('<< /Type /Catalog /Pages 2 0 R >>', 'ascii'));
-  object(2, Buffer.from('<< /Type /Pages /Kids [3 0 R 6 0 R 7 0 R] /Count 3 >>', 'ascii'));
-  object(3, Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Image0 5 0 R >> >> /Contents 4 0 R >>', 'ascii'));
+  object(
+    2,
+    Buffer.from(
+      '<< /Type /Pages /Kids [3 0 R 6 0 R 7 0 R] /Count 3 >>',
+      'ascii',
+    ),
+  );
+  object(
+    3,
+    Buffer.from(
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Image0 5 0 R >> >> /Contents 4 0 R >>',
+      'ascii',
+    ),
+  );
   const content = Buffer.from('q 612 0 0 792 0 0 cm /Image0 Do Q', 'ascii');
-  object(4, Buffer.concat([Buffer.from(`<< /Length ${content.length} >>\nstream\n`, 'ascii'), content, Buffer.from('\nendstream', 'ascii')]));
-  object(5, Buffer.concat([Buffer.from(`<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`, 'ascii'), jpeg, Buffer.from('\nendstream', 'ascii')]));
-  object(6, Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Image0 5 0 R >> >> /Contents 4 0 R >>', 'ascii'));
-  object(7, Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Image0 5 0 R >> >> /Contents 4 0 R >>', 'ascii'));
+  object(
+    4,
+    Buffer.concat([
+      Buffer.from(`<< /Length ${content.length} >>\nstream\n`, 'ascii'),
+      content,
+      Buffer.from('\nendstream', 'ascii'),
+    ]),
+  );
+  object(
+    5,
+    Buffer.concat([
+      Buffer.from(
+        `<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`,
+        'ascii',
+      ),
+      jpeg,
+      Buffer.from('\nendstream', 'ascii'),
+    ]),
+  );
+  object(
+    6,
+    Buffer.from(
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Image0 5 0 R >> >> /Contents 4 0 R >>',
+      'ascii',
+    ),
+  );
+  object(
+    7,
+    Buffer.from(
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Image0 5 0 R >> >> /Contents 4 0 R >>',
+      'ascii',
+    ),
+  );
   const xrefOffset = parts.reduce((sum, part) => sum + part.length, 0);
   const xref = [`xref\n0 8\n`, '0000000000 65535 f \n'];
-  for (let index = 1; index <= 7; index += 1) xref.push(`${String(offsets[index]).padStart(10, '0')} 00000 n \n`);
-  parts.push(Buffer.from(`${xref.join('')}trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`, 'ascii'));
+  for (let index = 1; index <= 7; index += 1)
+    xref.push(`${String(offsets[index]).padStart(10, '0')} 00000 n \n`);
+  parts.push(
+    Buffer.from(
+      `${xref.join('')}trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`,
+      'ascii',
+    ),
+  );
   return Buffer.concat(parts);
 }
 
@@ -47,7 +118,9 @@ const target = await retry(async () => {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`);
   if (!response.ok) throw new Error(`CDP discovery failed: ${response.status}`);
   const payload = await response.json();
-  const ready = Array.isArray(payload) ? payload.find((candidate) => candidate.url?.startsWith('margin://')) : null;
+  const ready = Array.isArray(payload)
+    ? payload.find((candidate) => candidate.url?.startsWith('margin://'))
+    : null;
   if (!ready) throw new Error('Margin renderer is not ready');
   return ready;
 });
@@ -78,23 +151,49 @@ function command(method, params = {}) {
 }
 
 async function evaluate(expression, awaitPromise = false) {
-  const result = await command('Runtime.evaluate', { expression, awaitPromise, returnByValue: true });
-  if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || 'Renderer evaluation failed');
+  const result = await command('Runtime.evaluate', {
+    expression,
+    awaitPromise,
+    returnByValue: true,
+  });
+  if (result.exceptionDetails)
+    throw new Error(
+      result.exceptionDetails.exception?.description ||
+        result.exceptionDetails.text ||
+        'Renderer evaluation failed',
+    );
   return result.result?.value;
 }
 
 try {
   await command('Runtime.enable');
   await command('Page.enable');
-  await command('Emulation.setDeviceMetricsOverride', { width: 1200, height: 1600, deviceScaleFactor: 1, mobile: false });
-  await evaluate(`document.body.innerHTML = '<main style="padding:140px;background:white;color:black;font-family:Arial"><h1 style="font-size:92px">ORCHID ALPHA</h1><p style="font-size:52px;line-height:1.5">Scanned PDF OCR verification page 2026</p></main>'`);
-  const screenshot = await command('Page.captureScreenshot', { format: 'jpeg', quality: 95, captureBeyondViewport: false, fromSurface: true });
+  await command('Emulation.setDeviceMetricsOverride', {
+    width: 1200,
+    height: 1600,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
+  await evaluate(
+    `document.body.innerHTML = '<main style="padding:140px;background:white;color:black;font-family:Arial"><h1 style="font-size:92px">ORCHID ALPHA</h1><p style="font-size:52px;line-height:1.5">Scanned PDF OCR verification page 2026</p></main>'`,
+  );
+  const screenshot = await command('Page.captureScreenshot', {
+    format: 'jpeg',
+    quality: 95,
+    captureBeyondViewport: false,
+    fromSurface: true,
+  });
   const pdf = scannedPdf(Buffer.from(screenshot.data, 'base64'), 1200, 1600);
 
   await command('Page.reload');
   await delay(1_000);
   await retry(async () => {
-    if (!await evaluate(`Boolean(document.querySelector('[aria-label="模型设置"]'))`)) throw new Error('Margin did not reload');
+    if (
+      !(await evaluate(
+        `Boolean(document.querySelector('[aria-label="模型设置"]'))`,
+      ))
+    )
+      throw new Error('Margin did not reload');
     return true;
   });
   await evaluate(`(() => {
@@ -110,7 +209,10 @@ try {
   })()`);
   await delay(1_000);
   await retry(async () => {
-    if (!await evaluate(`Boolean(document.querySelector('input[type="file"]'))`)) throw new Error('Margin settings did not reload');
+    if (
+      !(await evaluate(`Boolean(document.querySelector('input[type="file"]'))`))
+    )
+      throw new Error('Margin settings did not reload');
     return true;
   });
   await evaluate(`(() => {
@@ -134,33 +236,122 @@ try {
     input.dispatchEvent(new Event('change', { bubbles: true }));
   })()`);
   await retry(async () => {
-    const state = await evaluate(`({ page: document.querySelector('.page-scroll-indicator')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`);
+    const state = await evaluate(
+      `({ page: document.querySelector('.page-scroll-indicator')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`,
+    );
     if (state.error) throw new Error(state.error);
-    if (!state.page.includes('1 / 3')) throw new Error('Scanned PDF has not opened');
+    if (!state.page.includes('1 / 3'))
+      throw new Error('Scanned PDF has not opened');
     return state;
   });
-  await evaluate(`[...document.querySelectorAll('.index-strip button')].find((button) => button.textContent?.includes('建立索引'))?.click()`);
-  const indexed = await retry(async () => {
-    const state = await evaluate(`({ label: document.querySelector('.index-strip strong')?.textContent || '', message: document.querySelector('.index-strip span')?.textContent || '', warning: document.querySelector('.scan-warning')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`);
-    if (state.error) throw new Error(state.error);
-    if (!state.label.includes('全文索引已就绪') || !state.warning.includes('OCR 已识别')) throw new Error(`OCR index is not ready: ${JSON.stringify(state)}`);
-    return state;
-  }, 360, 500);
-  const result = await evaluate(`(async () => {
+  await evaluate(`document.querySelector('[aria-label="OCR 工具"]')?.click()`);
+  await retry(async () => {
+    if (
+      !(await evaluate(`Boolean(document.querySelector('.ocr-tools-dialog'))`))
+    )
+      throw new Error('OCR 2.0 workbench did not open');
+    return true;
+  });
+  await evaluate(`(() => {
+    const input = document.querySelector('#ocr-page-to');
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, '3');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await evaluate(
+    `[...document.querySelectorAll('button')].find((button) => button.textContent?.includes('开始 OCR'))?.click()`,
+  );
+  const indexed = await retry(
+    async () => {
+      const state = await evaluate(
+        `({ label: document.querySelector('.index-strip strong')?.textContent || '', message: document.querySelector('.index-strip span')?.textContent || '', warning: document.querySelector('.scan-warning')?.textContent || '', error: document.querySelector('.error-message')?.textContent || '' })`,
+      );
+      if (state.error) throw new Error(state.error);
+      if (
+        !state.label.includes('全文索引已就绪') ||
+        !state.warning.includes('OCR 已识别')
+      )
+        throw new Error(`OCR index is not ready: ${JSON.stringify(state)}`);
+      return state;
+    },
+    360,
+    500,
+  );
+  const result = await evaluate(
+    `(async () => {
     const book = (await window.marginDesktop.libraryList())[0];
     const providerId = 'remote:https://fixture.local/v1:fixture-embedding';
     const info = await window.marginDesktop.libraryIndexOpen(book.id, providerId);
     const matches = await window.marginDesktop.libraryIndexSearch(book.id, providerId, new Float32Array([1, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125]), 1);
-    return { info, match: matches[0] };
-  })()`, true);
-  if (result.info?.format !== 'sqlite-f32' || result.info.chunks < 3 || !/ORCHID/i.test(result.match?.text || '')) throw new Error(`Concurrent OCR text was not stored in SQLite: ${JSON.stringify(result)}`);
-  const taskState = await evaluate(`({ tasks: JSON.parse(localStorage.getItem('margin-index-tasks-v1') || '[]'), hasTaskCenter: [...document.querySelectorAll('.sidebar-module-button')].some((button) => button.textContent?.includes('任务')) })`);
-  if (!taskState.hasTaskCenter || taskState.tasks.length !== 1 || taskState.tasks[0].status !== 'completed' || taskState.tasks[0].progress !== 100 || !taskState.tasks[0].timings?.ocr || !taskState.tasks[0].timings?.embedding) throw new Error(`Background task state was not persisted: ${JSON.stringify(taskState)}`);
-  console.log(JSON.stringify({ indexed, task: { status: taskState.tasks[0].status, progress: taskState.tasks[0].progress, timings: taskState.tasks[0].timings }, info: result.info, match: { page: result.match.page, text: result.match.text.slice(0, 120) } }));
+    return { bookId: book.id, info, match: matches[0] };
+  })()`,
+    true,
+  );
+  if (
+    result.info?.format !== 'sqlite-f32' ||
+    result.info.chunks < 3 ||
+    !/ORCHID/i.test(result.match?.text || '')
+  )
+    throw new Error(
+      `Concurrent OCR text was not stored in SQLite: ${JSON.stringify(result)}`,
+    );
+  const database = new DatabaseSync(
+    path.join(root, 'library', result.bookId, 'index.sqlite'),
+    { readOnly: true },
+  );
+  const layoutRows = database
+    .prepare('SELECT layout_json FROM pages WHERE source = ?')
+    .all('ocr');
+  database.close();
+  if (
+    layoutRows.length !== 3 ||
+    layoutRows.some(
+      (row) => !JSON.parse(row.layout_json || '{}').regions?.length,
+    )
+  )
+    throw new Error(
+      'OCR layout coordinates were not persisted for every scanned page',
+    );
+  const taskState = await evaluate(
+    `({ tasks: JSON.parse(localStorage.getItem('margin-index-tasks-v1') || '[]'), hasTaskCenter: [...document.querySelectorAll('.sidebar-module-button')].some((button) => button.textContent?.includes('任务')) })`,
+  );
+  if (
+    !taskState.hasTaskCenter ||
+    taskState.tasks.length !== 1 ||
+    taskState.tasks[0].status !== 'completed' ||
+    taskState.tasks[0].progress !== 100 ||
+    taskState.tasks[0].ocrPageFrom !== 1 ||
+    taskState.tasks[0].ocrPageTo !== 3 ||
+    taskState.tasks[0].forceOcr !== true ||
+    !taskState.tasks[0].timings?.ocr ||
+    !taskState.tasks[0].timings?.embedding
+  )
+    throw new Error(
+      `Background OCR range task state was not persisted: ${JSON.stringify(taskState)}`,
+    );
+  console.log(
+    JSON.stringify({
+      indexed,
+      layoutPages: layoutRows.length,
+      task: {
+        status: taskState.tasks[0].status,
+        progress: taskState.tasks[0].progress,
+        timings: taskState.tasks[0].timings,
+      },
+      info: result.info,
+      match: { page: result.match.page, text: result.match.text.slice(0, 120) },
+    }),
+  );
 } finally {
-  await Promise.race([command('Browser.close').catch(() => undefined), delay(2_000)]);
+  await Promise.race([
+    command('Browser.close').catch(() => undefined),
+    delay(2_000),
+  ]);
   socket.close();
   if (child.exitCode === null) child.kill();
-  await Promise.race([new Promise((resolve) => child.once('exit', resolve)), delay(5_000)]);
+  await Promise.race([
+    new Promise((resolve) => child.once('exit', resolve)),
+    delay(5_000),
+  ]);
   await rm(root, { recursive: true, force: true });
 }

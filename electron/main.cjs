@@ -37,6 +37,7 @@ const {
   getIndexCheckpoint,
   openIndex,
   pauseIndexBuild,
+  readIndexPages,
   saveIndexPages,
   searchIndex,
   startIndexBuild,
@@ -58,6 +59,7 @@ const {
   searchHistory,
   updateKnowledgePack,
 } = require('./workspace-store.cjs');
+const { exportSearchablePdfFile } = require('./searchable-pdf.cjs');
 
 const isDevelopment = !app.isPackaged;
 const embeddingModel = 'Qwen/Qwen3-Embedding-4B';
@@ -106,6 +108,15 @@ const glmManagedModelName = 'GLM-OCR-Q8_0.gguf';
 const glmManagedProjectorName = 'mmproj-GLM-OCR-Q8_0.gguf';
 
 app.setName('Margin');
+// Keep the data directory stable across development builds, portable builds and
+// installed releases. Electron otherwise derives userData from package metadata,
+// which previously left some users with an empty `margin-pdf-reader` profile
+// while their downloaded models remained in the `Margin` profile.
+if (
+  !process.env.MARGIN_DATA_ROOT &&
+  !process.argv.some((argument) => argument.startsWith('--user-data-dir='))
+)
+  app.setPath('userData', path.join(app.getPath('appData'), 'Margin'));
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -1713,8 +1724,9 @@ ipcMain.handle('model:pause', () => {
   return { paused: Boolean(modelDownloadController) };
 });
 ipcMain.handle('model:open-folder', async () => {
-  await mkdir(dataRoot(), { recursive: true });
-  const result = await shell.openPath(dataRoot());
+  const directory = path.dirname(modelFile());
+  await mkdir(directory, { recursive: true });
+  const result = await shell.openPath(directory);
   if (result) throw new Error(result);
   return { opened: true };
 });
@@ -1806,6 +1818,8 @@ ipcMain.handle('ocr:recognize', async (event, payload) => {
   const language = payload?.language || 'chi_sim+eng';
   const page =
     Number.isInteger(payload?.page) && payload.page > 0 ? payload.page : 0;
+  const pixelWidth = Number(payload?.pixelWidth || 0);
+  const pixelHeight = Number(payload?.pixelHeight || 0);
   if (
     !(image instanceof Uint8Array) ||
     image.byteLength < 16 ||
@@ -1834,10 +1848,51 @@ ipcMain.handle('ocr:recognize', async (event, payload) => {
       const result = await worker.recognize(
         Buffer.from(image.buffer, image.byteOffset, image.byteLength),
         { rotateAuto: true },
+        { text: true, blocks: true },
       );
-      const text = String(result?.data?.text || '')
-        .replace(/\s+/g, ' ')
+      const regions = (result?.data?.blocks || [])
+        .flatMap((block) => {
+          const lines = (block.paragraphs || []).flatMap(
+            (paragraph) => paragraph.lines || [],
+          );
+          const type = String(block.blocktype || '').toLowerCase();
+          const kind = type.includes('table')
+            ? 'table'
+            : type.includes('image')
+              ? 'image'
+              : type.includes('vertical')
+                ? 'vertical-text'
+                : 'text';
+          return lines.map((line) => ({
+            kind,
+            text: String(line.text || '')
+              .replace(/\s+/g, ' ')
+              .trim(),
+            confidence: Number(line.confidence || 0),
+            bbox: {
+              x0: Number(line.bbox?.x0 || 0),
+              y0: Number(line.bbox?.y0 || 0),
+              x1: Number(line.bbox?.x1 || 0),
+              y1: Number(line.bbox?.y1 || 0),
+            },
+          }));
+        })
+        .filter(
+          (line) =>
+            line.text &&
+            line.bbox.x1 > line.bbox.x0 &&
+            line.bbox.y1 > line.bbox.y0,
+        )
+        .slice(0, 10_000);
+      const structuredText = regions
+        .map((line) => line.text)
+        .join('\n')
         .trim();
+      const text = structuredText || String(result?.data?.text || '').trim();
+      const layout =
+        pixelWidth > 0 && pixelHeight > 0
+          ? { width: pixelWidth, height: pixelHeight, regions }
+          : undefined;
       await logEvent('info', 'ocr.succeeded', {
         language,
         page,
@@ -1846,7 +1901,11 @@ ipcMain.handle('ocr:recognize', async (event, payload) => {
         confidence: result?.data?.confidence,
         elapsedMs: Date.now() - startedAt,
       });
-      return { text, confidence: Number(result?.data?.confidence || 0) };
+      return {
+        text,
+        confidence: Number(result?.data?.confidence || 0),
+        layout,
+      };
     } catch (error) {
       await logEvent('error', 'ocr.failed', {
         language,
@@ -2209,6 +2268,63 @@ ipcMain.handle(
   },
 );
 
+ipcMain.handle(
+  'library:export-searchable-pdf',
+  async (_event, id, range = {}) => {
+    const bookId = assertBookId(id);
+    const catalog = await readCatalog();
+    const book = catalog.find((entry) => entry.id === bookId);
+    if (!book) throw new Error('Book not found');
+    const indexedPages = readIndexPages(bookDirectory(bookId));
+    const ocrPages = indexedPages.filter((entry) => entry.source === 'ocr');
+    if (ocrPages.length === 0)
+      throw new Error('当前索引中没有 OCR 页面；请先在 OCR 工具中识别扫描页');
+    const pageFrom = Number.isInteger(range.pageFrom) ? range.pageFrom : 1;
+    const pageTo = Number.isInteger(range.pageTo)
+      ? range.pageTo
+      : Math.max(...ocrPages.map((entry) => entry.page));
+    if (pageFrom <= 0 || pageTo < pageFrom)
+      throw new Error('Invalid searchable PDF page range');
+    const selected = ocrPages.filter(
+      (entry) => entry.page >= pageFrom && entry.page <= pageTo,
+    );
+    if (selected.length === 0)
+      throw new Error('所选范围内没有已完成 OCR 的页面');
+    const safeName = path.parse(book.name).name.replace(/[<>:"/\\|?*]+/g, '-');
+    const result = await dialog.showSaveDialog({
+      title: '导出可搜索 PDF 副本',
+      defaultPath: path.join(
+        app.getPath('documents'),
+        `${safeName || 'Margin-OCR'}-可搜索.pdf`,
+      ),
+      filters: [{ name: 'PDF 文档', extensions: ['pdf'] }],
+    });
+    if (result.canceled || !result.filePath)
+      return { exported: false, pages: 0 };
+    const startedAt = Date.now();
+    const exported = await exportSearchablePdfFile({
+      sourceFile: path.join(bookDirectory(bookId), 'document.pdf'),
+      outputFile: result.filePath,
+      pages: selected,
+      producer: `Margin v${app.getVersion()}`,
+    });
+    await logEvent('info', 'ocr.searchable-pdf-exported', {
+      bookId,
+      pages: exported.pages,
+      pageFrom,
+      pageTo,
+      path: result.filePath,
+      elapsedMs: Date.now() - startedAt,
+    });
+    return {
+      exported: true,
+      path: result.filePath,
+      pages: exported.pages,
+      limitedCharset: exported.limitedCharset,
+    };
+  },
+);
+
 ipcMain.handle('workspace:chat-load', (_event, bookId, limit) =>
   loadChat(dataRoot(), assertWorkspaceContextId(bookId), limit),
 );
@@ -2260,6 +2376,7 @@ function createWindow() {
     minWidth: 1120,
     minHeight: 680,
     backgroundColor: '#eef1f4',
+    title: `Margin v${app.getVersion()}`,
     titleBarStyle: 'hiddenInset',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
