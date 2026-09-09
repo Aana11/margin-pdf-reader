@@ -89,6 +89,18 @@ function readMetadata(database) {
   );
 }
 
+function hasColumn(database, table, column) {
+  return database
+    .prepare(`PRAGMA table_info(${table})`)
+    .all()
+    .some((entry) => entry.name === column);
+}
+
+function ensureLayoutColumn(database) {
+  if (!hasColumn(database, 'pages', 'layout_json'))
+    database.exec('ALTER TABLE pages ADD COLUMN layout_json TEXT');
+}
+
 function startIndexBuild(
   directory,
   providerId,
@@ -111,6 +123,7 @@ function startIndexBuild(
         metadata.providerId === providerId &&
         metadata.buildKey === buildKey
       ) {
+        ensureLayoutColumn(existing);
         const storedDimensions = Number(metadata.dimensions || 0);
         if (storedDimensions !== 0) validateDimensions(storedDimensions);
         const count = Number(
@@ -156,6 +169,7 @@ function startIndexBuild(
       page INTEGER PRIMARY KEY,
       text TEXT NOT NULL,
       source TEXT NOT NULL,
+      layout_json TEXT,
       updated_at TEXT NOT NULL
     );
     CREATE INDEX chunks_page ON chunks(page);
@@ -184,16 +198,23 @@ function startIndexBuild(
         )
         .get();
       if (metadata.buildKey === buildKey && hasPages) {
+        const completedHasLayout = hasColumn(completed, 'pages', 'layout_json');
         const insert = database.prepare(
-          'INSERT INTO pages (page, text, source, updated_at) VALUES (?, ?, ?, ?)',
+          'INSERT INTO pages (page, text, source, layout_json, updated_at) VALUES (?, ?, ?, ?, ?)',
         );
         database.exec('BEGIN IMMEDIATE');
         for (const row of completed
           .prepare(
-            'SELECT page, text, source, updated_at FROM pages ORDER BY page',
+            `SELECT page, text, source, ${completedHasLayout ? 'layout_json' : 'NULL AS layout_json'}, updated_at FROM pages ORDER BY page`,
           )
           .iterate()) {
-          insert.run(row.page, row.text, row.source, row.updated_at);
+          insert.run(
+            row.page,
+            row.text,
+            row.source,
+            row.layout_json,
+            row.updated_at,
+          );
           copiedPages += 1;
         }
         database.exec('COMMIT');
@@ -280,7 +301,7 @@ function saveIndexPages(build, entries) {
   )
     throw new Error('Invalid index page batch');
   const upsert = build.database.prepare(
-    'INSERT OR REPLACE INTO pages (page, text, source, updated_at) VALUES (?, ?, ?, ?)',
+    'INSERT OR REPLACE INTO pages (page, text, source, layout_json, updated_at) VALUES (?, ?, ?, ?, ?)',
   );
   build.database.exec('BEGIN IMMEDIATE');
   try {
@@ -294,10 +315,14 @@ function saveIndexPages(build, entries) {
         !['pdf', 'ocr'].includes(entry.source)
       )
         throw new Error('Invalid index page checkpoint');
+      const layoutJson = entry.layout ? JSON.stringify(entry.layout) : null;
+      if (layoutJson && layoutJson.length > 4_000_000)
+        throw new Error('OCR page layout is too large');
       upsert.run(
         entry.page,
         entry.text,
         entry.source,
+        layoutJson,
         new Date().toISOString(),
       );
     }
@@ -317,13 +342,46 @@ function getIndexCheckpoint(build) {
     dimensions: build.dimensions,
     chunks: build.count,
     pages: build.database
-      .prepare('SELECT page, text, source FROM pages ORDER BY page')
-      .all(),
+      .prepare(
+        'SELECT page, text, source, layout_json FROM pages ORDER BY page',
+      )
+      .all()
+      .map((row) => ({
+        page: row.page,
+        text: row.text,
+        source: row.source,
+        layout: row.layout_json ? JSON.parse(row.layout_json) : undefined,
+      })),
     completedChunkIds: build.database
       .prepare('SELECT id FROM chunks ORDER BY ordinal')
       .all()
       .map((row) => row.id),
   };
+}
+
+function readIndexPages(directory) {
+  const file = path.join(directory, SQLITE_FILE);
+  if (!existsSync(file)) return [];
+  const database = new DatabaseSync(file, { readOnly: true, timeout: 5_000 });
+  try {
+    const metadata = readMetadata(database);
+    if (Number(metadata.version) !== INDEX_VERSION || metadata.complete !== '1')
+      return [];
+    const layoutColumn = hasColumn(database, 'pages', 'layout_json');
+    return database
+      .prepare(
+        `SELECT page, text, source, ${layoutColumn ? 'layout_json' : 'NULL AS layout_json'} FROM pages ORDER BY page`,
+      )
+      .all()
+      .map((row) => ({
+        page: row.page,
+        text: row.text,
+        source: row.source,
+        layout: row.layout_json ? JSON.parse(row.layout_json) : undefined,
+      }));
+  } finally {
+    database.close();
+  }
 }
 
 function finishIndexBuild(build) {
@@ -490,6 +548,7 @@ module.exports = {
   inspectIndex,
   migrateLegacyIndex,
   openIndex,
+  readIndexPages,
   searchIndex,
   saveIndexPages,
   startIndexBuild,

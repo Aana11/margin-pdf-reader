@@ -25,6 +25,7 @@ jobs:
       - run: npm run test:region-reading
       - run: npm run test:index-resume
       - run: npm run test:index-tasks
+      - run: npm run test:searchable-pdf
       - run: npm run test:workspace
       - run: npm run test:knowledge-packs
       - run: npm run desktop:release

@@ -11,6 +11,9 @@ const testEmbedding = process.argv.includes('--embedding');
 const executable =
   process.env.MARGIN_PACKAGED_APP ||
   path.resolve('release', 'win-unpacked', 'Margin.exe');
+const expectedVersion = JSON.parse(
+  await readFile(new URL('../package.json', import.meta.url), 'utf8'),
+).version;
 const port = Number(process.env.MARGIN_CDP_PORT || 9333);
 const libraryRoot = path.resolve('tmp', `smoke-library-${Date.now()}`);
 const dataRoot = testEmbedding
@@ -216,13 +219,14 @@ try {
   const ocrResult = await evaluate(
     `(() => {
     const image = Uint8Array.from(atob('${ocrImageBase64}'), character => character.charCodeAt(0));
-    return window.marginDesktop.ocrRecognize(image, 'chi_sim+eng');
+    return window.marginDesktop.ocrRecognize(image, 'chi_sim+eng', 1, 1420, 900);
   })()`,
     true,
   );
   if (
     !/Margin PDF Reader/i.test(ocrResult?.text || '') ||
-    !/ORCHID[- ]ALPHA/i.test(ocrResult?.text || '')
+    !/ORCHID[- ]ALPHA/i.test(ocrResult?.text || '') ||
+    !ocrResult?.layout?.regions?.length
   )
     throw new Error(
       `Packaged OCR failed: ${ocrResult?.text?.slice(0, 200) || 'no text'}`,
@@ -245,10 +249,23 @@ try {
   const settingsControls = await retry(async () => {
     const state = await evaluate(`({
       hasSystemPrompt: Boolean(document.querySelector('#system-prompt')),
-      promptValue: document.querySelector('#system-prompt')?.value || ''
+      promptValue: document.querySelector('#system-prompt')?.value || '',
+      unifiedModelField: document.querySelector('#model')?.getAttribute('list') === 'chat-model-options',
+      hasAvailabilityCheck: [...document.querySelectorAll('button')].some((button) => button.textContent?.includes('检测可用性')),
+      hasLocalModelRescan: [...document.querySelectorAll('button')].some((button) => button.textContent?.includes('重新检测')),
+      title: document.title
     })`);
-    if (!state.hasSystemPrompt || !state.promptValue.includes('阅读助手'))
-      throw new Error('Custom system prompt control is unavailable');
+    if (
+      !state.hasSystemPrompt ||
+      !state.promptValue.includes('阅读助手') ||
+      !state.unifiedModelField ||
+      !state.hasAvailabilityCheck ||
+      !state.hasLocalModelRescan ||
+      !state.title.includes(expectedVersion)
+    )
+      throw new Error(
+        `Settings controls or versioned title are unavailable: ${JSON.stringify(state)}`,
+      );
     return state;
   });
   await evaluate(`(() => {
@@ -266,7 +283,13 @@ try {
   );
   if (savedPrompt !== '自定义冒烟测试提示词')
     throw new Error('Custom system prompt did not persist');
-  await closeDialog();
+  const settingsClosed = await retry(async () => {
+    const open = await evaluate(
+      `Boolean(document.querySelector('#system-prompt'))`,
+    );
+    if (open) throw new Error('Settings dialog did not close after save');
+    return true;
+  });
 
   const modelStatus = await evaluate(
     `window.marginDesktop.modelStatus()`,
@@ -338,10 +361,18 @@ try {
   const persistedUi = await retry(async () => {
     const state = await evaluate(`({
       hasSidebar: Boolean(document.querySelector('.app-sidebar')),
+      versionLabel: document.querySelector('.sidebar-brand')?.textContent || '',
       hasLibrary: Boolean(document.querySelector('[aria-label="本地书架"]')),
+      hasOcrTools: Boolean(document.querySelector('[aria-label="OCR 工具"]')),
       settingsAtBottom: Boolean(document.querySelector('.sidebar-bottom [aria-label="模型设置"]'))
     })`);
-    if (!state.hasSidebar || !state.hasLibrary || !state.settingsAtBottom)
+    if (
+      !state.hasSidebar ||
+      !state.versionLabel.includes(expectedVersion) ||
+      !state.hasLibrary ||
+      !state.hasOcrTools ||
+      !state.settingsAtBottom
+    )
       throw new Error('Application sidebar did not persist');
     return state;
   });
@@ -553,6 +584,7 @@ try {
         characters: ocrResult.text.length,
       },
       settingsControls,
+      settingsClosed,
       savedPrompt,
       modelStatus,
       embeddingDimensions,

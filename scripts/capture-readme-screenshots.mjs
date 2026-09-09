@@ -327,6 +327,45 @@ try {
   await evaluate(`window.location.reload()`);
   await retry(async () => {
     const ready = await evaluate(
+      `Boolean(document.querySelector('[aria-label="OCR 工具"]'))`,
+    );
+    if (!ready) throw new Error('OCR tools trigger has not restored');
+    return ready;
+  });
+  await delay(500);
+  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
+  await evaluate(
+    `[...document.querySelectorAll('.book-item')].find((item) => item.textContent?.includes('Margin-Reader-Demo'))?.click()`,
+  );
+  await retry(async () => {
+    const ready = await evaluate(
+      `document.querySelector('.page-scroll-indicator')?.textContent?.includes('1 / 2')`,
+    );
+    if (!ready) throw new Error('Demo book has not reopened for OCR capture');
+    return ready;
+  });
+  await evaluate(`document.querySelector('[aria-label="OCR 工具"]')?.click()`);
+  await retry(async () => {
+    const visible = await evaluate(
+      `Boolean(document.querySelector('.ocr-tools-dialog'))`,
+    );
+    if (!visible) throw new Error('OCR tools dialog has not opened');
+    return visible;
+  });
+  await capture('ocr-tools.jpg');
+  await evaluate(
+    `document.querySelector('[role="dialog"][data-open] [data-slot="dialog-close"]')?.click()`,
+  );
+  await retry(async () => {
+    const open = await evaluate(
+      `Boolean(document.querySelector('[role="dialog"][data-open]'))`,
+    );
+    if (open) throw new Error('OCR tools dialog is still closing');
+    return true;
+  });
+  await evaluate(`window.location.reload()`);
+  await retry(async () => {
+    const ready = await evaluate(
       `Boolean(document.querySelector('[aria-label="模型设置"]'))`,
     );
     if (!ready) throw new Error('Settings trigger has not restored');
@@ -341,9 +380,6 @@ try {
     if (!visible) throw new Error('Settings dialog has not opened');
     return visible;
   });
-  await evaluate(
-    `document.querySelector('#glm-ocr-mode')?.scrollIntoView({ block: 'center' })`,
-  );
   await delay(200);
   await capture('model-settings.jpg');
   console.log(

@@ -2,6 +2,24 @@
 
 All notable changes to Margin are documented here.
 
+## [0.3.2] - 2026-09-09
+
+### Added
+
+- OCR 2.0 sidebar workbench with explicit page ranges, forced re-recognition, bounded GLM-OCR formula refinement, and searchable-PDF copy export.
+- Layout-aware Tesseract output: line text, confidence, region type, and bounding boxes are stored with page checkpoints in SQLite and reused across compatible rebuilds.
+- Chat-model availability test plus one combined model-name field that accepts both fetched suggestions and custom names.
+- A local-model rescan action that reports whether Qwen and GLM-OCR were found and shows the exact stable model root.
+- Unit and packaged coverage for OCR layout persistence, Unicode searchable PDF output, versioned titles, the unified model field, model rescanning, and settings auto-close.
+
+### Changed
+
+- Installed and portable builds use the same stable `%APPDATA%\Margin` data root, while explicit test/development profile overrides remain isolated.
+- Window and document titles include the running application version.
+- Saving model settings closes the settings dialog immediately.
+- API keys are optional for local OpenAI-compatible chat endpoints that do not require authentication.
+- The model-folder action opens the actual Qwen model directory instead of the data-root parent.
+
 ## [0.3.1] - 2026-09-09
 
 ### Added

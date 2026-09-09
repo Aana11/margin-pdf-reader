@@ -55,13 +55,28 @@ export type IndexInfo = {
   bytes: number;
   migrated?: boolean;
 };
+export type OcrPageLayout = {
+  width: number;
+  height: number;
+  regions: Array<{
+    kind: 'text' | 'table' | 'image' | 'vertical-text';
+    text: string;
+    confidence: number;
+    bbox: { x0: number; y0: number; x1: number; y1: number };
+  }>;
+};
 export type IndexCheckpoint = {
   started: boolean;
   format: 'sqlite-f32';
   resumed: boolean;
   dimensions: number;
   chunks: number;
-  pages: Array<{ page: number; text: string; source: 'pdf' | 'ocr' }>;
+  pages: Array<{
+    page: number;
+    text: string;
+    source: 'pdf' | 'ocr';
+    layout?: OcrPageLayout;
+  }>;
   completedChunkIds: string[];
 };
 export type ModelInstallStatus = {
@@ -178,7 +193,13 @@ declare global {
         image: Uint8Array,
         language: 'eng' | 'chi_sim+eng' | 'chi_tra+eng',
         page?: number,
-      ) => Promise<{ text: string; confidence: number }>;
+        pixelWidth?: number,
+        pixelHeight?: number,
+      ) => Promise<{
+        text: string;
+        confidence: number;
+        layout?: OcrPageLayout;
+      }>;
       onOcrProgress?: (
         listener: (progress: {
           page: number;
@@ -258,7 +279,12 @@ declare global {
       ) => Promise<IndexCheckpoint>;
       libraryIndexSavePages?: (
         id: string,
-        entries: Array<{ page: number; text: string; source: 'pdf' | 'ocr' }>,
+        entries: Array<{
+          page: number;
+          text: string;
+          source: 'pdf' | 'ocr';
+          layout?: OcrPageLayout;
+        }>,
       ) => Promise<{ pages: number }>;
       libraryIndexAppend?: (
         id: string,
@@ -277,6 +303,15 @@ declare global {
       ) => Promise<
         Array<{ id: string; page: number; text: string; score: number }>
       >;
+      libraryExportSearchablePdf?: (
+        id: string,
+        range?: { pageFrom?: number; pageTo?: number },
+      ) => Promise<{
+        exported: boolean;
+        path?: string;
+        pages: number;
+        limitedCharset?: boolean;
+      }>;
       workspaceChatLoad?: (
         bookId: string,
         limit?: number,
