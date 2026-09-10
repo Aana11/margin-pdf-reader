@@ -114,6 +114,8 @@ import type {
   LibraryEntry,
   ModelInstallStatus,
   OcrPageLayout,
+  ResearchItem,
+  ResearchItemKind,
   WorkspaceHistoryItem,
   WorkspaceNote,
   WorkspaceNoteKind,
@@ -123,6 +125,7 @@ type RegionCitation = { page: number; region: NormalizedRegion };
 type Message = {
   role: 'user' | 'assistant';
   content: string;
+  reasoning?: string;
   page: number;
   createdAt?: string;
   citation?: RegionCitation;
@@ -186,6 +189,8 @@ const DEFAULT_SETTINGS: ModelSettings = {
 const quickPrompts = ['总结本页', '解释核心概念', '精读本页公式/代码'];
 const CHAT_HISTORY_KEY = 'margin-chat-history-v1';
 const WORKSPACE_MIGRATION_KEY = 'margin-workspace-sqlite-v1';
+const LAST_READING_BOOK_KEY = 'margin-last-reading-book-v1';
+const SPLIT_RATIO_KEY = 'margin-reader-split-v1';
 const NOTE_KIND_LABELS: Record<WorkspaceNoteKind, string> = {
   highlight: '高亮',
   note: '批注',
@@ -204,7 +209,14 @@ type AppInfo = {
   runtimeBackend: 'cpu' | 'vulkan';
   ocrWorkers: number;
   embeddingSlots: number;
+  gpuMemoryMiB: number;
 };
+
+function readSplitRatio() {
+  if (typeof window === 'undefined') return 70;
+  const value = Number(localStorage.getItem(SPLIT_RATIO_KEY));
+  return Number.isFinite(value) ? Math.max(38, Math.min(78, value)) : 70;
+}
 
 function readSavedSettings(): ModelSettings {
   if (typeof window === 'undefined') return DEFAULT_SETTINGS;
@@ -793,6 +805,11 @@ export default function Home() {
   const vectorIndexRef = useRef(new MemoryVectorIndex());
   const embeddingProviderRef = useRef<EmbeddingProvider | null>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const restoredReadingRef = useRef(false);
+  const openLibraryBookRef = useRef<(book: LibraryEntry) => Promise<void>>(
+    async () => undefined,
+  );
   const autoScrollRef = useRef(true);
   const indexTasksRef = useRef<IndexTask[]>([]);
   const indexTaskRunnerRef = useRef(false);
@@ -822,6 +839,12 @@ export default function Home() {
   const [indexMessage, setIndexMessage] = useState('');
   const [hasIndexCheckpoint, setHasIndexCheckpoint] = useState(false);
   const [settings, setSettings] = useState<ModelSettings>(readSavedSettings);
+  const [settingsHydrated, setSettingsHydrated] = useState(false);
+  const [readerSplitRatio, setReaderSplitRatio] = useState(readSplitRatio);
+  const [resizingSplit, setResizingSplit] = useState(false);
+  const [expandedReasoning, setExpandedReasoning] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [library, setLibrary] = useState<LibraryEntry[]>([]);
   const [libraryLoaded, setLibraryLoaded] = useState(false);
   const [activeBookId, setActiveBookId] = useState<string | null>(null);
@@ -877,6 +900,15 @@ export default function Home() {
   const [workspaceNotesTotal, setWorkspaceNotesTotal] = useState(0);
   const [activeNotes, setActiveNotes] = useState<WorkspaceNote[]>([]);
   const [workspaceNotice, setWorkspaceNotice] = useState('');
+  const [researchOpen, setResearchOpen] = useState(false);
+  const [researchQuery, setResearchQuery] = useState('');
+  const [researchKind, setResearchKind] = useState<'all' | ResearchItemKind>(
+    'all',
+  );
+  const [researchItems, setResearchItems] = useState<ResearchItem[]>([]);
+  const [researchTotal, setResearchTotal] = useState(0);
+  const [selectedResearchIds, setSelectedResearchIds] = useState<string[]>([]);
+  const [researchNotice, setResearchNotice] = useState('');
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyQuery, setHistoryQuery] = useState('');
   const [historyItems, setHistoryItems] = useState<WorkspaceHistoryItem[]>([]);
@@ -1036,6 +1068,51 @@ export default function Home() {
   }, [refreshKnowledgePacks, refreshLibrary]);
 
   useEffect(() => {
+    const bridge = window.marginDesktop;
+    if (!bridge?.settingsLoad) {
+      window.queueMicrotask(() => setSettingsHydrated(true));
+      return;
+    }
+    let cancelled = false;
+    window.queueMicrotask(() => {
+      void bridge.settingsLoad!()
+        .then(async (stored) => {
+          if (cancelled || !stored) return;
+          if (Object.keys(stored).length === 0) {
+            // First 0.3.3 launch: migrate the previous renderer-only settings to
+            // the native profile so local endpoints survive cache resets/upgrades.
+            await bridge.settingsSave?.(readSavedSettings());
+            return;
+          }
+          const next = {
+            ...DEFAULT_SETTINGS,
+            ...readSavedSettings(),
+            ...(stored as Partial<ModelSettings>),
+          };
+          setSettings(next);
+          localStorage.setItem('margin-ai-settings', JSON.stringify(next));
+          localStorage.setItem('margin-settings-schema', '4');
+        })
+        .catch((reason) =>
+          window.marginDesktop?.logEvent?.(
+            'settings-native-load-failed',
+            {
+              message:
+                reason instanceof Error ? reason.message : String(reason),
+            },
+            'error',
+          ),
+        )
+        .finally(() => {
+          if (!cancelled) setSettingsHydrated(true);
+        });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (
       !libraryLoaded ||
       !window.marginDesktop?.workspaceChatReplace ||
@@ -1149,6 +1226,40 @@ export default function Home() {
   }, [workspaceKind, workspaceOpen, workspaceQuery]);
 
   useEffect(() => {
+    if (!researchOpen || !window.marginDesktop?.workspaceResearchList) return;
+    let cancelled = false;
+    const timeout = window.setTimeout(() => {
+      void window.marginDesktop!.workspaceResearchList!({
+        kind: researchKind === 'all' ? undefined : researchKind,
+        query: researchQuery,
+        limit: 100,
+        offset: 0,
+      })
+        .then((result) => {
+          if (!cancelled) {
+            setResearchItems(result.items);
+            setResearchTotal(result.total);
+            setSelectedResearchIds((current) =>
+              current.filter((id) =>
+                result.items.some((item) => item.id === id),
+              ),
+            );
+          }
+        })
+        .catch((reason) => {
+          if (!cancelled)
+            setError(
+              `读取研究资料失败：${reason instanceof Error ? reason.message : String(reason)}`,
+            );
+        });
+    }, 160);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [researchKind, researchOpen, researchQuery]);
+
+  useEffect(() => {
     const bridge = window.marginDesktop;
     if (!bridge?.modelStatus) return;
     window.queueMicrotask(
@@ -1193,7 +1304,8 @@ export default function Home() {
 
   useEffect(() => {
     const bridge = window.marginDesktop;
-    if (!bridge?.modelStatus || !bridge.glmOcrStatus) return;
+    if (!settingsHydrated || !bridge?.modelStatus || !bridge.glmOcrStatus)
+      return;
     let cancelled = false;
     const managedConfig: GlmOcrConfig = {
       provider: 'managed',
@@ -1237,7 +1349,8 @@ export default function Home() {
             }
             const next = { ...DEFAULT_SETTINGS, ...raw, ...discovered };
             localStorage.setItem('margin-ai-settings', JSON.stringify(next));
-            localStorage.setItem('margin-settings-schema', '3');
+            localStorage.setItem('margin-settings-schema', '4');
+            void bridge.settingsSave?.(next);
             if (Object.keys(discovered).length > 0) {
               setSettings(next);
               window.marginDesktop?.logEvent?.('models-auto-associated', {
@@ -1261,7 +1374,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [settingsHydrated]);
 
   useEffect(() => {
     const bridge = window.marginDesktop;
@@ -1368,6 +1481,36 @@ export default function Home() {
     autoScrollRef.current =
       el.scrollHeight - el.scrollTop - el.clientHeight < 60;
   };
+
+  const updateReaderSplit = useCallback((clientX: number) => {
+    const bounds = workspaceRef.current?.getBoundingClientRect();
+    if (!bounds || bounds.width <= 0) return;
+    const minimumReader = Math.min(520, bounds.width * 0.38);
+    const minimumAssistant = Math.min(420, bounds.width * 0.3);
+    const readerWidth = Math.max(
+      minimumReader,
+      Math.min(bounds.width - minimumAssistant, clientX - bounds.left),
+    );
+    const ratio = Math.round((readerWidth / bounds.width) * 1000) / 10;
+    setReaderSplitRatio(ratio);
+    localStorage.setItem(SPLIT_RATIO_KEY, String(ratio));
+  }, []);
+
+  useEffect(() => {
+    if (!resizingSplit) return;
+    const move = (event: PointerEvent) => updateReaderSplit(event.clientX);
+    const stop = () => setResizingSplit(false);
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop, { once: true });
+    window.addEventListener('pointercancel', stop, { once: true });
+    document.body.classList.add('resizing-split');
+    return () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+      document.body.classList.remove('resizing-split');
+    };
+  }, [resizingSplit, updateReaderSplit]);
 
   useEffect(() => {
     if (!activeBookId || !page || !window.marginDesktop?.libraryUpdate) return;
@@ -1516,6 +1659,7 @@ export default function Home() {
       setPageCount(document.numPages);
       setPage(initialPage);
       setActiveBookId(activeBookIdRef.current);
+      if (book) localStorage.setItem(LAST_READING_BOOK_KEY, book.id);
       let restoredMessages: Message[] = [];
       if (book && window.marginDesktop?.workspaceChatLoad) {
         try {
@@ -1945,6 +2089,133 @@ export default function Home() {
     }
   }
 
+  useEffect(() => {
+    openLibraryBookRef.current = openLibraryBook;
+  });
+
+  useEffect(() => {
+    if (!libraryLoaded || restoredReadingRef.current || loadingPdf) return;
+    restoredReadingRef.current = true;
+    const lastBookId = localStorage.getItem(LAST_READING_BOOK_KEY);
+    if (!lastBookId) return;
+    const book = library.find((entry) => entry.id === lastBookId);
+    if (book)
+      window.queueMicrotask(() => void openLibraryBookRef.current(book));
+    else localStorage.removeItem(LAST_READING_BOOK_KEY);
+  }, [library, libraryLoaded, loadingPdf]);
+
+  function activeResearchContext() {
+    const pack = knowledgePacks.find(
+      (item) => item.id === activeKnowledgePackId,
+    );
+    if (pack) return { id: `pack_${pack.id}`, name: `知识包：${pack.name}` };
+    const book = library.find((item) => item.id === activeBookIdRef.current);
+    return book ? { id: book.id, name: book.name } : null;
+  }
+
+  async function saveResearchMessage(
+    message: Message,
+    kind: 'question' | 'evidence' = message.role === 'user'
+      ? 'question'
+      : 'evidence',
+  ) {
+    const context = activeResearchContext();
+    if (
+      !context ||
+      !message.content ||
+      !window.marginDesktop?.workspaceResearchSave
+    )
+      return;
+    const title =
+      message.content
+        .replace(/[#*_`]/g, '')
+        .split('\n')
+        .find(Boolean)
+        ?.trim()
+        .slice(0, 64) || (kind === 'question' ? '待研究问题' : '研究证据');
+    try {
+      const saved = await window.marginDesktop.workspaceResearchSave(
+        context.id,
+        context.name,
+        {
+          kind,
+          title,
+          content: message.content,
+          sources: message.sources,
+        },
+      );
+      setResearchItems((current) => [
+        saved,
+        ...current.filter((item) => item.id !== saved.id),
+      ]);
+      setResearchTotal((current) => current + 1);
+      setResearchNotice(
+        kind === 'question' ? '问题已保存到研究台' : '回答与来源已加入证据板',
+      );
+    } catch (reason) {
+      setError(
+        `保存研究资料失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    }
+  }
+
+  async function removeResearchEntry(item: ResearchItem) {
+    if (!window.marginDesktop?.workspaceResearchRemove) return;
+    await window.marginDesktop.workspaceResearchRemove(item.id);
+    setResearchItems((current) =>
+      current.filter((entry) => entry.id !== item.id),
+    );
+    setSelectedResearchIds((current) => current.filter((id) => id !== item.id));
+    setResearchTotal((current) => Math.max(0, current - 1));
+  }
+
+  async function synthesizeResearch(mode: 'compare' | 'outline') {
+    const selected = researchItems.filter((item) =>
+      selectedResearchIds.includes(item.id),
+    );
+    if (selected.length === 0) {
+      setResearchNotice('请先勾选至少一条问题或证据。');
+      return;
+    }
+    const material = selected
+      .slice(0, 20)
+      .map((item, index) => {
+        const sources = item.sources?.length
+          ? `\n来源：${item.sources
+              .map((source) => `《${source.bookName}》第 ${source.page} 页`)
+              .join('、')}`
+          : '';
+        return `${index + 1}. [${item.kind}] ${item.title}\n${item.content.slice(0, 3500)}${sources}`;
+      })
+      .join('\n\n');
+    const prompt =
+      mode === 'compare'
+        ? `请对照分析下面这些研究材料：列出共同结论、差异或冲突、各自证据强弱，并逐项保留原有书名与页码引用。不要补造来源。\n\n${material}`
+        : `请根据下面这些研究材料生成一份可继续写作的分层大纲。每个要点必须附已有的《书名》第 N 页引用；证据不足处标记“待补证”，不要创造不存在的来源。\n\n${material}`;
+    setResearchOpen(false);
+    const answer = await askAi(undefined, prompt);
+    const context = activeResearchContext();
+    if (
+      mode === 'outline' &&
+      typeof answer === 'string' &&
+      context &&
+      window.marginDesktop?.workspaceResearchSave
+    ) {
+      const saved = await window.marginDesktop.workspaceResearchSave(
+        context.id,
+        context.name,
+        {
+          kind: 'outline',
+          title: `引用大纲 · ${new Date().toLocaleString('zh-CN')}`,
+          content: answer,
+        },
+      );
+      setResearchItems((current) => [saved, ...current]);
+      setResearchTotal((current) => current + 1);
+      setResearchNotice('带引用大纲已生成并保存');
+    }
+  }
+
   async function removeWorkspaceNote(note: WorkspaceNote) {
     if (
       !window.marginDesktop?.workspaceNoteRemove ||
@@ -2047,6 +2318,7 @@ export default function Home() {
         setPageCount(0);
         setPageText('');
         setActiveBookId(null);
+        localStorage.removeItem(LAST_READING_BOOK_KEY);
         setMessages([]);
         setActiveNotes([]);
         setIndexStatus('idle');
@@ -2066,7 +2338,7 @@ export default function Home() {
     }
   }
 
-  function saveSettings() {
+  async function saveSettings() {
     const previous = readSavedSettings();
     // Only the vector/embedding configuration changes which vectors are produced,
     // so only those changes invalidate an already-built index. Chat-only or even
@@ -2081,7 +2353,14 @@ export default function Home() {
       previous.glmOcrEndpoint !== settings.glmOcrEndpoint ||
       previous.glmOcrModel !== settings.glmOcrModel;
     localStorage.setItem('margin-ai-settings', JSON.stringify(settings));
-    localStorage.setItem('margin-settings-schema', '3');
+    localStorage.setItem('margin-settings-schema', '4');
+    try {
+      await window.marginDesktop?.settingsSave?.(settings);
+    } catch (reason) {
+      setError(
+        `模型设置已保存在当前窗口，但写入本地配置文件失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    }
     if (vectorConfigChanged) {
       vectorIndexRef.current.clear();
       embeddingProviderRef.current = null;
@@ -2199,7 +2478,26 @@ export default function Home() {
         }),
       ]);
       setModelStatus(embedding);
-      if (settings.glmOcrProvider === 'managed') setGlmOcrStatus(glm);
+      const associated: ModelSettings = {
+        ...settings,
+        ...(embedding.installed
+          ? { embeddingKind: 'local-qwen3-embedding-4b' as const }
+          : {}),
+        ...(glm.modelInstalled
+          ? {
+              glmOcrMode: 'auto' as const,
+              glmOcrProvider: 'managed' as const,
+              glmOcrEndpoint: '',
+              glmOcrModel: 'ggml-org/GLM-OCR-GGUF',
+              glmOcrAutoStart: true,
+            }
+          : {}),
+      };
+      setSettings(associated);
+      localStorage.setItem('margin-ai-settings', JSON.stringify(associated));
+      localStorage.setItem('margin-settings-schema', '4');
+      await window.marginDesktop.settingsSave?.(associated);
+      if (glm.modelInstalled) setGlmOcrStatus(glm);
       setLocalModelCheckResult(
         `检测完成：向量模型${embedding.installed ? '已找到' : '未安装'}；GLM-OCR ${glm.modelInstalled ? '已找到' : '未安装'}。目录：${embedding.root}`,
       );
@@ -3367,6 +3665,7 @@ export default function Home() {
     const assistantMessage: Message = {
       role: 'assistant',
       content: '',
+      reasoning: '',
       page: targetPage,
       createdAt: askedAt,
       citation,
@@ -3522,6 +3821,7 @@ export default function Home() {
         throw new Error((await response.text()) || `HTTP ${response.status}`);
       const contentType = response.headers.get('content-type') ?? '';
       let answerText = '';
+      let reasoningText = '';
       const emitChunk = (chunk: string) => {
         if (!chunk) return;
         answerText += chunk;
@@ -3531,6 +3831,25 @@ export default function Home() {
           const last = next[next.length - 1];
           if (last?.role === 'assistant')
             next[next.length - 1] = { ...last, content: text(last.content) };
+          return next;
+        });
+      };
+      const emitReasoning = (chunk: string) => {
+        if (!chunk) return;
+        reasoningText += chunk;
+        setExpandedReasoning((current) => {
+          const next = new Set(current);
+          next.add(askedAt);
+          return next;
+        });
+        setMessages((current) => {
+          const next = [...current];
+          const last = next[next.length - 1];
+          if (last?.role === 'assistant')
+            next[next.length - 1] = {
+              ...last,
+              reasoning: `${last.reasoning || ''}${chunk}`,
+            };
           return next;
         });
       };
@@ -3553,9 +3872,23 @@ export default function Home() {
             if (!data || data === '[DONE]') continue;
             try {
               const parsed = JSON.parse(data) as {
-                choices?: Array<{ delta?: { content?: string } }>;
+                choices?: Array<{
+                  delta?: {
+                    content?: string;
+                    reasoning_content?: string;
+                    reasoning?: string;
+                    thinking?: string;
+                  };
+                }>;
               };
-              emitChunk(parsed.choices?.[0]?.delta?.content ?? '');
+              const delta = parsed.choices?.[0]?.delta;
+              emitReasoning(
+                delta?.reasoning_content ??
+                  delta?.reasoning ??
+                  delta?.thinking ??
+                  '',
+              );
+              emitChunk(delta?.content ?? '');
             } catch {
               /* ignore malformed keep-alive or partial line */
             }
@@ -3564,9 +3897,23 @@ export default function Home() {
       } else {
         // Some providers ignore `stream: true` and return the whole JSON.
         const result = (await response.json()) as {
-          choices?: Array<{ message?: { content?: string } }>;
+          choices?: Array<{
+            message?: {
+              content?: string;
+              reasoning_content?: string;
+              reasoning?: string;
+              thinking?: string;
+            };
+          }>;
         };
-        emitChunk(result.choices?.[0]?.message?.content ?? '');
+        const responseMessage = result.choices?.[0]?.message;
+        emitReasoning(
+          responseMessage?.reasoning_content ??
+            responseMessage?.reasoning ??
+            responseMessage?.thinking ??
+            '',
+        );
+        emitChunk(responseMessage?.content ?? '');
       }
       setMessages((current) => {
         const next = [...current];
@@ -3575,6 +3922,7 @@ export default function Home() {
           next[next.length - 1] = {
             ...last,
             content: last.content || '（模型未返回文本）',
+            reasoning: last.reasoning || undefined,
             sources: knowledgePack
               ? matches.slice(0, 8).map((match) => ({
                   bookId: (match as KnowledgeMatch).bookId,
@@ -3603,10 +3951,20 @@ export default function Home() {
         [
           ...previousMessages,
           userMessage,
-          { ...assistantMessage, content: savedAnswer, sources },
+          {
+            ...assistantMessage,
+            content: savedAnswer,
+            reasoning: reasoningText || undefined,
+            sources,
+          },
         ],
       );
-      return true;
+      setExpandedReasoning((current) => {
+        const next = new Set(current);
+        next.delete(askedAt);
+        return next;
+      });
+      return savedAnswer;
     } catch (reason) {
       setError(
         `AI 请求失败：${reason instanceof Error ? reason.message.slice(0, 160) : '请检查端点与密钥'}`,
@@ -3621,6 +3979,11 @@ export default function Home() {
       return false;
     } finally {
       setAsking(false);
+      setExpandedReasoning((current) => {
+        const next = new Set(current);
+        next.delete(askedAt);
+        return next;
+      });
     }
   }
 
@@ -3693,6 +4056,19 @@ export default function Home() {
                       索引未处理书籍
                     </Button>
                   )}
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setLibraryOpen(false);
+                      setTaskCenterOpen(true);
+                    }}
+                  >
+                    <Gauge />
+                    后台任务
+                    {pendingIndexTaskCount > 0
+                      ? `（${pendingIndexTaskCount}）`
+                      : ''}
+                  </Button>
                 </div>
                 <span>{library.length} 本书 · 数据仅保存在本机</span>
               </div>
@@ -4007,21 +4383,6 @@ export default function Home() {
             </DialogContent>
           </Dialog>
           <Dialog open={taskCenterOpen} onOpenChange={setTaskCenterOpen}>
-            <DialogTrigger
-              render={
-                <button
-                  className="sidebar-module-button"
-                  aria-label="索引任务"
-                  title="索引任务"
-                />
-              }
-            >
-              <ListTodo />
-              <span>任务</span>
-              {pendingIndexTaskCount > 0 && (
-                <strong>{pendingIndexTaskCount}</strong>
-              )}
-            </DialogTrigger>
             <DialogContent className="task-center-dialog">
               <DialogHeader>
                 <DialogTitle>后台索引任务</DialogTitle>
@@ -4435,9 +4796,146 @@ export default function Home() {
               </DialogFooter>
             </DialogContent>
           </Dialog>
-          <div className="sidebar-future-slots" aria-hidden="true">
-            <span />
-          </div>
+          <Dialog open={researchOpen} onOpenChange={setResearchOpen}>
+            <DialogTrigger
+              render={
+                <button
+                  className="sidebar-module-button"
+                  aria-label="研究工作台"
+                  title="保存问题、整理证据和生成引用大纲"
+                />
+              }
+            >
+              <BookMarked />
+              <span>研究</span>
+              {researchTotal > 0 && <strong>{researchTotal}</strong>}
+            </DialogTrigger>
+            <DialogContent className="research-dialog">
+              <DialogHeader>
+                <DialogTitle>研究工作台</DialogTitle>
+                <DialogDescription>
+                  保存问题和回答证据，选择材料进行跨书对照，或生成带页码引用的大纲。
+                </DialogDescription>
+              </DialogHeader>
+              <div className="research-toolbar">
+                <div className="workspace-search">
+                  <Search />
+                  <Input
+                    value={researchQuery}
+                    onChange={(event) => setResearchQuery(event.target.value)}
+                    placeholder="搜索问题、证据或大纲"
+                    aria-label="搜索研究资料"
+                  />
+                </div>
+                <div className="workspace-filters">
+                  {(['all', 'question', 'evidence', 'outline'] as const).map(
+                    (kind) => (
+                      <button
+                        key={kind}
+                        className={researchKind === kind ? 'active' : ''}
+                        onClick={() => setResearchKind(kind)}
+                      >
+                        {kind === 'all'
+                          ? '全部'
+                          : kind === 'question'
+                            ? '问题'
+                            : kind === 'evidence'
+                              ? '证据'
+                              : '大纲'}
+                      </button>
+                    ),
+                  )}
+                </div>
+              </div>
+              {researchNotice && (
+                <button
+                  className="workspace-notice"
+                  onClick={() => setResearchNotice('')}
+                >
+                  {researchNotice}
+                </button>
+              )}
+              <div className="research-list">
+                {researchItems.length === 0 ? (
+                  <p className="history-empty">
+                    暂无研究材料。可在提问或回答下方点击“保存问题”和“加入证据板”。
+                  </p>
+                ) : (
+                  researchItems.map((item) => (
+                    <article
+                      className={`research-item ${item.kind}`}
+                      key={item.id}
+                    >
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={selectedResearchIds.includes(item.id)}
+                          onChange={(event) =>
+                            setSelectedResearchIds((current) =>
+                              event.target.checked
+                                ? [...current, item.id]
+                                : current.filter((id) => id !== item.id),
+                            )
+                          }
+                        />
+                        <span>
+                          {item.kind === 'question'
+                            ? '问题'
+                            : item.kind === 'evidence'
+                              ? '证据'
+                              : '大纲'}
+                        </span>
+                      </label>
+                      <div>
+                        <strong>{item.title}</strong>
+                        <small>{item.contextName}</small>
+                        <p>{item.content}</p>
+                        {item.sources && item.sources.length > 0 && (
+                          <div className="research-sources">
+                            {item.sources.map((source, index) => (
+                              <button
+                                key={`${source.bookId}-${source.page}-${index}`}
+                                onClick={() => void openKnowledgeSource(source)}
+                              >
+                                《{source.bookName}》· 第 {source.page} 页
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        className="workspace-note-remove"
+                        onClick={() => void removeResearchEntry(item)}
+                        aria-label={`删除 ${item.title}`}
+                      >
+                        <Trash2 />
+                      </button>
+                    </article>
+                  ))
+                )}
+              </div>
+              <DialogFooter>
+                <span className="workspace-count">
+                  已选择 {selectedResearchIds.length} / {researchTotal} 条
+                </span>
+                <Button
+                  variant="outline"
+                  disabled={selectedResearchIds.length === 0 || asking}
+                  onClick={() => void synthesizeResearch('compare')}
+                >
+                  <Table2 />
+                  对照分析
+                </Button>
+                <Button
+                  disabled={selectedResearchIds.length === 0 || asking}
+                  onClick={() => void synthesizeResearch('outline')}
+                >
+                  <NotebookPen />
+                  生成引用大纲
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </nav>
         <div className="sidebar-bottom">
           <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
@@ -4458,7 +4956,7 @@ export default function Home() {
                 <DialogTitle>模型设置</DialogTitle>
                 <DialogDescription>
                   支持 OpenAI 兼容的 <code>/chat/completions</code>{' '}
-                  端点。配置仅保存在本机浏览器。
+                  端点。配置同时保存在 Margin 本地数据目录，重启后自动恢复。
                 </DialogDescription>
               </DialogHeader>
               <div className="local-model-check">
@@ -5067,7 +5565,7 @@ export default function Home() {
                 )}
               </div>
               <DialogFooter>
-                <Button onClick={saveSettings}>保存配置</Button>
+                <Button onClick={() => void saveSettings()}>保存配置</Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
@@ -5081,7 +5579,11 @@ export default function Home() {
         />
       </aside>
 
-      <div className="workspace">
+      <div
+        ref={workspaceRef}
+        className="workspace"
+        style={{ '--reader-split': `${readerSplitRatio}%` } as CSSProperties}
+      >
         <section className="reader-panel" aria-label="PDF 阅读区">
           {pdf ? (
             <>
@@ -5188,6 +5690,38 @@ export default function Home() {
             </div>
           )}
         </section>
+
+        <button
+          type="button"
+          className="workspace-resizer"
+          aria-label="调节阅读区和 AI 助手宽度"
+          title="左右拖动调节分栏，双击恢复默认宽度"
+          onPointerDown={(event) => {
+            event.preventDefault();
+            setResizingSplit(true);
+          }}
+          onDoubleClick={() => {
+            setReaderSplitRatio(70);
+            localStorage.setItem(SPLIT_RATIO_KEY, '70');
+          }}
+          onKeyDown={(event) => {
+            if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key))
+              return;
+            event.preventDefault();
+            const next =
+              event.key === 'Home'
+                ? 70
+                : Math.max(
+                    38,
+                    Math.min(
+                      78,
+                      readerSplitRatio + (event.key === 'ArrowRight' ? 2 : -2),
+                    ),
+                  );
+            setReaderSplitRatio(next);
+            localStorage.setItem(SPLIT_RATIO_KEY, String(next));
+          }}
+        />
 
         <aside className="ai-panel" aria-label="AI 阅读助手">
           <div className="ai-heading">
@@ -5471,6 +6005,7 @@ export default function Home() {
                     !message.content &&
                     asking &&
                     index === messages.length - 1;
+                  const reasoningKey = message.createdAt || String(index);
                   return (
                     <div
                       className={`message ${message.role}`}
@@ -5484,6 +6019,28 @@ export default function Home() {
                         )}
                       </span>
                       <div className="message-body">
+                        {message.role === 'assistant' && message.reasoning && (
+                          <details
+                            className="message-reasoning"
+                            open={expandedReasoning.has(reasoningKey)}
+                            onToggle={(event) => {
+                              const open = event.currentTarget.open;
+                              setExpandedReasoning((current) => {
+                                const next = new Set(current);
+                                if (open) next.add(reasoningKey);
+                                else next.delete(reasoningKey);
+                                return next;
+                              });
+                            }}
+                          >
+                            <summary>
+                              <Sparkles />
+                              思考过程
+                              <ChevronDown />
+                            </summary>
+                            <div>{message.reasoning}</div>
+                          </details>
+                        )}
                         {thinking ? (
                           <p className="thinking">
                             <i />
@@ -5520,6 +6077,20 @@ export default function Home() {
                             </div>
                           )}
                         <div className="message-meta-actions">
+                          {message.content &&
+                            (activeBookId || activeKnowledgePack) && (
+                              <button
+                                className="message-research-save"
+                                onClick={() =>
+                                  void saveResearchMessage(message)
+                                }
+                              >
+                                <BookMarked />
+                                {message.role === 'user'
+                                  ? '保存问题'
+                                  : '加入证据板'}
+                              </button>
+                            )}
                           {message.citation && (
                             <button
                               className="message-citation"

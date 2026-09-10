@@ -196,17 +196,20 @@ try {
       throw new Error('Margin did not reload');
     return true;
   });
-  await evaluate(`(() => {
-    localStorage.setItem('margin-ai-settings', JSON.stringify({
+  await evaluate(`(async () => {
+    const settings = {
       embeddingKind: 'openai-compatible',
       embeddingEndpoint: 'https://fixture.local/v1',
       embeddingModel: 'fixture-embedding',
       embeddingApiKey: 'fixture',
       ocrMode: 'auto',
       ocrLanguage: 'eng'
-    }));
+    };
+    localStorage.setItem('margin-settings-schema', '4');
+    localStorage.setItem('margin-ai-settings', JSON.stringify(settings));
+    await window.marginDesktop.settingsSave(settings);
     window.location.reload();
-  })()`);
+  })()`, true);
   await delay(1_000);
   await retry(async () => {
     if (
@@ -312,11 +315,17 @@ try {
     throw new Error(
       'OCR layout coordinates were not persisted for every scanned page',
     );
-  const taskState = await evaluate(
-    `({ tasks: JSON.parse(localStorage.getItem('margin-index-tasks-v1') || '[]'), hasTaskCenter: [...document.querySelectorAll('.sidebar-module-button')].some((button) => button.textContent?.includes('任务')) })`,
-  );
+  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
+  const taskState = await retry(async () => {
+    const state = await evaluate(
+      `({ tasks: JSON.parse(localStorage.getItem('margin-index-tasks-v1') || '[]'), hasSidebarTask: [...document.querySelectorAll('.sidebar-module-button')].some((button) => button.textContent?.includes('任务')), hasShelfTask: [...document.querySelectorAll('.library-dialog button')].some((button) => button.textContent?.includes('后台任务')) })`,
+    );
+    if (!state.hasShelfTask) throw new Error('Bookshelf task button not ready');
+    return state;
+  });
   if (
-    !taskState.hasTaskCenter ||
+    taskState.hasSidebarTask ||
+    !taskState.hasShelfTask ||
     taskState.tasks.length !== 1 ||
     taskState.tasks[0].status !== 'completed' ||
     taskState.tasks[0].progress !== 100 ||

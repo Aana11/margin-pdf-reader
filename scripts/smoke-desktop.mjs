@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import path from 'node:path';
 import { ensureSmokePdf } from './smoke-fixture.mjs';
 
@@ -16,11 +17,40 @@ const expectedVersion = JSON.parse(
 ).version;
 const port = Number(process.env.MARGIN_CDP_PORT || 9333);
 const libraryRoot = path.resolve('tmp', `smoke-library-${Date.now()}`);
-const dataRoot = testEmbedding
-  ? process.env.MARGIN_DATA_ROOT ||
-    path.join(process.env.APPDATA || libraryRoot, 'Margin')
-  : path.join(libraryRoot, 'data');
+const dataRoot = path.join(libraryRoot, 'data');
+const sharedAssetRoot =
+  process.env.MARGIN_ASSET_ROOT ||
+  path.join(process.env.APPDATA || libraryRoot, 'Margin');
 const attachToRunningApp = process.env.MARGIN_CDP_ATTACH === '1';
+const chatServer = createServer((request, response) => {
+  response.setHeader('Access-Control-Allow-Origin', '*');
+  response.setHeader('Access-Control-Allow-Headers', '*');
+  if (request.method === 'OPTIONS') {
+    response.writeHead(204);
+    response.end();
+    return;
+  }
+  if (!request.url?.endsWith('/chat/completions')) {
+    response.writeHead(404);
+    response.end();
+    return;
+  }
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+  });
+  response.write(
+    `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: '先核对当前页，再组织结论。' } }] })}\n\n`,
+  );
+  setTimeout(() => {
+    response.write(
+      `data: ${JSON.stringify({ choices: [{ delta: { content: '这是带思考过程的冒烟回答。' } }] })}\n\n`,
+    );
+    response.end('data: [DONE]\n\n');
+  }, 700);
+});
+await new Promise((resolve) => chatServer.listen(0, '127.0.0.1', resolve));
+const chatPort = chatServer.address().port;
 const child = attachToRunningApp
   ? null
   : spawn(
@@ -35,6 +65,7 @@ const child = attachToRunningApp
         env: {
           ...process.env,
           MARGIN_DATA_ROOT: dataRoot,
+          ...(testEmbedding ? { MARGIN_ASSET_ROOT: sharedAssetRoot } : {}),
           MARGIN_LIBRARY_ROOT: path.join(libraryRoot, 'library'),
         },
       },
@@ -269,10 +300,17 @@ try {
     return state;
   });
   await evaluate(`(() => {
-    const input = document.querySelector('#system-prompt');
-    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
-    setter.call(input, '自定义冒烟测试提示词');
-    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const textSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    const inputSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    const prompt = document.querySelector('#system-prompt');
+    textSetter.call(prompt, '自定义冒烟测试提示词');
+    prompt.dispatchEvent(new Event('input', { bubbles: true }));
+    const endpoint = document.querySelector('#endpoint');
+    inputSetter.call(endpoint, 'http://127.0.0.1:${chatPort}/v1');
+    endpoint.dispatchEvent(new Event('input', { bubbles: true }));
+    const model = document.querySelector('#model');
+    inputSetter.call(model, 'margin-smoke-reasoning');
+    model.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
   await delay(100);
   await evaluate(
@@ -283,6 +321,12 @@ try {
   );
   if (savedPrompt !== '自定义冒烟测试提示词')
     throw new Error('Custom system prompt did not persist');
+  await retry(async () => {
+    const value = await evaluate(`window.marginDesktop.settingsLoad()`, true);
+    if (value?.systemPrompt !== '自定义冒烟测试提示词')
+      throw new Error('Native model settings did not persist');
+    return value;
+  });
   const settingsClosed = await retry(async () => {
     const open = await evaluate(
       `Boolean(document.querySelector('#system-prompt'))`,
@@ -290,6 +334,39 @@ try {
     if (open) throw new Error('Settings dialog did not close after save');
     return true;
   });
+  await evaluate(`(() => {
+    const input = document.querySelector('.composer textarea');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(input, '请测试思考过程');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    document.querySelector('.composer button[type="submit"]')?.click();
+  })()`);
+  const reasoningStreaming = await retry(
+    async () => {
+      const state = await evaluate(`({
+      text: document.querySelector('.message-reasoning')?.textContent || '',
+      open: Boolean(document.querySelector('.message-reasoning')?.open)
+    })`);
+      if (!state.text.includes('先核对当前页') || !state.open)
+        throw new Error('Reasoning stream is not visible and expanded');
+      return state;
+    },
+    40,
+    100,
+  );
+  const reasoningComplete = await retry(
+    async () => {
+      const state = await evaluate(`({
+      answer: [...document.querySelectorAll('.message.assistant .message-content')].at(-1)?.textContent || '',
+      open: Boolean([...document.querySelectorAll('.message-reasoning')].at(-1)?.open)
+    })`);
+      if (!state.answer.includes('带思考过程的冒烟回答') || state.open)
+        throw new Error('Reasoning did not collapse after the final answer');
+      return state;
+    },
+    60,
+    100,
+  );
 
   const modelStatus = await evaluate(
     `window.marginDesktop.modelStatus()`,
@@ -364,6 +441,11 @@ try {
       versionLabel: document.querySelector('.sidebar-brand')?.textContent || '',
       hasLibrary: Boolean(document.querySelector('[aria-label="本地书架"]')),
       hasOcrTools: Boolean(document.querySelector('[aria-label="OCR 工具"]')),
+      hasResearch: Boolean(document.querySelector('[aria-label="研究工作台"]')),
+      hasSidebarTask: Boolean(document.querySelector('.app-sidebar [aria-label="索引任务"]')),
+      hasResizer: Boolean(document.querySelector('.workspace-resizer')),
+      restoredPage: document.querySelector('.page-scroll-indicator')?.textContent || '',
+      restoredDocument: Boolean(document.querySelector('.pdf-pages')),
       settingsAtBottom: Boolean(document.querySelector('.sidebar-bottom [aria-label="模型设置"]'))
     })`);
     if (
@@ -371,6 +453,11 @@ try {
       !state.versionLabel.includes(expectedVersion) ||
       !state.hasLibrary ||
       !state.hasOcrTools ||
+      !state.hasResearch ||
+      state.hasSidebarTask ||
+      !state.hasResizer ||
+      !state.restoredDocument ||
+      !state.restoredPage.includes('2 / 2') ||
       !state.settingsAtBottom
     )
       throw new Error('Application sidebar did not persist');
@@ -381,11 +468,13 @@ try {
     async () => {
       const shelf = await evaluate(`({
       name: document.querySelector('.book-item strong')?.textContent || '',
-      indexed: Boolean(document.querySelector('.book-index'))
+      indexed: Boolean(document.querySelector('.book-index')),
+      hasTaskCenter: [...document.querySelectorAll('.library-dialog button')].some((button) => button.textContent?.includes('后台任务'))
     })`);
       if (
         !shelf.name.includes('margin-reader-smoke') ||
-        (testEmbedding && !shelf.indexed)
+        (testEmbedding && !shelf.indexed) ||
+        !shelf.hasTaskCenter
       )
         throw new Error('Bookshelf state has not persisted yet');
       return shelf;
@@ -393,6 +482,41 @@ try {
     120,
     500,
   );
+  await closeDialog();
+  const researchSeed = await evaluate(
+    `(async () => {
+      const book = (await window.marginDesktop.libraryList())[0];
+      const question = await window.marginDesktop.workspaceResearchSave(book.id, book.name, { kind: 'question', title: '冒烟研究问题', content: '比较两种定义。' });
+      const evidence = await window.marginDesktop.workspaceResearchSave(book.id, book.name, { kind: 'evidence', title: '冒烟证据', content: '第二页给出定义。', sources: [{ bookId: book.id, bookName: book.name, page: 2, score: 0.9, excerpt: '定义' }] });
+      const listed = await window.marginDesktop.workspaceResearchList({ contextId: book.id, limit: 20 });
+      return { question: question.kind, evidence: evidence.kind, total: listed.total };
+    })()`,
+    true,
+  );
+  if (
+    researchSeed.question !== 'question' ||
+    researchSeed.evidence !== 'evidence' ||
+    researchSeed.total !== 2
+  )
+    throw new Error(
+      `Research workspace bridge failed: ${JSON.stringify(researchSeed)}`,
+    );
+  await openDialog('研究工作台', '保存问题和回答证据');
+  await retry(async () => {
+    const state = await evaluate(`({
+      text: document.querySelector('.research-dialog')?.textContent || '',
+      items: document.querySelectorAll('.research-item').length
+    })`);
+    if (
+      !state.text.includes('冒烟研究问题') ||
+      !state.text.includes('冒烟证据') ||
+      state.items !== 2
+    )
+      throw new Error(
+        `Research workspace is not ready: ${JSON.stringify(state)}`,
+      );
+    return state;
+  });
   await closeDialog();
   await openDialog('提问历史', '历史已迁移到本机 SQLite');
   const persistedHistory = await retry(async () => {
@@ -586,6 +710,8 @@ try {
       settingsControls,
       settingsClosed,
       savedPrompt,
+      reasoningStreaming,
+      reasoningComplete,
       modelStatus,
       embeddingDimensions,
       indexStatus,
@@ -615,4 +741,5 @@ try {
       new Promise((resolve) => child.once('exit', resolve)),
       delay(5_000),
     ]);
+  await new Promise((resolve) => chatServer.close(resolve));
 }

@@ -167,7 +167,10 @@ try {
     await window.marginDesktop.workspaceNoteSave(${JSON.stringify(book.id)}, 'Margin-Reader-Demo.pdf', { kind: 'note', page: 1, title: '阅读与 AI 同屏', content: '适合记录需要回看的页面布局与交互方式。', excerpt: '阅读区与助手保持页码同步。', color: '#f2a56f', region: { x: .12, y: .36, width: .55, height: .12 } });
     await window.marginDesktop.workspaceNoteSave(${JSON.stringify(book.id)}, 'Margin-Reader-Demo.pdf', { kind: 'summary', page: 1, title: 'Margin 核心能力', content: '本地书架、连续阅读、全文检索、GLM-OCR 精读与可追溯的阅读资料。', excerpt: '', color: '#8cc8ef' });
     await window.marginDesktop.workspaceNoteSave(${JSON.stringify(book.id)}, 'Margin-Reader-Demo.pdf', { kind: 'glossary', page: 1, title: 'RAG', content: '先检索相关原文，再让对话模型基于证据回答。', excerpt: '全文向量检索', color: '#79d8cc', region: { x: .18, y: .62, width: .32, height: .08 } });
-    localStorage.setItem('margin-settings-schema', '3');
+    await window.marginDesktop.workspaceResearchSave(${JSON.stringify(book.id)}, 'Margin-Reader-Demo.pdf', { kind: 'question', title: '本地 RAG 如何保证回答可追溯？', content: '比较当前页说明与知识包检索结果。' });
+    await window.marginDesktop.workspaceResearchSave('pack_' + ${JSON.stringify(demoLibrary.core)}, '知识包：高等数学核心', { kind: 'evidence', title: '跨书检索保留来源页码', content: '知识包只检索明确加入的书籍，并保留书名、页码和相似度。', sources: [{ bookId: ${JSON.stringify(book.id)}, bookName: 'Margin-Reader-Demo.pdf', page: 1, score: .94, excerpt: '本地 PDF 阅读与可追溯引用' }] });
+    await window.marginDesktop.workspaceResearchSave('pack_' + ${JSON.stringify(demoLibrary.core)}, '知识包：高等数学核心', { kind: 'outline', title: '本地知识研究大纲', content: '1. 本地书库与索引\\n2. 跨书证据检索\\n3. GLM-OCR 公式精读\\n4. 带引用的结论输出' });
+    localStorage.setItem('margin-settings-schema', '4');
     localStorage.setItem('margin-ai-settings', JSON.stringify({
       glmOcrMode: 'auto',
       glmOcrProvider: 'managed',
@@ -217,6 +220,24 @@ try {
   });
   await delay(800);
   await capture('knowledge-packs.jpg');
+  await evaluate(
+    `document.querySelector('[role="dialog"][data-open] [data-slot="dialog-close"]')?.click()`,
+  );
+
+  await evaluate(
+    `document.querySelector('[aria-label="研究工作台"]')?.click()`,
+  );
+  await retry(async () => {
+    const state = await evaluate(
+      `({ dialog: Boolean(document.querySelector('.research-dialog')), items: document.querySelectorAll('.research-item').length })`,
+    );
+    if (!state.dialog || state.items !== 3)
+      throw new Error(
+        `Research workspace has not opened: ${JSON.stringify(state)}`,
+      );
+    return state;
+  });
+  await capture('research-workbench.jpg');
   await evaluate(
     `document.querySelector('[role="dialog"][data-open] [data-slot="dialog-close"]')?.click()`,
   );
@@ -309,13 +330,23 @@ try {
   })()`);
   await retry(async () => {
     const ready = await evaluate(
-      `Boolean(document.querySelector('[aria-label="索引任务"]'))`,
+      `Boolean(document.querySelector('[aria-label="本地书架"]'))`,
     );
-    if (!ready) throw new Error('Task center trigger has not restored');
+    if (!ready) throw new Error('Bookshelf trigger has not restored');
     return ready;
   });
   await delay(500);
-  await evaluate(`document.querySelector('[aria-label="索引任务"]')?.click()`);
+  await evaluate(`document.querySelector('[aria-label="本地书架"]')?.click()`);
+  await retry(async () => {
+    const ready = await evaluate(
+      `[...document.querySelectorAll('.library-dialog button')].some((button) => button.textContent?.includes('后台任务'))`,
+    );
+    if (!ready) throw new Error('Task center button is not inside bookshelf');
+    return ready;
+  });
+  await evaluate(
+    `[...document.querySelectorAll('.library-dialog button')].find((button) => button.textContent?.includes('后台任务'))?.click()`,
+  );
   await retry(async () => {
     const visible = await evaluate(
       `Boolean(document.querySelector('.index-task-card'))`,

@@ -143,12 +143,14 @@ try {
   const pdfBase64 = (await readFile(pdfPath)).toString('base64');
   const seeded = await evaluate(
     `(async () => {
-    localStorage.setItem('margin-settings-schema', '3');
-    localStorage.setItem('margin-ai-settings', JSON.stringify({
+    const settings = {
       endpoint: ${JSON.stringify(endpoint)}, model: 'chat-test', apiKey: 'chat-key', systemPrompt: 'Use only supplied sources.',
       embeddingKind: 'openai-compatible', embeddingEndpoint: ${JSON.stringify(endpoint)}, embeddingModel: 'embed-test', embeddingApiKey: 'embed-key',
       ocrMode: 'off', ocrLanguage: 'eng', glmOcrMode: 'off', glmOcrProvider: 'managed', glmOcrEndpoint: '', glmOcrModel: 'ggml-org/GLM-OCR-GGUF', glmOcrApiKey: '', glmOcrAutoStart: true
-    }));
+    };
+    localStorage.setItem('margin-settings-schema', '4');
+    localStorage.setItem('margin-ai-settings', JSON.stringify(settings));
+    await window.marginDesktop.settingsSave(settings);
     const bytes = Uint8Array.from(atob('${pdfBase64}'), character => character.charCodeAt(0));
     const algebra = await window.marginDesktop.libraryImport('高等代数.pdf', bytes.buffer);
     const geometry = await window.marginDesktop.libraryImport('解析几何.pdf', bytes.buffer);

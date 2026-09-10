@@ -98,7 +98,7 @@ try {
     return result.result?.value;
   };
   await command('Runtime.enable');
-  await evaluate(`localStorage.setItem('margin-settings-schema', '2'); localStorage.setItem('margin-ai-settings', JSON.stringify({ endpoint: '${endpoint}', model: 'chat-test', apiKey: 'chat-key', systemPrompt: 'Use supplied context.', embeddingKind: 'openai-compatible', embeddingEndpoint: '${endpoint}', embeddingModel: 'embed-test', embeddingApiKey: 'embed-key', ocrMode: 'auto', ocrLanguage: 'eng', glmOcrMode: 'auto', glmOcrProvider: 'ollama', glmOcrEndpoint: '${baseEndpoint}', glmOcrModel: 'glm-ocr:latest', glmOcrApiKey: '', glmOcrAutoStart: true })); window.location.reload()`);
+  await evaluate(`(async () => { const settings = { endpoint: '${endpoint}', model: 'chat-test', apiKey: 'chat-key', systemPrompt: 'Use supplied context.', embeddingKind: 'openai-compatible', embeddingEndpoint: '${endpoint}', embeddingModel: 'embed-test', embeddingApiKey: 'embed-key', ocrMode: 'auto', ocrLanguage: 'eng', glmOcrMode: 'auto', glmOcrProvider: 'ollama', glmOcrEndpoint: '${baseEndpoint}', glmOcrModel: 'glm-ocr:latest', glmOcrApiKey: '', glmOcrAutoStart: true }; localStorage.setItem('margin-settings-schema', '4'); localStorage.setItem('margin-ai-settings', JSON.stringify(settings)); await window.marginDesktop.settingsSave(settings); window.location.reload(); })()`, true);
   await retry(() => evaluate(`document.readyState === 'complete' && Boolean(document.querySelector('input[type="file"]'))`).then((ready) => { if (!ready) throw new Error('App not ready'); return ready; }));
   await command('DOM.enable');
   const documentNode = await command('DOM.getDocument');

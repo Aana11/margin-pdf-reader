@@ -2,6 +2,27 @@
 
 All notable changes to Margin are documented here.
 
+## [0.3.3] - 2026-09-10
+
+### Added
+
+- A persistent research workbench for saved questions, source-backed evidence, cross-book comparison prompts, and automatically saved cited outlines.
+- A draggable reader/assistant divider with keyboard adjustment, double-click reset, and locally persisted width.
+- Streaming reasoning display for OpenAI-compatible `reasoning_content`, `reasoning`, and `thinking` fields. Users can expand or collapse it, and completion automatically collapses the panel.
+- Native `%APPDATA%\Margin\preferences.json` persistence for model provider, endpoint, model name, credentials, and prompt settings in addition to renderer storage.
+
+### Changed
+
+- The last managed book automatically reopens at its persisted page after restarting the application.
+- The background-index task-center entry moved from the main sidebar into the bookshelf manager.
+- Managed GLM-OCR caps vision tokens and batch allocation, uses GPU-memory-aware projector placement, and automatically retries Vulkan out-of-memory crashes in CPU-projector protection mode.
+- Chat reasoning and research items are stored in `workspace.sqlite`; research materials are included in Markdown exports.
+
+### Fixed
+
+- Dense-page GLM-OCR inference no longer reports a crashed Vulkan process as a generic remote `ECONNRESET` failure on 12 GB GPUs.
+- Explicitly associated local embedding and GLM-OCR settings survive application restarts and are restored before startup model detection.
+
 ## [0.3.2] - 2026-09-09
 
 ### Added

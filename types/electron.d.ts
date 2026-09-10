@@ -116,10 +116,23 @@ export type WorkspaceCitation = {
 export type WorkspaceMessage = {
   role: 'user' | 'assistant';
   content: string;
+  reasoning?: string;
   page: number;
   createdAt?: string;
   citation?: WorkspaceCitation;
   sources?: KnowledgeSource[];
+};
+export type ResearchItemKind = 'question' | 'evidence' | 'outline';
+export type ResearchItem = {
+  id: string;
+  contextId: string;
+  contextName: string;
+  kind: ResearchItemKind;
+  title: string;
+  content: string;
+  sources?: KnowledgeSource[];
+  createdAt: string;
+  updatedAt: string;
 };
 export type KnowledgeSource = {
   bookId: string;
@@ -169,7 +182,12 @@ declare global {
         runtimeBackend: 'cpu' | 'vulkan';
         ocrWorkers: number;
         embeddingSlots: number;
+        gpuMemoryMiB: number;
       }>;
+      settingsLoad?: () => Promise<Record<string, unknown>>;
+      settingsSave?: (
+        value: Record<string, unknown>,
+      ) => Promise<{ saved: boolean; path: string }>;
       openLogs?: () => Promise<{ opened: boolean; path: string }>;
       logEvent?: (
         event: string,
@@ -342,6 +360,25 @@ declare global {
         > & { id?: string },
       ) => Promise<WorkspaceNote>;
       workspaceNoteRemove?: (id: string) => Promise<{ removed: boolean }>;
+      workspaceResearchList?: (options?: {
+        contextId?: string;
+        kind?: ResearchItemKind;
+        query?: string;
+        limit?: number;
+        offset?: number;
+      }) => Promise<{ total: number; items: ResearchItem[] }>;
+      workspaceResearchSave?: (
+        contextId: string,
+        contextName: string,
+        item: {
+          id?: string;
+          kind: ResearchItemKind;
+          title: string;
+          content: string;
+          sources?: KnowledgeSource[];
+        },
+      ) => Promise<ResearchItem>;
+      workspaceResearchRemove?: (id: string) => Promise<{ removed: boolean }>;
       workspaceExportMarkdown?: (options?: {
         bookId?: string;
       }) => Promise<{ exported: boolean; path?: string }>;
