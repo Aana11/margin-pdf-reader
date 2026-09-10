@@ -3,10 +3,11 @@ const { mkdirSync } = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const path = require('node:path');
 
-const WORKSPACE_VERSION = 3;
+const WORKSPACE_VERSION = 4;
 const WORKSPACE_FILE = 'workspace.sqlite';
 const NOTE_KINDS = new Set(['highlight', 'note', 'summary', 'glossary']);
 const RESEARCH_KINDS = new Set(['question', 'evidence', 'outline']);
+const STUDY_KINDS = new Set(['concept', 'formula', 'qa']);
 
 function cleanText(value, maximum, field) {
   if (typeof value !== 'string') throw new Error(`Invalid ${field}`);
@@ -87,6 +88,27 @@ function openWorkspace(root) {
     );
     CREATE INDEX IF NOT EXISTS research_items_context_updated ON research_items(context_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS research_items_kind_updated ON research_items(kind, updated_at DESC);
+    CREATE TABLE IF NOT EXISTS study_cards (
+      id TEXT PRIMARY KEY,
+      context_id TEXT NOT NULL,
+      context_name TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('concept', 'formula', 'qa')),
+      front TEXT NOT NULL,
+      back TEXT NOT NULL,
+      source_excerpt TEXT NOT NULL DEFAULT '',
+      sources_json TEXT,
+      state TEXT NOT NULL DEFAULT 'new' CHECK (state IN ('new', 'learning', 'review')),
+      due_at TEXT NOT NULL,
+      interval_days REAL NOT NULL DEFAULT 0,
+      ease_factor REAL NOT NULL DEFAULT 2.5,
+      repetitions INTEGER NOT NULL DEFAULT 0,
+      lapses INTEGER NOT NULL DEFAULT 0,
+      last_review_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS study_cards_due ON study_cards(due_at, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS study_cards_context ON study_cards(context_id, updated_at DESC);
     INSERT OR REPLACE INTO metadata(key, value) VALUES ('version', '${WORKSPACE_VERSION}');
   `);
   const messageColumns = new Set(
@@ -99,6 +121,8 @@ function openWorkspace(root) {
     database.exec('ALTER TABLE messages ADD COLUMN sources_json TEXT');
   if (!messageColumns.has('reasoning_text'))
     database.exec('ALTER TABLE messages ADD COLUMN reasoning_text TEXT');
+  if (!messageColumns.has('quote_text'))
+    database.exec('ALTER TABLE messages ADD COLUMN quote_text TEXT');
   return database;
 }
 
@@ -368,7 +392,7 @@ function replaceChat(root, bookId, bookName, messages) {
   const database = openWorkspace(root);
   try {
     const insert = database.prepare(
-      'INSERT INTO messages (id, book_id, book_name, position, role, content, reasoning_text, page, citation_json, sources_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO messages (id, book_id, book_name, position, role, content, reasoning_text, quote_text, page, citation_json, sources_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     );
     database.exec('BEGIN IMMEDIATE');
     database.prepare('DELETE FROM messages WHERE book_id = ?').run(bookId);
@@ -388,6 +412,7 @@ function replaceChat(root, bookId, bookName, messages) {
         message.role,
         cleanText(message.content, 100_000, 'message'),
         cleanText(message.reasoning || '', 100_000, 'message reasoning'),
+        cleanText(message.quote || '', 8_000, 'message quote'),
         message.page,
         serializeCitation(message.citation),
         serializeSources(message.sources),
@@ -419,7 +444,7 @@ function loadChat(root, bookId, limit = 100) {
   try {
     const rows = database
       .prepare(
-        'SELECT role, content, reasoning_text, page, citation_json, sources_json, created_at FROM messages WHERE book_id = ? ORDER BY position DESC LIMIT ?',
+        'SELECT role, content, reasoning_text, quote_text, page, citation_json, sources_json, created_at FROM messages WHERE book_id = ? ORDER BY position DESC LIMIT ?',
       )
       .all(bookId, safeLimit)
       .reverse();
@@ -427,6 +452,7 @@ function loadChat(root, bookId, limit = 100) {
       role: row.role,
       content: row.content,
       reasoning: row.reasoning_text || undefined,
+      quote: row.quote_text || undefined,
       page: row.page,
       createdAt: row.created_at,
       citation: parseJson(row.citation_json),
@@ -556,6 +582,236 @@ function removeResearchItem(root, id) {
     return {
       removed:
         database.prepare('DELETE FROM research_items WHERE id = ?').run(id)
+          .changes > 0,
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function studyCardFromRow(row) {
+  return {
+    id: row.id,
+    contextId: row.context_id,
+    contextName: row.context_name,
+    kind: row.kind,
+    front: row.front,
+    back: row.back,
+    sourceExcerpt: row.source_excerpt,
+    sources: parseJson(row.sources_json),
+    state: row.state,
+    dueAt: row.due_at,
+    intervalDays: row.interval_days,
+    easeFactor: row.ease_factor,
+    repetitions: row.repetitions,
+    lapses: row.lapses,
+    lastReviewAt: row.last_review_at || undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function saveStudyCards(root, contextId, contextName, cards) {
+  validateBookId(contextId);
+  const safeName = cleanText(contextName, 300, 'study context name');
+  if (!Array.isArray(cards) || cards.length === 0 || cards.length > 30)
+    throw new Error('Invalid study cards');
+  const now = new Date().toISOString();
+  const database = openWorkspace(root);
+  try {
+    const insert = database.prepare(`INSERT INTO study_cards
+      (id, context_id, context_name, kind, front, back, source_excerpt, sources_json,
+       state, due_at, interval_days, ease_factor, repetitions, lapses, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, 0, 2.5, 0, 0, ?, ?)`);
+    database.exec('BEGIN IMMEDIATE');
+    const saved = cards.map((card) => {
+      if (!card || !STUDY_KINDS.has(card.kind))
+        throw new Error('Invalid study card');
+      const value = {
+        id: randomUUID(),
+        kind: card.kind,
+        front: cleanText(card.front || '', 2_000, 'study card front'),
+        back: cleanText(card.back || '', 8_000, 'study card back'),
+        sourceExcerpt: cleanText(
+          card.sourceExcerpt || '',
+          4_000,
+          'study source excerpt',
+        ),
+        sources: serializeSources(card.sources),
+      };
+      if (!value.front || !value.back)
+        throw new Error('Study card front and back are required');
+      insert.run(
+        value.id,
+        contextId,
+        safeName,
+        value.kind,
+        value.front,
+        value.back,
+        value.sourceExcerpt,
+        value.sources,
+        now,
+        now,
+        now,
+      );
+      return {
+        ...value,
+        contextId,
+        contextName: safeName,
+        sources: parseJson(value.sources),
+        state: 'new',
+        dueAt: now,
+        intervalDays: 0,
+        easeFactor: 2.5,
+        repetitions: 0,
+        lapses: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
+    database.exec('COMMIT');
+    return saved;
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      /* No active transaction. */
+    }
+    throw error;
+  } finally {
+    database.close();
+  }
+}
+
+function listStudyCards(root, options = {}) {
+  const contextId = options.contextId ? validateBookId(options.contextId) : '';
+  const kind =
+    options.kind && STUDY_KINDS.has(options.kind) ? options.kind : '';
+  const query = cleanText(options.query || '', 200, 'study query');
+  const dueOnly = Boolean(options.dueOnly);
+  const limit = Math.max(1, Math.min(300, Number(options.limit) || 100));
+  const offset = Math.max(0, Number(options.offset) || 0);
+  const clauses = [];
+  const params = [];
+  if (contextId) {
+    clauses.push('context_id = ?');
+    params.push(contextId);
+  }
+  if (kind) {
+    clauses.push('kind = ?');
+    params.push(kind);
+  }
+  if (dueOnly) {
+    clauses.push('due_at <= ?');
+    params.push(new Date().toISOString());
+  }
+  if (query) {
+    clauses.push(
+      "(front LIKE ? ESCAPE '\\' OR back LIKE ? ESCAPE '\\' OR context_name LIKE ? ESCAPE '\\')",
+    );
+    const escaped = `%${query.replace(/[\\%_]/g, '\\$&')}%`;
+    params.push(escaped, escaped, escaped);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const database = openWorkspace(root);
+  try {
+    const total = Number(
+      database
+        .prepare(`SELECT COUNT(*) AS count FROM study_cards ${where}`)
+        .get(...params).count,
+    );
+    const due = Number(
+      database
+        .prepare('SELECT COUNT(*) AS count FROM study_cards WHERE due_at <= ?')
+        .get(new Date().toISOString()).count,
+    );
+    const rows = database
+      .prepare(
+        `SELECT * FROM study_cards ${where} ORDER BY due_at, updated_at DESC LIMIT ? OFFSET ?`,
+      )
+      .all(...params, limit, offset);
+    return { total, due, items: rows.map(studyCardFromRow) };
+  } finally {
+    database.close();
+  }
+}
+
+function reviewStudyCard(root, id, rating) {
+  if (typeof id !== 'string' || !id) throw new Error('Invalid study card id');
+  if (!['again', 'hard', 'good', 'easy'].includes(rating))
+    throw new Error('Invalid study rating');
+  const database = openWorkspace(root);
+  try {
+    const row = database
+      .prepare('SELECT * FROM study_cards WHERE id = ?')
+      .get(id);
+    if (!row) throw new Error('Study card not found');
+    let ease = Number(row.ease_factor) || 2.5;
+    let repetitions = Number(row.repetitions) || 0;
+    let lapses = Number(row.lapses) || 0;
+    let interval = Number(row.interval_days) || 0;
+    let state = 'learning';
+    let minutes = 10;
+    if (rating === 'again') {
+      ease = Math.max(1.3, ease - 0.2);
+      repetitions = 0;
+      lapses += 1;
+      interval = 0;
+    } else if (rating === 'hard') {
+      ease = Math.max(1.3, ease - 0.15);
+      interval = Math.max(1, interval ? interval * 1.2 : 1);
+      minutes = interval * 24 * 60;
+      state = 'review';
+    } else if (rating === 'good') {
+      repetitions += 1;
+      interval =
+        repetitions === 1
+          ? 1
+          : repetitions === 2
+            ? 3
+            : Math.max(4, interval * ease);
+      minutes = interval * 24 * 60;
+      state = 'review';
+    } else {
+      repetitions += 1;
+      ease = Math.min(3.2, ease + 0.15);
+      interval = repetitions === 1 ? 4 : Math.max(7, interval * ease * 1.3);
+      minutes = interval * 24 * 60;
+      state = 'review';
+    }
+    interval = Math.round(interval * 10) / 10;
+    const now = new Date();
+    const dueAt = new Date(now.getTime() + minutes * 60_000).toISOString();
+    database
+      .prepare(`UPDATE study_cards SET state = ?, due_at = ?, interval_days = ?,
+        ease_factor = ?, repetitions = ?, lapses = ?, last_review_at = ?, updated_at = ?
+        WHERE id = ?`)
+      .run(
+        state,
+        dueAt,
+        interval,
+        ease,
+        repetitions,
+        lapses,
+        now.toISOString(),
+        now.toISOString(),
+        id,
+      );
+    return studyCardFromRow(
+      database.prepare('SELECT * FROM study_cards WHERE id = ?').get(id),
+    );
+  } finally {
+    database.close();
+  }
+}
+
+function removeStudyCard(root, id) {
+  if (typeof id !== 'string' || !id) throw new Error('Invalid study card id');
+  const database = openWorkspace(root);
+  try {
+    return {
+      removed:
+        database.prepare('DELETE FROM study_cards WHERE id = ?').run(id)
           .changes > 0,
     };
   } finally {
@@ -751,6 +1007,9 @@ function removeBookData(root, bookId) {
       .prepare('DELETE FROM research_items WHERE context_id = ?')
       .run(bookId);
     database
+      .prepare('DELETE FROM study_cards WHERE context_id = ?')
+      .run(bookId);
+    database
       .prepare('DELETE FROM knowledge_pack_books WHERE book_id = ?')
       .run(bookId);
     database.exec('COMMIT');
@@ -791,6 +1050,18 @@ function markdownExport(root, options = {}) {
     research.push(...batch.items);
     researchOffset += batch.items.length;
     if (researchOffset >= batch.total || batch.items.length === 0) break;
+  }
+  const study = [];
+  let studyOffset = 0;
+  while (true) {
+    const batch = listStudyCards(root, {
+      contextId: options.bookId,
+      limit: 300,
+      offset: studyOffset,
+    });
+    study.push(...batch.items);
+    studyOffset += batch.items.length;
+    if (studyOffset >= batch.total || batch.items.length === 0) break;
   }
   const database = openWorkspace(root);
   try {
@@ -859,6 +1130,21 @@ function markdownExport(root, options = {}) {
         }
       }
     }
+    if (study.length) {
+      const studyLabels = { concept: '概念', formula: '公式', qa: '问答' };
+      output.push('## 学习卡片', '');
+      for (const card of study) {
+        output.push(
+          `### ${studyLabels[card.kind]} · ${card.front}`,
+          '',
+          card.back,
+          '',
+          `- 来源范围：${card.contextName}`,
+          `- 复习状态：${card.state} · 间隔 ${card.intervalDays} 天 · 错误 ${card.lapses} 次`,
+          '',
+        );
+      }
+    }
     if (messages.length) {
       output.push('## 提问历史', '');
       for (const message of messages)
@@ -869,7 +1155,7 @@ function markdownExport(root, options = {}) {
           '',
         );
     }
-    if (!notes.length && !research.length && !messages.length)
+    if (!notes.length && !research.length && !study.length && !messages.length)
       output.push('暂无可导出的阅读资料。', '');
     return output.join('\n');
   } finally {
@@ -884,6 +1170,7 @@ module.exports = {
   importKnowledgePack,
   listNotes,
   listResearchItems,
+  listStudyCards,
   listKnowledgePacks,
   loadChat,
   markdownExport,
@@ -891,9 +1178,12 @@ module.exports = {
   removeKnowledgePack,
   removeNote,
   removeResearchItem,
+  removeStudyCard,
   replaceChat,
   saveNote,
   saveResearchItem,
+  saveStudyCards,
   searchHistory,
+  reviewStudyCard,
   updateKnowledgePack,
 };

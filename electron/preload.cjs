@@ -121,6 +121,14 @@ contextBridge.exposeInMainWorld('marginDesktop', {
     ipcRenderer.invoke('workspace:research-save', contextId, contextName, item),
   workspaceResearchRemove: (id) =>
     ipcRenderer.invoke('workspace:research-remove', id),
+  workspaceStudyList: (options) =>
+    ipcRenderer.invoke('workspace:study-list', options),
+  workspaceStudySave: (contextId, contextName, cards) =>
+    ipcRenderer.invoke('workspace:study-save', contextId, contextName, cards),
+  workspaceStudyReview: (id, rating) =>
+    ipcRenderer.invoke('workspace:study-review', id, rating),
+  workspaceStudyRemove: (id) =>
+    ipcRenderer.invoke('workspace:study-remove', id),
   workspaceExportMarkdown: (options) =>
     ipcRenderer.invoke('workspace:export-markdown', options),
 });

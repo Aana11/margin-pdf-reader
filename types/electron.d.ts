@@ -117,10 +117,32 @@ export type WorkspaceMessage = {
   role: 'user' | 'assistant';
   content: string;
   reasoning?: string;
+  quote?: string;
   page: number;
   createdAt?: string;
   citation?: WorkspaceCitation;
   sources?: KnowledgeSource[];
+};
+export type StudyCardKind = 'concept' | 'formula' | 'qa';
+export type StudyRating = 'again' | 'hard' | 'good' | 'easy';
+export type StudyCard = {
+  id: string;
+  contextId: string;
+  contextName: string;
+  kind: StudyCardKind;
+  front: string;
+  back: string;
+  sourceExcerpt: string;
+  sources?: KnowledgeSource[];
+  state: 'new' | 'learning' | 'review';
+  dueAt: string;
+  intervalDays: number;
+  easeFactor: number;
+  repetitions: number;
+  lapses: number;
+  lastReviewAt?: string;
+  createdAt: string;
+  updatedAt: string;
 };
 export type ResearchItemKind = 'question' | 'evidence' | 'outline';
 export type ResearchItem = {
@@ -379,6 +401,30 @@ declare global {
         },
       ) => Promise<ResearchItem>;
       workspaceResearchRemove?: (id: string) => Promise<{ removed: boolean }>;
+      workspaceStudyList?: (options?: {
+        contextId?: string;
+        kind?: StudyCardKind;
+        query?: string;
+        dueOnly?: boolean;
+        limit?: number;
+        offset?: number;
+      }) => Promise<{ total: number; due: number; items: StudyCard[] }>;
+      workspaceStudySave?: (
+        contextId: string,
+        contextName: string,
+        cards: Array<{
+          kind: StudyCardKind;
+          front: string;
+          back: string;
+          sourceExcerpt?: string;
+          sources?: KnowledgeSource[];
+        }>,
+      ) => Promise<StudyCard[]>;
+      workspaceStudyReview?: (
+        id: string,
+        rating: StudyRating,
+      ) => Promise<StudyCard>;
+      workspaceStudyRemove?: (id: string) => Promise<{ removed: boolean }>;
       workspaceExportMarkdown?: (options?: {
         bookId?: string;
       }) => Promise<{ exported: boolean; path?: string }>;

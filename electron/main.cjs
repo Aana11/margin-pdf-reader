@@ -3,6 +3,7 @@ const {
   BrowserWindow,
   dialog,
   ipcMain,
+  Menu,
   net,
   protocol,
   shell,
@@ -49,6 +50,7 @@ const {
   importKnowledgePack,
   listNotes,
   listResearchItems,
+  listStudyCards,
   listKnowledgePacks,
   loadChat,
   markdownExport,
@@ -56,10 +58,13 @@ const {
   removeKnowledgePack,
   removeNote,
   removeResearchItem,
+  removeStudyCard,
   replaceChat,
   saveNote,
   saveResearchItem,
+  saveStudyCards,
   searchHistory,
+  reviewStudyCard,
   updateKnowledgePack,
 } = require('./workspace-store.cjs');
 const { exportSearchablePdfFile } = require('./searchable-pdf.cjs');
@@ -1074,15 +1079,31 @@ async function fetchJsonWithTimeout(url, options = {}, timeout = 5_000) {
   }
 }
 
-async function managedGlmFilesReady() {
+async function getManagedGlmAssetStatus() {
   const resources = glmModelResources();
-  const checks = await Promise.all(
+  const files = await Promise.all(
     resources.map(async (resource) => {
       const details = await stat(resource.output).catch(() => null);
-      return Boolean(details?.isFile() && details.size === resource.size);
+      return {
+        name: resource.name,
+        path: resource.output,
+        expectedBytes: resource.size,
+        bytes: details?.size || 0,
+        ready: Boolean(details?.isFile() && details.size === resource.size),
+      };
     }),
   );
-  return checks.every(Boolean) && (await isRuntimeCurrent());
+  const runtimeInstalled = await isRuntimeCurrent();
+  return {
+    files,
+    modelInstalled: files.every((file) => file.ready),
+    runtimeInstalled,
+  };
+}
+
+async function managedGlmFilesReady() {
+  const status = await getManagedGlmAssetStatus();
+  return status.modelInstalled && status.runtimeInstalled;
 }
 
 function stopGlmSidecar() {
@@ -1300,8 +1321,8 @@ async function installManagedGlm(sender) {
 
 async function getGlmStatus(config) {
   if (config.provider === 'managed') {
-    const runtimeInstalled = await isRuntimeCurrent();
-    const modelInstalled = await managedGlmFilesReady();
+    const assets = await getManagedGlmAssetStatus();
+    const { runtimeInstalled, modelInstalled } = assets;
     const modelLoaded = Boolean(
       glmSidecarProcess && glmSidecarProcess.exitCode === null,
     );
@@ -1310,15 +1331,26 @@ async function getGlmStatus(config) {
       'downloading',
       'installing',
       'paused',
-      'error',
     ].includes(glmInstallState.state);
     const state = activeInstallState
       ? glmInstallState.state
       : modelLoaded
         ? 'loaded'
-        : modelInstalled
+        : modelInstalled && runtimeInstalled
           ? 'ready'
-          : 'missing-model';
+          : modelInstalled
+            ? 'missing-runtime'
+            : glmInstallState.state === 'error'
+              ? 'error'
+              : 'missing-model';
+    await logEvent('info', 'glm-ocr.status-checked', {
+      dataRoot: dataRoot(),
+      modelInstalled,
+      runtimeInstalled,
+      modelLoaded,
+      files: assets.files,
+      state,
+    });
     return {
       provider: 'managed',
       runtimeInstalled,
@@ -1332,9 +1364,13 @@ async function getGlmStatus(config) {
           ? glmInstallState.message
           : modelLoaded
             ? `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? `Vulkan GPU${glmCpuProjector ? '（显存保护）' : ''}` : 'CPU'}`
-            : modelInstalled
+            : modelInstalled && runtimeInstalled
               ? 'GLM-OCR 已安装，可按需自动启动'
-              : '约 1.4 GB，Margin 将自动下载模型与运行时',
+              : modelInstalled
+                ? 'GLM-OCR 模型已找到，需修复共享运行时'
+                : glmInstallState.state === 'error' && glmInstallState.message
+                  ? glmInstallState.message
+                  : '约 1.4 GB，Margin 将自动下载模型与运行时',
     };
   }
   if (config.provider !== 'ollama')
@@ -2464,6 +2500,25 @@ ipcMain.handle(
 ipcMain.handle('workspace:research-remove', (_event, id) =>
   removeResearchItem(dataRoot(), id),
 );
+ipcMain.handle('workspace:study-list', (_event, options) =>
+  listStudyCards(dataRoot(), options),
+);
+ipcMain.handle(
+  'workspace:study-save',
+  (_event, contextId, contextName, cards) =>
+    saveStudyCards(
+      dataRoot(),
+      assertWorkspaceContextId(contextId),
+      contextName,
+      cards,
+    ),
+);
+ipcMain.handle('workspace:study-review', (_event, id, rating) =>
+  reviewStudyCard(dataRoot(), id, rating),
+);
+ipcMain.handle('workspace:study-remove', (_event, id) =>
+  removeStudyCard(dataRoot(), id),
+);
 
 ipcMain.handle('workspace:export-markdown', async (_event, options = {}) => {
   const bookId = options.bookId ? assertBookId(options.bookId) : undefined;
@@ -2494,6 +2549,7 @@ function createWindow() {
     backgroundColor: '#eef1f4',
     title: `Margin v${app.getVersion()}`,
     titleBarStyle: 'hiddenInset',
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -2520,6 +2576,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
   void logEvent('info', 'app.ready', {
     version: app.getVersion(),
     packaged: app.isPackaged,

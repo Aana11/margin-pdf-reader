@@ -170,6 +170,12 @@ try {
     await window.marginDesktop.workspaceResearchSave(${JSON.stringify(book.id)}, 'Margin-Reader-Demo.pdf', { kind: 'question', title: '本地 RAG 如何保证回答可追溯？', content: '比较当前页说明与知识包检索结果。' });
     await window.marginDesktop.workspaceResearchSave('pack_' + ${JSON.stringify(demoLibrary.core)}, '知识包：高等数学核心', { kind: 'evidence', title: '跨书检索保留来源页码', content: '知识包只检索明确加入的书籍，并保留书名、页码和相似度。', sources: [{ bookId: ${JSON.stringify(book.id)}, bookName: 'Margin-Reader-Demo.pdf', page: 1, score: .94, excerpt: '本地 PDF 阅读与可追溯引用' }] });
     await window.marginDesktop.workspaceResearchSave('pack_' + ${JSON.stringify(demoLibrary.core)}, '知识包：高等数学核心', { kind: 'outline', title: '本地知识研究大纲', content: '1. 本地书库与索引\\n2. 跨书证据检索\\n3. GLM-OCR 公式精读\\n4. 带引用的结论输出' });
+    await window.marginDesktop.workspaceStudySave(${JSON.stringify(book.id)}, 'Margin-Reader-Demo.pdf', [
+      { kind: 'concept', front: 'RAG 为什么能让回答更可追溯？', back: '回答前先检索带页码的原文片段，并在结论中保留来源。', sourceExcerpt: '全文向量检索', sources: [{ bookId: ${JSON.stringify(book.id)}, bookName: 'Margin-Reader-Demo.pdf', page: 1, score: 1, excerpt: '全文向量检索' }] },
+      { kind: 'formula', front: '向量余弦相似度如何表示？', back: '$$\\cos(\\theta)=\\frac{x\\cdot y}{\\|x\\|\\|y\\|}$$', sourceExcerpt: '向量检索' },
+      { kind: 'qa', front: '知识包会自动检索整个书架吗？', back: '不会，只检索用户明确加入当前知识包的书籍。', sourceExcerpt: '知识包检索范围' },
+      { kind: 'concept', front: 'GLM-OCR 在检索链路中承担什么职责？', back: '对公式、表格和代码密集的命中页面做按需视觉精读。', sourceExcerpt: '公式精读' }
+    ]);
     localStorage.setItem('margin-settings-schema', '4');
     localStorage.setItem('margin-ai-settings', JSON.stringify({
       glmOcrMode: 'auto',
@@ -197,9 +203,9 @@ try {
   );
   await retry(async () => {
     const state = await evaluate(
-      `({ page: document.querySelector('.page-scroll-indicator')?.textContent || '', messages: document.querySelectorAll('.message').length })`,
+      `({ page: document.querySelector('.page-scroll-indicator')?.textContent || '', messages: document.querySelectorAll('.message').length, dialogOpen: Boolean(document.querySelector('[role="dialog"][data-open]')) })`,
     );
-    if (!state.page.includes('1 / 2') || state.messages !== 2)
+    if (!state.page.includes('1 / 2') || state.messages !== 2 || state.dialogOpen)
       throw new Error('Demo reader has not restored');
     return state;
   });
@@ -246,6 +252,26 @@ try {
       `Boolean(document.querySelector('[role="dialog"][data-open]'))`,
     );
     if (open) throw new Error('Knowledge pack dialog is still closing');
+    return true;
+  });
+  await evaluate(`document.querySelector('[aria-label="学习卡片"]')?.click()`);
+  await retry(async () => {
+    const state = await evaluate(
+      `({ dialog: Boolean(document.querySelector('.study-dialog')), cards: document.querySelectorAll('.study-card').length })`,
+    );
+    if (!state.dialog || state.cards !== 4)
+      throw new Error(`Study cards have not opened: ${JSON.stringify(state)}`);
+    return state;
+  });
+  await capture('study-cards.jpg');
+  await evaluate(
+    `document.querySelector('[role="dialog"][data-open] [data-slot="dialog-close"]')?.click()`,
+  );
+  await retry(async () => {
+    const open = await evaluate(
+      `Boolean(document.querySelector('[role="dialog"][data-open]'))`,
+    );
+    if (open) throw new Error('Study dialog is still closing');
     return true;
   });
   await delay(600);

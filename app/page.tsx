@@ -13,6 +13,7 @@ import {
   BookMarked,
   BookOpen,
   Bot,
+  BrainCircuit,
   CheckCircle2,
   ChevronDown,
   Clock3,
@@ -33,6 +34,7 @@ import {
   Pause,
   Play,
   Plus,
+  Quote,
   RotateCcw,
   ScanSearch,
   Search,
@@ -116,6 +118,9 @@ import type {
   OcrPageLayout,
   ResearchItem,
   ResearchItemKind,
+  StudyCard,
+  StudyCardKind,
+  StudyRating,
   WorkspaceHistoryItem,
   WorkspaceNote,
   WorkspaceNoteKind,
@@ -126,6 +131,7 @@ type Message = {
   role: 'user' | 'assistant';
   content: string;
   reasoning?: string;
+  quote?: string;
   page: number;
   createdAt?: string;
   citation?: RegionCitation;
@@ -344,12 +350,40 @@ function indexTaskStatusLabel(task: IndexTask) {
   return '需要处理';
 }
 
-function MarkdownMessage({ content }: { content: string }) {
+function MarkdownMessage({
+  content,
+  onQuote,
+}: {
+  content: string;
+  onQuote?: (text: string) => void;
+}) {
+  const contentRef = useRef<HTMLDivElement>(null);
   const normalized = content
     .replace(/\\\[([\s\S]*?)\\\]/g, (_, formula: string) => `$$${formula}$$`)
     .replace(/\\\((.+?)\\\)/g, (_, formula: string) => `$${formula}$`);
   return (
-    <div className="message-content">
+    <div
+      className="message-content"
+      role="presentation"
+      ref={contentRef}
+      onMouseUp={() => {
+        if (!onQuote) return;
+        const selection = window.getSelection();
+        const text = selection?.toString().trim() || '';
+        const anchor = selection?.anchorNode;
+        const focus = selection?.focusNode;
+        if (
+          !text ||
+          text.length > 8_000 ||
+          !anchor ||
+          !focus ||
+          !contentRef.current?.contains(anchor) ||
+          !contentRef.current.contains(focus)
+        )
+          return;
+        onQuote(text);
+      }}
+    >
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
@@ -365,6 +399,24 @@ function MarkdownMessage({ content }: { content: string }) {
       </ReactMarkdown>
     </div>
   );
+}
+
+function parseStudyCardsResponse(content: string) {
+  const fenced = content.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+  const candidate = fenced || content.slice(content.indexOf('['));
+  const start = candidate.indexOf('[');
+  const end = candidate.lastIndexOf(']');
+  if (start < 0 || end <= start) throw new Error('模型未返回学习卡片 JSON');
+  const parsed = JSON.parse(candidate.slice(start, end + 1));
+  if (!Array.isArray(parsed)) throw new Error('学习卡片格式无效');
+  return parsed.slice(0, 12).map((card) => {
+    const kind = String(card?.kind || '') as StudyCardKind;
+    const front = String(card?.front || '').trim();
+    const back = String(card?.back || '').trim();
+    if (!['concept', 'formula', 'qa'].includes(kind) || !front || !back)
+      throw new Error('学习卡片缺少类型、题面或答案');
+    return { kind, front, back };
+  });
 }
 
 async function renderPageImage(
@@ -805,6 +857,7 @@ export default function Home() {
   const vectorIndexRef = useRef(new MemoryVectorIndex());
   const embeddingProviderRef = useRef<EmbeddingProvider | null>(null);
   const chatAreaRef = useRef<HTMLDivElement>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const workspaceRef = useRef<HTMLDivElement>(null);
   const restoredReadingRef = useRef(false);
   const openLibraryBookRef = useRef<(book: LibraryEntry) => Promise<void>>(
@@ -828,6 +881,11 @@ export default function Home() {
   const [pageCount, setPageCount] = useState(0);
   const [pageText, setPageText] = useState('');
   const [question, setQuestion] = useState('');
+  const [answerQuote, setAnswerQuote] = useState<{
+    text: string;
+    page: number;
+    sources?: KnowledgeSource[];
+  } | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [loadingPdf, setLoadingPdf] = useState(false);
   const [asking, setAsking] = useState(false);
@@ -909,6 +967,19 @@ export default function Home() {
   const [researchTotal, setResearchTotal] = useState(0);
   const [selectedResearchIds, setSelectedResearchIds] = useState<string[]>([]);
   const [researchNotice, setResearchNotice] = useState('');
+  const [studyOpen, setStudyOpen] = useState(false);
+  const [studyQuery, setStudyQuery] = useState('');
+  const [studyKind, setStudyKind] = useState<'all' | StudyCardKind>('all');
+  const [studyDueOnly, setStudyDueOnly] = useState(false);
+  const [studyCards, setStudyCards] = useState<StudyCard[]>([]);
+  const [studyTotal, setStudyTotal] = useState(0);
+  const [studyDue, setStudyDue] = useState(0);
+  const [studyNotice, setStudyNotice] = useState('');
+  const [studyGenerating, setStudyGenerating] = useState(false);
+  const [studyReviewCard, setStudyReviewCard] = useState<StudyCard | null>(
+    null,
+  );
+  const [studyAnswerVisible, setStudyAnswerVisible] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyQuery, setHistoryQuery] = useState('');
   const [historyItems, setHistoryItems] = useState<WorkspaceHistoryItem[]>([]);
@@ -1258,6 +1329,49 @@ export default function Home() {
       window.clearTimeout(timeout);
     };
   }, [researchKind, researchOpen, researchQuery]);
+
+  const refreshStudyCards = useCallback(async () => {
+    const result = await window.marginDesktop?.workspaceStudyList?.({
+      kind: studyKind === 'all' ? undefined : studyKind,
+      query: studyQuery,
+      dueOnly: studyDueOnly,
+      limit: 200,
+      offset: 0,
+    });
+    if (!result) return;
+    setStudyCards(result.items);
+    setStudyTotal(result.total);
+    setStudyDue(result.due);
+  }, [studyDueOnly, studyKind, studyQuery]);
+
+  useEffect(() => {
+    if (!studyOpen || !window.marginDesktop?.workspaceStudyList) return;
+    let cancelled = false;
+    const timeout = window.setTimeout(() => {
+      void refreshStudyCards().catch((reason) => {
+        if (!cancelled)
+          setError(
+            `读取学习卡片失败：${reason instanceof Error ? reason.message : String(reason)}`,
+          );
+      });
+    }, 160);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [refreshStudyCards, studyOpen]);
+
+  useEffect(() => {
+    window.queueMicrotask(() => {
+      void window.marginDesktop
+        ?.workspaceStudyList?.({
+          dueOnly: true,
+          limit: 1,
+          offset: 0,
+        })
+        .then((result) => setStudyDue(result.due));
+    });
+  }, []);
 
   useEffect(() => {
     const bridge = window.marginDesktop;
@@ -2214,6 +2328,163 @@ export default function Home() {
       setResearchTotal((current) => current + 1);
       setResearchNotice('带引用大纲已生成并保存');
     }
+  }
+
+  async function generateStudyCards(sourceMessage?: Message) {
+    const context = activeResearchContext();
+    if (!context || !window.marginDesktop?.workspaceStudySave) {
+      setStudyNotice('请先打开书架中的书籍或选择一个知识包。');
+      return;
+    }
+    if (!settings.endpoint.trim() || !settings.model.trim()) {
+      setStudyNotice('请先在模型设置中配置可用的对话模型。');
+      return;
+    }
+    const latestAnswer = [...messages]
+      .reverse()
+      .find((message) => message.role === 'assistant' && message.content);
+    const source = sourceMessage || latestAnswer;
+    const sourceText = (source?.content || pageText).trim();
+    if (!sourceText) {
+      setStudyNotice('当前页和最近回答都没有可用于生成卡片的内容。');
+      return;
+    }
+    const book = library.find((item) => item.id === activeBookIdRef.current);
+    const sources = source?.sources?.length
+      ? source.sources
+      : book
+        ? [
+            {
+              bookId: book.id,
+              bookName: book.name,
+              page: source?.page || page,
+              score: 1,
+              excerpt: sourceText.slice(0, 600),
+            },
+          ]
+        : undefined;
+    setStudyGenerating(true);
+    setStudyNotice('正在从当前材料提炼概念、公式和问答卡…');
+    try {
+      const response = await fetch(
+        `${settings.endpoint.replace(/\/$/, '')}/chat/completions`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(settings.apiKey.trim()
+              ? { Authorization: `Bearer ${settings.apiKey.trim()}` }
+              : {}),
+          },
+          body: JSON.stringify({
+            model: settings.model,
+            temperature: 0.2,
+            stream: false,
+            messages: [
+              {
+                role: 'system',
+                content:
+                  '你是严谨的学习卡片编辑。只依据给定材料，不补造事实。输出纯 JSON 数组，不要输出解释或 Markdown 围栏。每项格式为 {"kind":"concept|formula|qa","front":"题面","back":"答案"}。生成 6 张互不重复的卡片，至少包含概念、公式、问答各一张；公式使用 LaTeX。',
+              },
+              {
+                role: 'user',
+                content: `来源范围：${context.name}\n\n材料：\n${sourceText.slice(0, 14000)}`,
+              },
+            ],
+          }),
+        },
+      );
+      if (!response.ok)
+        throw new Error((await response.text()) || `HTTP ${response.status}`);
+      const payload = await response.json();
+      const raw = payload?.choices?.[0]?.message?.content;
+      const content = Array.isArray(raw)
+        ? raw.map((part) => part?.text || '').join('')
+        : String(raw || '');
+      const cards = parseStudyCardsResponse(content).map((card) => ({
+        ...card,
+        sourceExcerpt: sourceText.slice(0, 2_000),
+        sources,
+      }));
+      const saved = await window.marginDesktop.workspaceStudySave(
+        context.id,
+        context.name,
+        cards,
+      );
+      setStudyCards((current) => [...saved, ...current]);
+      setStudyTotal((current) => current + saved.length);
+      setStudyDue((current) => current + saved.length);
+      setStudyNotice(`已生成 ${saved.length} 张卡片，全部进入今日复习。`);
+      window.marginDesktop?.logEvent?.('study.cards-generated', {
+        contextId: context.id,
+        count: saved.length,
+        source: source ? 'assistant-answer' : 'current-page',
+      });
+    } catch (reason) {
+      setStudyNotice(
+        `生成失败：${reason instanceof Error ? reason.message.slice(0, 180) : '未知错误'}`,
+      );
+    } finally {
+      setStudyGenerating(false);
+    }
+  }
+
+  async function gradeStudyCard(rating: StudyRating) {
+    const card = studyReviewCard;
+    if (!card || !window.marginDesktop?.workspaceStudyReview) return;
+    try {
+      const updated = await window.marginDesktop.workspaceStudyReview(
+        card.id,
+        rating,
+      );
+      setStudyCards((current) =>
+        current
+          .map((item) => (item.id === updated.id ? updated : item))
+          .filter((item) => !studyDueOnly || item.id !== updated.id),
+      );
+      setStudyDue((current) => Math.max(0, current - 1));
+      const remaining = await window.marginDesktop.workspaceStudyList?.({
+        dueOnly: true,
+        limit: 1,
+        offset: 0,
+      });
+      setStudyReviewCard(remaining?.items[0] || null);
+      if (remaining) setStudyDue(remaining.due);
+      setStudyAnswerVisible(false);
+      setStudyNotice(
+        rating === 'again'
+          ? '已记为错题，10 分钟后再次出现。'
+          : `已安排下次复习：${new Date(updated.dueAt).toLocaleString('zh-CN')}`,
+      );
+    } catch (reason) {
+      setStudyNotice(
+        `记录复习失败：${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    }
+  }
+
+  async function removeStudyEntry(card: StudyCard) {
+    if (!window.marginDesktop?.workspaceStudyRemove) return;
+    await window.marginDesktop.workspaceStudyRemove(card.id);
+    setStudyCards((current) => current.filter((item) => item.id !== card.id));
+    setStudyTotal((current) => Math.max(0, current - 1));
+    if (studyReviewCard?.id === card.id) setStudyReviewCard(null);
+    await refreshStudyCards();
+  }
+
+  async function startStudyReview() {
+    const result = await window.marginDesktop?.workspaceStudyList?.({
+      dueOnly: true,
+      limit: 1,
+      offset: 0,
+    });
+    const due = result?.items[0];
+    if (!due) {
+      setStudyNotice('今天没有到期卡片。');
+      return;
+    }
+    setStudyReviewCard(due);
+    setStudyAnswerVisible(false);
   }
 
   async function removeWorkspaceNote(note: WorkspaceNote) {
@@ -3650,8 +3921,10 @@ export default function Home() {
       setError('请先在模型设置中填写端点地址与模型名称。');
       return false;
     }
+    const quotedAnswer = regionContext ? null : answerQuote;
     const askedAt = new Date().toISOString();
-    const targetPage = regionContext?.citation.page ?? (pdf ? page : 1);
+    const targetPage =
+      regionContext?.citation.page ?? quotedAnswer?.page ?? (pdf ? page : 1);
     const citation = regionContext?.citation;
     const userMessage: Message = {
       role: 'user',
@@ -3661,6 +3934,7 @@ export default function Home() {
       page: targetPage,
       createdAt: askedAt,
       citation,
+      quote: quotedAnswer?.text,
     };
     const assistantMessage: Message = {
       role: 'assistant',
@@ -3672,6 +3946,7 @@ export default function Home() {
     };
     const previousMessages = messages;
     setQuestion('');
+    setAnswerQuote(null);
     setError('');
     setAsking(true);
     // Reserve a placeholder assistant bubble immediately so the user sees a
@@ -3785,8 +4060,8 @@ export default function Home() {
       const requestContent = regionContext
         ? `我框选了第 ${targetPage} 页的一处区域。\n\nGLM-OCR 对该区域的识别结果：\n${regionContext.recognized.slice(0, 16000)}\n\n任务：${prompt}\n\n回答必须以识别结果为依据，不要补造看不清的内容。行内公式使用 $...$，独立公式使用 $$...$$；代码使用带语言标记的代码块；表格使用 Markdown。`
         : knowledgePack
-          ? `你正在回答跨书知识包“${knowledgePack.name}”中的问题。只依据下列由用户明确加入知识包且符合当前筛选的书籍片段作答，不要引用书架中的其他书。每个关键结论都要在句末标注来源，格式为【《书名》· 第 N 页】；若证据不足，明确说明。\n\n跨书检索片段：\n${ragContext.slice(0, 20000)}\n\nGLM-OCR 跨书视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次来源不需要视觉精读）'}\n\n精读结果优先用于还原公式、表格和代码结构。行内公式使用 $...$，独立公式使用 $$...$$；代码使用带语言标记的代码块；表格使用 Markdown。\n\n我的问题：${prompt}`
-          : `我正在阅读第 ${page} 页。\n\n当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。行内公式使用 $...$，独立公式使用 $$...$$，以便阅读器渲染。\n\n我的问题：${prompt}`;
+          ? `你正在回答跨书知识包“${knowledgePack.name}”中的问题。只依据下列由用户明确加入知识包且符合当前筛选的书籍片段作答，不要引用书架中的其他书。每个关键结论都要在句末标注来源，格式为【《书名》· 第 N 页】；若证据不足，明确说明。\n\n${quotedAnswer ? `待核对的此前回答选段：\n> ${quotedAnswer.text.slice(0, 8000).replace(/\n/g, '\n> ')}\n\n` : ''}跨书检索片段：\n${ragContext.slice(0, 20000)}\n\nGLM-OCR 跨书视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次来源不需要视觉精读）'}\n\n精读结果优先用于还原公式、表格和代码结构。行内公式使用 $...$，独立公式使用 $$...$$；代码使用带语言标记的代码块；表格使用 Markdown。\n\n我的问题：${prompt}`
+          : `我正在阅读第 ${page} 页。\n\n${quotedAnswer ? `我正在针对你此前回答中的这段内容继续提问：\n> ${quotedAnswer.text.slice(0, 8000).replace(/\n/g, '\n> ')}\n\n请把它视为待核对的回答片段，结合原文判断，不要因为它来自此前回答就默认正确。\n\n` : ''}当前页原文：\n${pageText.slice(0, 12000) || '（此页未提取到可选文本，可能是扫描件）'}\n\n全文检索片段：\n${ragContext.slice(0, 12000)}\n\nGLM-OCR 视觉精读结果：\n${deepReadContext.slice(0, 16000) || '（本次未调用精读模型）'}\n\n请优先保留精读结果中的 LaTeX 公式、代码缩进与表格结构。行内公式使用 $...$，独立公式使用 $$...$$，以便阅读器渲染。\n\n我的问题：${prompt}`;
       const response = await fetch(
         `${settings.endpoint.replace(/\/$/, '')}/chat/completions`,
         {
@@ -4936,6 +5211,224 @@ export default function Home() {
               </DialogFooter>
             </DialogContent>
           </Dialog>
+          <Dialog
+            open={studyOpen}
+            onOpenChange={(open) => {
+              setStudyOpen(open);
+              if (!open) {
+                setStudyReviewCard(null);
+                setStudyAnswerVisible(false);
+              }
+            }}
+          >
+            <DialogTrigger
+              render={
+                <button
+                  className="sidebar-module-button"
+                  aria-label="学习卡片"
+                  title="知识点、公式卡、测验与间隔复习"
+                />
+              }
+            >
+              <BrainCircuit />
+              <span>学习</span>
+              {studyDue > 0 && <strong>{studyDue}</strong>}
+            </DialogTrigger>
+            <DialogContent className="study-dialog">
+              <DialogHeader>
+                <DialogTitle>学习卡片</DialogTitle>
+                <DialogDescription>
+                  从当前页面或 AI
+                  回答提炼概念、公式与问答卡，并按记忆情况安排复习。
+                </DialogDescription>
+              </DialogHeader>
+              {studyNotice && (
+                <button
+                  className="workspace-notice"
+                  onClick={() => setStudyNotice('')}
+                >
+                  {studyNotice}
+                </button>
+              )}
+              {studyReviewCard ? (
+                <div className="study-review">
+                  <div className={`study-kind ${studyReviewCard.kind}`}>
+                    {studyReviewCard.kind === 'concept'
+                      ? '概念'
+                      : studyReviewCard.kind === 'formula'
+                        ? '公式'
+                        : '问答'}
+                  </div>
+                  <small>{studyReviewCard.contextName}</small>
+                  <h3>{studyReviewCard.front}</h3>
+                  {studyAnswerVisible ? (
+                    <div className="study-review-answer">
+                      <MarkdownMessage content={studyReviewCard.back} />
+                      {studyReviewCard.sources?.[0] && (
+                        <button
+                          onClick={() =>
+                            void openKnowledgeSource(
+                              studyReviewCard.sources![0],
+                            )
+                          }
+                        >
+                          <FileText /> 回到《
+                          {studyReviewCard.sources[0].bookName}》第{' '}
+                          {studyReviewCard.sources[0].page} 页
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <Button onClick={() => setStudyAnswerVisible(true)}>
+                      显示答案
+                    </Button>
+                  )}
+                  {studyAnswerVisible && (
+                    <div className="study-ratings">
+                      <Button
+                        variant="outline"
+                        onClick={() => void gradeStudyCard('again')}
+                      >
+                        忘记 · 10 分钟
+                      </Button>
+                      <Button
+                        variant="outline"
+                        onClick={() => void gradeStudyCard('hard')}
+                      >
+                        困难
+                      </Button>
+                      <Button
+                        variant="outline"
+                        onClick={() => void gradeStudyCard('good')}
+                      >
+                        记得
+                      </Button>
+                      <Button onClick={() => void gradeStudyCard('easy')}>
+                        熟练
+                      </Button>
+                    </div>
+                  )}
+                  <button
+                    className="study-review-exit"
+                    onClick={() => {
+                      setStudyReviewCard(null);
+                      setStudyAnswerVisible(false);
+                    }}
+                  >
+                    退出本张复习
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="study-summary">
+                    <div>
+                      <strong>{studyDue}</strong>
+                      <span>今日待复习</span>
+                    </div>
+                    <div>
+                      <strong>{studyTotal}</strong>
+                      <span>当前筛选</span>
+                    </div>
+                    <Button
+                      onClick={() => void startStudyReview()}
+                      disabled={studyDue === 0}
+                    >
+                      <Play /> 开始复习
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => void generateStudyCards()}
+                      disabled={
+                        studyGenerating || (!pdf && !activeKnowledgePack)
+                      }
+                    >
+                      <Sparkles />
+                      {studyGenerating ? '生成中…' : '生成 6 张卡片'}
+                    </Button>
+                  </div>
+                  <div className="study-toolbar">
+                    <div className="workspace-search">
+                      <Search />
+                      <Input
+                        value={studyQuery}
+                        onChange={(event) => setStudyQuery(event.target.value)}
+                        placeholder="搜索题面、答案或书名"
+                        aria-label="搜索学习卡片"
+                      />
+                    </div>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={studyDueOnly}
+                        onChange={(event) =>
+                          setStudyDueOnly(event.target.checked)
+                        }
+                      />
+                      仅看今日
+                    </label>
+                  </div>
+                  <div className="workspace-filters">
+                    {(['all', 'concept', 'formula', 'qa'] as const).map(
+                      (kind) => (
+                        <button
+                          key={kind}
+                          className={studyKind === kind ? 'active' : ''}
+                          onClick={() => setStudyKind(kind)}
+                        >
+                          {kind === 'all'
+                            ? '全部'
+                            : kind === 'concept'
+                              ? '概念'
+                              : kind === 'formula'
+                                ? '公式'
+                                : '问答'}
+                        </button>
+                      ),
+                    )}
+                  </div>
+                  <div className="study-list">
+                    {studyCards.length === 0 ? (
+                      <p className="history-empty">
+                        暂无匹配卡片。打开书籍后可从当前页或 AI 回答生成。
+                      </p>
+                    ) : (
+                      studyCards.map((card) => (
+                        <article className="study-card" key={card.id}>
+                          <button
+                            className="study-card-main"
+                            onClick={() => {
+                              setStudyReviewCard(card);
+                              setStudyAnswerVisible(false);
+                            }}
+                          >
+                            <span className={`study-kind ${card.kind}`}>
+                              {card.kind === 'concept'
+                                ? '概念'
+                                : card.kind === 'formula'
+                                  ? '公式'
+                                  : '问答'}
+                            </span>
+                            <strong>{card.front}</strong>
+                            <small>
+                              {card.contextName} ·{' '}
+                              {card.lapses ? `错 ${card.lapses} 次` : '未错'}
+                            </small>
+                          </button>
+                          <button
+                            className="workspace-note-remove"
+                            onClick={() => void removeStudyEntry(card)}
+                            aria-label={`删除学习卡片 ${card.front}`}
+                          >
+                            <Trash2 />
+                          </button>
+                        </article>
+                      ))
+                    )}
+                  </div>
+                </>
+              )}
+            </DialogContent>
+          </Dialog>
         </nav>
         <div className="sidebar-bottom">
           <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
@@ -5288,15 +5781,18 @@ export default function Home() {
                             <strong>
                               {glmOcrStatus?.modelLoaded
                                 ? 'GLM-OCR 已载入内存'
-                                : glmOcrStatus?.modelInstalled
+                                : glmOcrStatus?.modelInstalled &&
+                                    glmOcrStatus?.runtimeInstalled
                                   ? 'GLM-OCR 已准备好'
-                                  : glmOcrStatus?.state === 'paused'
-                                    ? '下载已暂停'
-                                    : settings.glmOcrProvider === 'managed'
-                                      ? '尚未安装本地 GLM-OCR'
-                                      : glmOcrStatus?.runtimeInstalled
-                                        ? 'Ollama 已安装，模型未准备'
-                                        : '系统未检测到 Ollama'}
+                                  : glmOcrStatus?.modelInstalled
+                                    ? 'GLM-OCR 模型已找到'
+                                    : glmOcrStatus?.state === 'paused'
+                                      ? '下载已暂停'
+                                      : settings.glmOcrProvider === 'managed'
+                                        ? '尚未安装本地 GLM-OCR'
+                                        : glmOcrStatus?.runtimeInstalled
+                                          ? 'Ollama 已安装，模型未准备'
+                                          : '系统未检测到 Ollama'}
                             </strong>
                             <small>
                               {glmOcrStatus?.message ||
@@ -5357,11 +5853,14 @@ export default function Home() {
                                 'checking',
                               ].includes(glmOcrStatus?.state || '')}
                             >
-                              {glmOcrStatus?.modelInstalled
-                                ? '启动并载入'
-                                : glmOcrStatus?.state === 'paused'
-                                  ? '继续下载'
-                                  : '下载并安装'}
+                              {glmOcrStatus?.modelInstalled &&
+                              !glmOcrStatus?.runtimeInstalled
+                                ? '修复运行时'
+                                : glmOcrStatus?.modelInstalled
+                                  ? '启动并载入'
+                                  : glmOcrStatus?.state === 'paused'
+                                    ? '继续下载'
+                                    : '下载并安装'}
                             </Button>
                           )}
                           {glmOcrStatus?.modelLoaded && (
@@ -5918,19 +6417,17 @@ export default function Home() {
               {knowledgeSearchStatus}
             </p>
           )}
-          {!activeKnowledgePack && pdf && (
+          {!activeKnowledgePack && pdf && indexStatus !== 'ready' && (
             <div className={`index-strip ${indexStatus}`}>
               <div>
                 <strong>
-                  {indexStatus === 'ready'
-                    ? '全文索引已就绪'
-                    : indexStatus === 'indexing'
-                      ? `后台索引 ${indexProgress}%`
-                      : indexStatus === 'error'
-                        ? '索引建立失败'
-                        : activeBookTask?.status === 'paused'
-                          ? '索引已暂停'
-                          : '尚未建立全文索引'}
+                  {indexStatus === 'indexing'
+                    ? `后台索引 ${indexProgress}%`
+                    : indexStatus === 'error'
+                      ? '索引建立失败'
+                      : activeBookTask?.status === 'paused'
+                        ? '索引已暂停'
+                        : '尚未建立全文索引'}
                 </strong>
                 <span title={indexMessage}>
                   {indexMessage ||
@@ -5945,39 +6442,40 @@ export default function Home() {
                 )}
               </div>
               <Button
-                variant={indexStatus === 'ready' ? 'ghost' : 'outline'}
+                variant="outline"
                 size="sm"
                 onClick={() =>
                   indexStatus === 'indexing' ? stopIndexing() : buildIndex()
                 }
               >
-                {indexStatus === 'ready'
-                  ? '重新索引'
-                  : indexStatus === 'indexing'
-                    ? '暂停'
-                    : indexStatus === 'error'
-                      ? '重试'
-                      : hasIndexCheckpoint ||
-                          activeBookTask?.status === 'paused'
-                        ? '继续索引'
-                        : '建立索引'}
+                {indexStatus === 'indexing'
+                  ? '暂停'
+                  : indexStatus === 'error'
+                    ? '重试'
+                    : hasIndexCheckpoint || activeBookTask?.status === 'paused'
+                      ? '继续索引'
+                      : '建立索引'}
               </Button>
             </div>
           )}
           {scanWarning && <p className="scan-warning">{scanWarning}</p>}
-          {(pdf || activeKnowledgePack) &&
-            (settings.glmOcrMode === 'auto' || deepReadStatus) && (
-              <p
-                className={
-                  deepReadStatus.includes('失败')
-                    ? 'deep-read-status error'
-                    : 'deep-read-status'
-                }
-              >
-                <Sparkles />
-                {deepReadStatus || 'GLM-OCR 已待命 · 复杂页面将自动精读'}
-              </p>
-            )}
+          {(pdf || activeKnowledgePack) && settings.glmOcrMode === 'auto' && (
+            <p
+              className={`assistant-model-status${deepReadStatus.includes('失败') ? ' error' : ''}`}
+              title={glmOcrStatus?.message}
+            >
+              <span
+                className={`status-dot${glmOcrStatus?.modelInstalled && glmOcrStatus?.runtimeInstalled ? ' online' : ''}`}
+              />
+              {deepReadStatus ||
+                (glmOcrStatus?.modelLoaded
+                  ? 'GLM-OCR 已载入'
+                  : glmOcrStatus?.modelInstalled &&
+                      glmOcrStatus?.runtimeInstalled
+                    ? 'GLM-OCR 已就绪，将按需精读'
+                    : glmOcrStatus?.message || '正在检测 GLM-OCR')}
+            </p>
+          )}
           <div
             className="chat-area"
             ref={chatAreaRef}
@@ -6048,9 +6546,28 @@ export default function Home() {
                             <i />
                           </p>
                         ) : message.role === 'assistant' ? (
-                          <MarkdownMessage content={message.content} />
+                          <MarkdownMessage
+                            content={message.content}
+                            onQuote={(text) => {
+                              setAnswerQuote({
+                                text,
+                                page: message.page,
+                                sources: message.sources,
+                              });
+                              window.getSelection()?.removeAllRanges();
+                              window.setTimeout(
+                                () => composerInputRef.current?.focus(),
+                                0,
+                              );
+                            }}
+                          />
                         ) : (
-                          <p>{message.content}</p>
+                          <div className="user-message-content">
+                            {message.quote && (
+                              <blockquote>{message.quote}</blockquote>
+                            )}
+                            <p>{message.content}</p>
+                          </div>
                         )}
                         {message.role === 'assistant' &&
                           message.sources &&
@@ -6111,6 +6628,18 @@ export default function Home() {
                                 存为摘要卡片
                               </button>
                             )}
+                          {message.role === 'assistant' && message.content && (
+                            <button
+                              className="message-save-card"
+                              onClick={() => {
+                                setStudyOpen(true);
+                                void generateStudyCards(message);
+                              }}
+                            >
+                              <BrainCircuit />
+                              生成学习卡
+                            </button>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -6129,6 +6658,22 @@ export default function Home() {
                 {workspaceNotice}
               </button>
             )}
+            {answerQuote && (
+              <div className="answer-quote">
+                <Quote />
+                <div>
+                  <small>引用回答 · 第 {answerQuote.page} 页</small>
+                  <p>{answerQuote.text}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAnswerQuote(null)}
+                  aria-label="取消引用"
+                >
+                  <X />
+                </button>
+              </div>
+            )}
             <div className="quick-prompts">
               {quickPrompts.map((prompt) => (
                 <button
@@ -6142,6 +6687,7 @@ export default function Home() {
             </div>
             <form className="composer" onSubmit={(event) => void askAi(event)}>
               <Textarea
+                ref={composerInputRef}
                 value={question}
                 onChange={(event) => setQuestion(event.target.value)}
                 onKeyDown={(event) => {
@@ -6152,11 +6698,13 @@ export default function Home() {
                 }}
                 disabled={(!pdf && !activeKnowledgePack) || asking}
                 placeholder={
-                  activeKnowledgePack
-                    ? `向“${activeKnowledgePack.name}”中的 ${activeKnowledgePack.bookIds.length} 本书提问…`
-                    : pdf
-                      ? `针对第 ${page} 页提问…`
-                      : '请先打开 PDF 或选择知识包'
+                  answerQuote
+                    ? '针对所选回答内容继续提问…'
+                    : activeKnowledgePack
+                      ? `向“${activeKnowledgePack.name}”中的 ${activeKnowledgePack.bookIds.length} 本书提问…`
+                      : pdf
+                        ? `针对第 ${page} 页提问…`
+                        : '请先打开 PDF 或选择知识包'
                 }
                 aria-label="输入问题"
               />
