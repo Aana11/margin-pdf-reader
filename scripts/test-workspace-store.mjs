@@ -17,11 +17,16 @@ try {
     {
       role: 'assistant',
       content: '线性空间是满足八条公理的集合。',
+      reasoning: '先根据教材定义核对公理。',
       page: 12,
       createdAt: '2026-09-08T10:00:01.000Z',
     },
   ]);
   assert.equal(workspaceStore.loadChat(root, bookId).length, 2);
+  assert.equal(
+    workspaceStore.loadChat(root, bookId)[1].reasoning,
+    '先根据教材定义核对公理。',
+  );
   assert.equal(workspaceStore.searchHistory(root, '线性', 20, 0).total, 1);
   const sourceChatId = 'pack_029';
   workspaceStore.replaceChat(root, sourceChatId, '知识包：代数', [
@@ -49,6 +54,52 @@ try {
       excerpt: '线性空间',
     },
   ]);
+  const researchQuestion = workspaceStore.saveResearchItem(
+    root,
+    sourceChatId,
+    '知识包：代数',
+    {
+      kind: 'question',
+      title: '比较线性空间定义',
+      content: '不同教材怎样定义线性空间？',
+    },
+  );
+  const researchEvidence = workspaceStore.saveResearchItem(
+    root,
+    sourceChatId,
+    '知识包：代数',
+    {
+      kind: 'evidence',
+      title: '八条公理',
+      content: '教材列出了八条公理。',
+      sources: [
+        {
+          bookId,
+          bookName: '高等代数.pdf',
+          page: 12,
+          score: 0.91,
+          excerpt: '线性空间',
+        },
+      ],
+    },
+  );
+  assert.equal(
+    workspaceStore.listResearchItems(root, {
+      contextId: sourceChatId,
+      query: '线性',
+    }).total,
+    1,
+  );
+  assert.equal(
+    workspaceStore.listResearchItems(root, { kind: 'evidence' }).items[0]
+      .sources[0].page,
+    12,
+  );
+  assert.equal(
+    workspaceStore.removeResearchItem(root, researchQuestion.id).removed,
+    true,
+  );
+  assert.ok(researchEvidence.id);
 
   const pack = workspaceStore.createKnowledgePack(root, {
     name: '代数核心',

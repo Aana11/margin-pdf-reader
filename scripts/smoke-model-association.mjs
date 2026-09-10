@@ -135,14 +135,15 @@ try {
   assert.equal(associated.settings.embeddingKind, 'local-qwen3-embedding-4b');
   assert.equal(associated.settings.glmOcrProvider, 'managed');
   assert.equal(associated.settings.glmOcrAutoStart, true);
-  assert.equal(associated.schema, '3');
+  assert.equal(associated.schema, '4');
   assert.equal(associated.embedding.installed, true);
   assert.equal(associated.glm.modelInstalled, true);
   assert.equal(associated.app.version, expectedVersion);
   assert.equal(associated.app.dataRoot, dataRoot);
 
   await evaluate(
-    `(() => { const settings = JSON.parse(localStorage.getItem('margin-ai-settings')); settings.glmOcrMode = 'off'; localStorage.setItem('margin-ai-settings', JSON.stringify(settings)); window.location.reload(); })()`,
+    `(async () => { const settings = JSON.parse(localStorage.getItem('margin-ai-settings')); settings.glmOcrMode = 'off'; localStorage.setItem('margin-ai-settings', JSON.stringify(settings)); await window.marginDesktop.settingsSave(settings); window.location.reload(); })()`,
+    true,
   );
   const preserved = await retry(() =>
     evaluate(

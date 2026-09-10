@@ -48,14 +48,17 @@ const {
   getKnowledgePack,
   importKnowledgePack,
   listNotes,
+  listResearchItems,
   listKnowledgePacks,
   loadChat,
   markdownExport,
   removeBookData,
   removeKnowledgePack,
   removeNote,
+  removeResearchItem,
   replaceChat,
   saveNote,
+  saveResearchItem,
   searchHistory,
   updateKnowledgePack,
 } = require('./workspace-store.cjs');
@@ -69,6 +72,20 @@ const modelRevision = 'f4602530db1d980e16da9d7d3a70294cf5c190be';
 const runtimeVersion = 'b10516';
 const gpuRuntimeVersion = 'b10516';
 const forcedRuntimeBackend = process.env.MARGIN_RUNTIME_BACKEND;
+const detectedGpuMemoryMiB = Number(
+  spawnSync(
+    'nvidia-smi',
+    ['--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+    {
+      windowsHide: true,
+      encoding: 'utf8',
+      timeout: 3_000,
+    },
+  )
+    .stdout?.split(/\r?\n/)
+    .find(Boolean)
+    ?.trim() || 0,
+);
 const runtimeBackend = ['cpu', 'vulkan'].includes(forcedRuntimeBackend)
   ? forcedRuntimeBackend
   : spawnSync('nvidia-smi', ['--query-gpu=name', '--format=csv,noheader'], {
@@ -102,6 +119,13 @@ let glmSidecarProcess;
 let glmSidecarIdleTimer;
 let glmDownloadController;
 let glmInstallState = { state: 'idle', progress: 0, message: '' };
+let glmLastExit;
+// The GLM vision projector can build a 16+ GB Vulkan graph for dense pages.
+// Keep it on the CPU on consumer GPUs while the decoder remains GPU-backed.
+let glmCpuProjector =
+  runtimeBackend !== 'vulkan' ||
+  !detectedGpuMemoryMiB ||
+  detectedGpuMemoryMiB < 10 * 1024;
 
 const glmManagedModel = 'ggml-org/GLM-OCR-GGUF';
 const glmManagedModelName = 'GLM-OCR-Q8_0.gguf';
@@ -134,8 +158,41 @@ function dataRoot() {
   return process.env.MARGIN_DATA_ROOT || app.getPath('userData');
 }
 
+function assetRoot() {
+  return process.env.MARGIN_ASSET_ROOT || dataRoot();
+}
+
 function logFile() {
   return path.join(dataRoot(), 'logs', 'main.log');
+}
+
+function preferencesFile() {
+  return path.join(dataRoot(), 'preferences.json');
+}
+
+async function readPreferences() {
+  try {
+    const parsed = JSON.parse(await readFile(preferencesFile(), 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writePreferences(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('设置数据无效');
+  const serialized = JSON.stringify(value, null, 2);
+  if (serialized.length > 64 * 1024) throw new Error('设置数据过大');
+  await mkdir(dataRoot(), { recursive: true });
+  const target = preferencesFile();
+  const temporary = `${target}.new`;
+  await writeFile(temporary, serialized, 'utf8');
+  await rm(target, { force: true });
+  await rename(temporary, target);
+  return { saved: true, path: target };
 }
 
 function ocrRoot() {
@@ -290,16 +347,16 @@ function logEvent(level, event, details = {}) {
 }
 
 function modelFile() {
-  return path.join(dataRoot(), 'models', 'Qwen', modelDirectory, modelName);
+  return path.join(assetRoot(), 'models', 'Qwen', modelDirectory, modelName);
 }
 
 function runtimeFile() {
-  return path.join(dataRoot(), 'runtime', 'llama', 'llama-server.exe');
+  return path.join(assetRoot(), 'runtime', 'llama', 'llama-server.exe');
 }
 
 function runtimeArchive() {
   return path.join(
-    dataRoot(),
+    assetRoot(),
     'downloads',
     runtimeBackend === 'vulkan'
       ? `llama-${gpuRuntimeVersion}-bin-win-vulkan-x64.zip`
@@ -330,11 +387,11 @@ async function isRuntimeCurrent() {
 }
 
 function glmModelFile() {
-  return path.join(dataRoot(), 'models', 'GLM-OCR', glmManagedModelName);
+  return path.join(assetRoot(), 'models', 'GLM-OCR', glmManagedModelName);
 }
 
 function glmProjectorFile() {
-  return path.join(dataRoot(), 'models', 'GLM-OCR', glmManagedProjectorName);
+  return path.join(assetRoot(), 'models', 'GLM-OCR', glmManagedProjectorName);
 }
 
 function glmModelResources() {
@@ -902,7 +959,7 @@ async function getModelStatus() {
       installed: true,
       loaded: Boolean(sidecarProcess && sidecarProcess.exitCode === null),
       model: embeddingModel,
-      root: dataRoot(),
+      root: assetRoot(),
       backend: runtimeBackend,
       ...modelInstallState,
       state:
@@ -914,7 +971,7 @@ async function getModelStatus() {
     loaded: false,
     missing,
     model: embeddingModel,
-    root: dataRoot(),
+    root: assetRoot(),
     backend: runtimeBackend,
     ...modelInstallState,
   };
@@ -1054,6 +1111,7 @@ async function startManagedGlmSidecar() {
   const port = await getFreePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   let logs = '';
+  glmLastExit = undefined;
   const startedAt = Date.now();
   const args = [
     '--model',
@@ -1068,15 +1126,22 @@ async function startManagedGlmSidecar() {
     '12288',
     '--parallel',
     '1',
+    '--batch-size',
+    '512',
+    '--ubatch-size',
+    '256',
+    '--cache-type-k',
+    'q8_0',
+    '--image-max-tokens',
+    '2048',
     '--threads',
     String(Math.max(1, Math.min(8, Math.ceil(os.cpus().length / 2)))),
     '--flash-attn',
     'off',
     '--fit',
     'off',
-    ...(runtimeBackend === 'vulkan'
-      ? ['--n-gpu-layers', '99']
-      : ['--no-mmproj-offload']),
+    ...(runtimeBackend === 'vulkan' ? ['--n-gpu-layers', '99'] : []),
+    ...(glmCpuProjector ? ['--no-mmproj-offload'] : []),
     '--no-webui',
   ];
   await logEvent('info', 'glm-ocr.sidecar-starting', {
@@ -1084,6 +1149,8 @@ async function startManagedGlmSidecar() {
     modelPath: glmModelFile(),
     projectorPath: glmProjectorFile(),
     backend: runtimeBackend,
+    cpuProjector: glmCpuProjector,
+    gpuMemoryMiB: detectedGpuMemoryMiB,
     port,
   });
   glmSidecarProcess = spawn(runtimeFile(), args, {
@@ -1097,6 +1164,13 @@ async function startManagedGlmSidecar() {
   launchedProcess.stdout.on('data', collect);
   launchedProcess.stderr.on('data', collect);
   launchedProcess.once('exit', (code, signal) => {
+    glmLastExit = {
+      code,
+      signal,
+      logs,
+      outOfMemory:
+        /OutOfDeviceMemory|failed to allocate Vulkan|GGML_ASSERT/i.test(logs),
+    };
     void logEvent(
       code === 0 || signal === 'SIGTERM' ? 'info' : 'error',
       'glm-ocr.sidecar-exited',
@@ -1121,6 +1195,7 @@ async function startManagedGlmSidecar() {
           port,
           elapsedMs: Date.now() - startedAt,
           backend: runtimeBackend,
+          cpuProjector: glmCpuProjector,
         });
         return baseUrl;
       }
@@ -1256,7 +1331,7 @@ async function getGlmStatus(config) {
         activeInstallState && glmInstallState.message
           ? glmInstallState.message
           : modelLoaded
-            ? `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? 'Vulkan GPU' : 'CPU'}`
+            ? `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? `Vulkan GPU${glmCpuProjector ? '（显存保护）' : ''}` : 'CPU'}`
             : modelInstalled
               ? 'GLM-OCR 已安装，可按需自动启动'
               : '约 1.4 GB，Margin 将自动下载模型与运行时',
@@ -1424,12 +1499,13 @@ async function prepareGlm(config, sender) {
         provider: 'managed',
         state: 'loaded',
         progress: 100,
-        message: `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? 'Vulkan GPU' : 'CPU'}`,
+        message: `GLM-OCR 已载入 · ${runtimeBackend === 'vulkan' ? `Vulkan GPU${glmCpuProjector ? '（显存保护）' : ''}` : 'CPU'}`,
       });
       await logEvent('info', 'glm-ocr.prepared', {
         provider: 'managed',
         model: glmManagedModel,
         backend: runtimeBackend,
+        cpuProjector: glmCpuProjector,
       });
       return getGlmStatus(config);
     }
@@ -1579,11 +1655,32 @@ async function recognizeGlm(payload) {
           },
         ],
       };
-      const response = await fetchJsonWithTimeout(
-        endpoint,
-        { method: 'POST', headers, body: JSON.stringify(body) },
-        180_000,
-      );
+      let response;
+      try {
+        response = await fetchJsonWithTimeout(
+          endpoint,
+          { method: 'POST', headers, body: JSON.stringify(body) },
+          180_000,
+        );
+      } catch (error) {
+        // A crashed local HTTP process surfaces as ECONNRESET. Inspect its
+        // captured stderr and retry once with the vision projector on CPU.
+        if (config.provider !== 'managed' || glmCpuProjector) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        if (!glmLastExit?.outOfMemory) throw error;
+        await logEvent('warn', 'glm-ocr.vram-fallback', {
+          gpuMemoryMiB: detectedGpuMemoryMiB,
+          exitCode: glmLastExit.code,
+        });
+        glmCpuProjector = true;
+        stopGlmSidecar();
+        const fallbackEndpoint = `${await getManagedGlmUrl()}/v1/chat/completions`;
+        response = await fetchJsonWithTimeout(
+          fallbackEndpoint,
+          { method: 'POST', headers, body: JSON.stringify(body) },
+          180_000,
+        );
+      }
       const content = response.choices?.[0]?.message?.content;
       result = (
         typeof content === 'string'
@@ -1629,7 +1726,10 @@ ipcMain.handle('app:info', () => ({
     runtimeBackend === 'vulkan'
       ? 8
       : Math.max(1, Math.min(4, Math.floor(os.cpus().length / 4))),
+  gpuMemoryMiB: detectedGpuMemoryMiB,
 }));
+ipcMain.handle('settings:load', readPreferences);
+ipcMain.handle('settings:save', (_event, value) => writePreferences(value));
 ipcMain.handle('glm:status', (_event, payload) =>
   getGlmStatus(assertGlmConfig(payload)),
 );
@@ -2347,6 +2447,22 @@ ipcMain.handle('workspace:note-save', (_event, bookId, bookName, note) =>
 
 ipcMain.handle('workspace:note-remove', (_event, id) =>
   removeNote(dataRoot(), id),
+);
+ipcMain.handle('workspace:research-list', (_event, options) =>
+  listResearchItems(dataRoot(), options),
+);
+ipcMain.handle(
+  'workspace:research-save',
+  (_event, contextId, contextName, item) =>
+    saveResearchItem(
+      dataRoot(),
+      assertWorkspaceContextId(contextId),
+      contextName,
+      item,
+    ),
+);
+ipcMain.handle('workspace:research-remove', (_event, id) =>
+  removeResearchItem(dataRoot(), id),
 );
 
 ipcMain.handle('workspace:export-markdown', async (_event, options = {}) => {

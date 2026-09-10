@@ -212,8 +212,38 @@ textarea {
   height: 100vh;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(340px, 410px);
+  grid-template-columns: minmax(0, var(--reader-split, 70%)) 8px minmax(0, 1fr);
   overflow: hidden;
+}
+.workspace-resizer {
+  position: relative;
+  z-index: 25;
+  display: grid;
+  width: 8px;
+  height: 100%;
+  place-items: center;
+  cursor: col-resize;
+  background: #e5eaec;
+  touch-action: none;
+}
+.workspace-resizer::after {
+  content: '';
+  width: 2px;
+  height: 42px;
+  border-radius: 999px;
+  background: #a7b4b7;
+  transition:
+    width 0.15s ease,
+    background 0.15s ease;
+}
+.workspace-resizer:hover::after,
+.workspace-resizer:focus-visible::after {
+  width: 4px;
+  background: #3d9f93;
+}
+body.resizing-split {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .library-dialog {
@@ -1516,6 +1546,45 @@ textarea {
   color: #218276;
   text-decoration: underline;
 }
+.message-reasoning {
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid #d9e5e3;
+  border-radius: 9px;
+  background: #f5f9f8;
+  color: #607476;
+  font-size: 11px;
+}
+.message-reasoning summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  color: #477873;
+  cursor: pointer;
+  list-style: none;
+}
+.message-reasoning summary::-webkit-details-marker {
+  display: none;
+}
+.message-reasoning summary svg {
+  width: 12px;
+  height: 12px;
+}
+.message-reasoning summary svg:last-child {
+  margin-left: auto;
+  transition: transform 0.15s ease;
+}
+.message-reasoning[open] summary svg:last-child {
+  transform: rotate(180deg);
+}
+.message-reasoning > div {
+  max-height: 240px;
+  overflow: auto;
+  padding: 0 10px 9px;
+  white-space: pre-wrap;
+  line-height: 1.6;
+}
 .message.user {
   grid-template-columns: minmax(0, 1fr) 30px;
 }
@@ -1589,7 +1658,8 @@ textarea {
   font-size: 8px;
 }
 .message-citation,
-.message-save-card {
+.message-save-card,
+.message-research-save {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -1603,13 +1673,15 @@ textarea {
   cursor: pointer;
 }
 .message-citation:hover,
-.message-save-card:hover {
+.message-save-card:hover,
+.message-research-save:hover {
   border-color: #73b9af;
   background: #e7f4f1;
   color: #1d7469;
 }
 .message-citation svg,
-.message-save-card svg {
+.message-save-card svg,
+.message-research-save svg {
   width: 12px;
   height: 12px;
 }
@@ -1620,6 +1692,11 @@ textarea {
   border-color: #d7dfea;
   background: #f4f7fb;
   color: #55738a;
+}
+.message-research-save {
+  border-color: #d9d6e8;
+  background: #f6f4fb;
+  color: #695b8c;
 }
 .thinking i {
   display: inline-block;
@@ -2167,6 +2244,95 @@ textarea {
   font-size: 11px;
   cursor: pointer;
 }
+.research-dialog {
+  width: min(860px, calc(100vw - 32px));
+  max-width: 860px;
+  max-height: min(84vh, 780px);
+  overflow: hidden;
+}
+.research-toolbar {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.research-toolbar .workspace-filters {
+  margin: 0;
+}
+.research-list {
+  min-height: 220px;
+  max-height: 52vh;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  overflow-y: auto;
+}
+.research-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 38px;
+  border: 1px solid #e0e6e8;
+  border-radius: 10px;
+  background: #fbfcfc;
+  overflow: hidden;
+}
+.research-item > label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 12px 8px;
+  border-right: 1px solid #edf0f1;
+  color: #718084;
+  font-size: 9px;
+}
+.research-item > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px;
+}
+.research-item > div > strong {
+  color: #344448;
+  font-size: 13px;
+}
+.research-item > div > small {
+  color: #879397;
+  font-size: 10px;
+}
+.research-item > div > p {
+  max-height: 78px;
+  margin: 3px 0 0;
+  overflow: hidden;
+  color: #5c696d;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.research-item.question {
+  border-left: 3px solid #e1b85e;
+}
+.research-item.evidence {
+  border-left: 3px solid #65b3a8;
+}
+.research-item.outline {
+  border-left: 3px solid #8b83c7;
+}
+.research-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 5px;
+}
+.research-sources button {
+  padding: 3px 6px;
+  border: 1px solid #cfe0dd;
+  border-radius: 999px;
+  background: #f0f7f6;
+  color: #347b73;
+  font-size: 9px;
+  cursor: pointer;
+}
 
 @media (max-width: 800px) {
   .app-shell {
@@ -2189,6 +2355,9 @@ textarea {
     min-height: 100vh;
     grid-template-columns: 1fr;
     grid-template-rows: minmax(560px, 70vh) minmax(520px, auto);
+  }
+  .workspace-resizer {
+    display: none;
   }
   .reader-panel {
     border-right: 0;
@@ -2240,6 +2409,9 @@ textarea {
   }
   .library-dialog-actions > div {
     flex-wrap: wrap;
+  }
+  .research-toolbar {
+    grid-template-columns: 1fr;
   }
   .task-center-summary {
     grid-template-columns: 1fr;

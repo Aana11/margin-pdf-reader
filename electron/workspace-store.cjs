@@ -3,9 +3,10 @@ const { mkdirSync } = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const path = require('node:path');
 
-const WORKSPACE_VERSION = 2;
+const WORKSPACE_VERSION = 3;
 const WORKSPACE_FILE = 'workspace.sqlite';
 const NOTE_KINDS = new Set(['highlight', 'note', 'summary', 'glossary']);
+const RESEARCH_KINDS = new Set(['question', 'evidence', 'outline']);
 
 function cleanText(value, maximum, field) {
   if (typeof value !== 'string') throw new Error(`Invalid ${field}`);
@@ -73,6 +74,19 @@ function openWorkspace(root) {
       PRIMARY KEY (pack_id, book_id)
     ) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS knowledge_pack_books_book ON knowledge_pack_books(book_id);
+    CREATE TABLE IF NOT EXISTS research_items (
+      id TEXT PRIMARY KEY,
+      context_id TEXT NOT NULL,
+      context_name TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('question', 'evidence', 'outline')),
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      sources_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS research_items_context_updated ON research_items(context_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS research_items_kind_updated ON research_items(kind, updated_at DESC);
     INSERT OR REPLACE INTO metadata(key, value) VALUES ('version', '${WORKSPACE_VERSION}');
   `);
   const messageColumns = new Set(
@@ -83,6 +97,8 @@ function openWorkspace(root) {
   );
   if (!messageColumns.has('sources_json'))
     database.exec('ALTER TABLE messages ADD COLUMN sources_json TEXT');
+  if (!messageColumns.has('reasoning_text'))
+    database.exec('ALTER TABLE messages ADD COLUMN reasoning_text TEXT');
   return database;
 }
 
@@ -352,7 +368,7 @@ function replaceChat(root, bookId, bookName, messages) {
   const database = openWorkspace(root);
   try {
     const insert = database.prepare(
-      'INSERT INTO messages (id, book_id, book_name, position, role, content, page, citation_json, sources_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO messages (id, book_id, book_name, position, role, content, reasoning_text, page, citation_json, sources_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     );
     database.exec('BEGIN IMMEDIATE');
     database.prepare('DELETE FROM messages WHERE book_id = ?').run(bookId);
@@ -371,6 +387,7 @@ function replaceChat(root, bookId, bookName, messages) {
         position,
         message.role,
         cleanText(message.content, 100_000, 'message'),
+        cleanText(message.reasoning || '', 100_000, 'message reasoning'),
         message.page,
         serializeCitation(message.citation),
         serializeSources(message.sources),
@@ -402,18 +419,145 @@ function loadChat(root, bookId, limit = 100) {
   try {
     const rows = database
       .prepare(
-        'SELECT role, content, page, citation_json, sources_json, created_at FROM messages WHERE book_id = ? ORDER BY position DESC LIMIT ?',
+        'SELECT role, content, reasoning_text, page, citation_json, sources_json, created_at FROM messages WHERE book_id = ? ORDER BY position DESC LIMIT ?',
       )
       .all(bookId, safeLimit)
       .reverse();
     return rows.map((row) => ({
       role: row.role,
       content: row.content,
+      reasoning: row.reasoning_text || undefined,
       page: row.page,
       createdAt: row.created_at,
       citation: parseJson(row.citation_json),
       sources: parseJson(row.sources_json),
     }));
+  } finally {
+    database.close();
+  }
+}
+
+function normalizeResearchItem(item, existing) {
+  if (!item || !RESEARCH_KINDS.has(item.kind))
+    throw new Error('Invalid research item');
+  const now = new Date().toISOString();
+  return {
+    id: typeof item.id === 'string' && item.id ? item.id : randomUUID(),
+    kind: item.kind,
+    title: cleanText(item.title || '', 300, 'research title'),
+    content: cleanText(item.content || '', 100_000, 'research content'),
+    sources: serializeSources(item.sources),
+    createdAt: existing?.created_at || now,
+    updatedAt: now,
+  };
+}
+
+function saveResearchItem(root, contextId, contextName, item) {
+  validateBookId(contextId);
+  const safeName = cleanText(contextName, 300, 'research context name');
+  const database = openWorkspace(root);
+  try {
+    const existing =
+      typeof item?.id === 'string'
+        ? database
+            .prepare(
+              'SELECT created_at FROM research_items WHERE id = ? AND context_id = ?',
+            )
+            .get(item.id, contextId)
+        : undefined;
+    const value = normalizeResearchItem(item, existing);
+    database
+      .prepare(`INSERT OR REPLACE INTO research_items
+        (id, context_id, context_name, kind, title, content, sources_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        value.id,
+        contextId,
+        safeName,
+        value.kind,
+        value.title,
+        value.content,
+        value.sources,
+        value.createdAt,
+        value.updatedAt,
+      );
+    return {
+      ...value,
+      contextId,
+      contextName: safeName,
+      sources: parseJson(value.sources),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function listResearchItems(root, options = {}) {
+  const contextId = options.contextId ? validateBookId(options.contextId) : '';
+  const kind =
+    options.kind && RESEARCH_KINDS.has(options.kind) ? options.kind : '';
+  const query = cleanText(options.query || '', 200, 'research query');
+  const limit = Math.max(1, Math.min(200, Number(options.limit) || 100));
+  const offset = Math.max(0, Number(options.offset) || 0);
+  const clauses = [];
+  const params = [];
+  if (contextId) {
+    clauses.push('context_id = ?');
+    params.push(contextId);
+  }
+  if (kind) {
+    clauses.push('kind = ?');
+    params.push(kind);
+  }
+  if (query) {
+    clauses.push(
+      "(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR context_name LIKE ? ESCAPE '\\')",
+    );
+    const escaped = `%${query.replace(/[\\%_]/g, '\\$&')}%`;
+    params.push(escaped, escaped, escaped);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const database = openWorkspace(root);
+  try {
+    const total = Number(
+      database
+        .prepare(`SELECT COUNT(*) AS count FROM research_items ${where}`)
+        .get(...params).count,
+    );
+    const rows = database
+      .prepare(
+        `SELECT * FROM research_items ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+      )
+      .all(...params, limit, offset);
+    return {
+      total,
+      items: rows.map((row) => ({
+        id: row.id,
+        contextId: row.context_id,
+        contextName: row.context_name,
+        kind: row.kind,
+        title: row.title,
+        content: row.content,
+        sources: parseJson(row.sources_json),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      })),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function removeResearchItem(root, id) {
+  if (typeof id !== 'string' || !id)
+    throw new Error('Invalid research item id');
+  const database = openWorkspace(root);
+  try {
+    return {
+      removed:
+        database.prepare('DELETE FROM research_items WHERE id = ?').run(id)
+          .changes > 0,
+    };
   } finally {
     database.close();
   }
@@ -604,6 +748,9 @@ function removeBookData(root, bookId) {
     database.prepare('DELETE FROM messages WHERE book_id = ?').run(bookId);
     database.prepare('DELETE FROM notes WHERE book_id = ?').run(bookId);
     database
+      .prepare('DELETE FROM research_items WHERE context_id = ?')
+      .run(bookId);
+    database
       .prepare('DELETE FROM knowledge_pack_books WHERE book_id = ?')
       .run(bookId);
     database.exec('COMMIT');
@@ -632,6 +779,18 @@ function markdownExport(root, options = {}) {
     notes.push(...batch.items);
     noteOffset += batch.items.length;
     if (noteOffset >= batch.total || batch.items.length === 0) break;
+  }
+  const research = [];
+  let researchOffset = 0;
+  while (true) {
+    const batch = listResearchItems(root, {
+      contextId: options.bookId,
+      limit: 100,
+      offset: researchOffset,
+    });
+    research.push(...batch.items);
+    researchOffset += batch.items.length;
+    if (researchOffset >= batch.total || batch.items.length === 0) break;
   }
   const database = openWorkspace(root);
   try {
@@ -672,6 +831,34 @@ function markdownExport(root, options = {}) {
         if (note.content) output.push(note.content, '');
       }
     }
+    if (research.length) {
+      const researchLabels = {
+        question: '研究问题',
+        evidence: '证据',
+        outline: '引用大纲',
+      };
+      output.push('## 研究工作台', '');
+      for (const item of research.slice().reverse()) {
+        output.push(
+          `### ${item.title || researchLabels[item.kind]}`,
+          '',
+          `- 类型：${researchLabels[item.kind]}`,
+          `- 范围：${item.contextName}`,
+          '',
+          item.content,
+          '',
+        );
+        if (item.sources?.length) {
+          output.push(
+            '- 来源：',
+            ...item.sources.map(
+              (source) => `  - 《${source.bookName}》第 ${source.page} 页`,
+            ),
+            '',
+          );
+        }
+      }
+    }
     if (messages.length) {
       output.push('## 提问历史', '');
       for (const message of messages)
@@ -682,7 +869,7 @@ function markdownExport(root, options = {}) {
           '',
         );
     }
-    if (!notes.length && !messages.length)
+    if (!notes.length && !research.length && !messages.length)
       output.push('暂无可导出的阅读资料。', '');
     return output.join('\n');
   } finally {
@@ -696,14 +883,17 @@ module.exports = {
   getKnowledgePack,
   importKnowledgePack,
   listNotes,
+  listResearchItems,
   listKnowledgePacks,
   loadChat,
   markdownExport,
   removeBookData,
   removeKnowledgePack,
   removeNote,
+  removeResearchItem,
   replaceChat,
   saveNote,
+  saveResearchItem,
   searchHistory,
   updateKnowledgePack,
 };

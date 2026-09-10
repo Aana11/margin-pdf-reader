@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   platform: process.platform,
   isDesktop: true,
   appInfo: () => ipcRenderer.invoke('app:info'),
+  settingsLoad: () => ipcRenderer.invoke('settings:load'),
+  settingsSave: (value) => ipcRenderer.invoke('settings:save', value),
   openLogs: () => ipcRenderer.invoke('logs:open'),
   logEvent: (event, details = {}, level = 'info') =>
     ipcRenderer.send('log:renderer', { event, details, level }),
@@ -113,6 +115,12 @@ contextBridge.exposeInMainWorld('marginDesktop', {
   workspaceNoteSave: (bookId, bookName, note) =>
     ipcRenderer.invoke('workspace:note-save', bookId, bookName, note),
   workspaceNoteRemove: (id) => ipcRenderer.invoke('workspace:note-remove', id),
+  workspaceResearchList: (options) =>
+    ipcRenderer.invoke('workspace:research-list', options),
+  workspaceResearchSave: (contextId, contextName, item) =>
+    ipcRenderer.invoke('workspace:research-save', contextId, contextName, item),
+  workspaceResearchRemove: (id) =>
+    ipcRenderer.invoke('workspace:research-remove', id),
   workspaceExportMarkdown: (options) =>
     ipcRenderer.invoke('workspace:export-markdown', options),
 });
