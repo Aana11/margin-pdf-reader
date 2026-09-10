@@ -2,6 +2,22 @@
 
 All notable changes to Margin are documented here.
 
+## [0.3.4] - 2026-09-10
+
+### Added
+
+- A local SQLite learning deck that generates concept, formula, and question/answer cards from the current page or an assistant answer, retains page sources, and renders LaTeX during review.
+- Spaced repetition with four recall ratings, due-card filtering, persistent intervals/ease/repetitions, wrong-answer counts, and one-click navigation back to the source book and page.
+- Answer quoting: selecting part of an assistant response attaches a bounded quote to the next question, persists it separately in chat history, and asks the model to verify it against fresh retrieval context.
+- Packaged coverage for the study bridge/UI, quote interaction, and SQLite schema migration.
+
+### Changed
+
+- Removed Electron's native File/Edit menu bar and reduced assistant header, chat spacing, composer height, and prompt-chip padding to expose more conversation content.
+- A completed full-text index no longer consumes a permanent status row; active, paused, missing, and failed index states remain actionable.
+- GLM-OCR status in the assistant is now a compact dot and short description.
+- Managed GLM-OCR detects weights and the shared llama.cpp runtime independently, records inspected paths and byte sizes, offers runtime repair without re-downloading valid weights, and clears stale error presentation after assets recover.
+
 ## [0.3.3] - 2026-09-10
 
 ### Added

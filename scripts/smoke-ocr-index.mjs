@@ -196,7 +196,8 @@ try {
       throw new Error('Margin did not reload');
     return true;
   });
-  await evaluate(`(async () => {
+  await evaluate(
+    `(async () => {
     const settings = {
       embeddingKind: 'openai-compatible',
       embeddingEndpoint: 'https://fixture.local/v1',
@@ -209,7 +210,9 @@ try {
     localStorage.setItem('margin-ai-settings', JSON.stringify(settings));
     await window.marginDesktop.settingsSave(settings);
     window.location.reload();
-  })()`, true);
+  })()`,
+    true,
+  );
   await delay(1_000);
   await retry(async () => {
     if (
@@ -271,7 +274,7 @@ try {
       );
       if (state.error) throw new Error(state.error);
       if (
-        !state.label.includes('全文索引已就绪') ||
+        (state.label && !state.label.includes('全文索引已就绪')) ||
         !state.warning.includes('OCR 已识别')
       )
         throw new Error(`OCR index is not ready: ${JSON.stringify(state)}`);

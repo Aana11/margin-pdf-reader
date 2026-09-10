@@ -367,6 +367,34 @@ try {
     60,
     100,
   );
+  const quotedFollowup = await evaluate(`(() => {
+    const content = [...document.querySelectorAll('.message.assistant .message-content')].at(-1);
+    const text = content?.querySelector('p')?.firstChild;
+    if (!content || !text) return { quoted: '', focused: false };
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    content.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    return {
+      quoted: document.querySelector('.answer-quote')?.textContent || '',
+      focused: document.activeElement === document.querySelector('.composer textarea')
+    };
+  })()`);
+  await delay(50);
+  const quoteState = await evaluate(`({
+    quoted: document.querySelector('.answer-quote')?.textContent || '',
+    focused: document.activeElement === document.querySelector('.composer textarea')
+  })`);
+  if (
+    !quoteState.quoted.includes('带思考过程的冒烟回答') ||
+    !quoteState.focused
+  )
+    throw new Error(
+      `Assistant answer quoting failed: ${JSON.stringify({ quotedFollowup, quoteState })}`,
+    );
+  await evaluate(`document.querySelector('.answer-quote button')?.click()`);
 
   const modelStatus = await evaluate(
     `window.marginDesktop.modelStatus()`,
@@ -442,6 +470,7 @@ try {
       hasLibrary: Boolean(document.querySelector('[aria-label="本地书架"]')),
       hasOcrTools: Boolean(document.querySelector('[aria-label="OCR 工具"]')),
       hasResearch: Boolean(document.querySelector('[aria-label="研究工作台"]')),
+      hasStudy: Boolean(document.querySelector('[aria-label="学习卡片"]')),
       hasSidebarTask: Boolean(document.querySelector('.app-sidebar [aria-label="索引任务"]')),
       hasResizer: Boolean(document.querySelector('.workspace-resizer')),
       restoredPage: document.querySelector('.page-scroll-indicator')?.textContent || '',
@@ -454,6 +483,7 @@ try {
       !state.hasLibrary ||
       !state.hasOcrTools ||
       !state.hasResearch ||
+      !state.hasStudy ||
       state.hasSidebarTask ||
       !state.hasResizer ||
       !state.restoredDocument ||
@@ -515,6 +545,33 @@ try {
       throw new Error(
         `Research workspace is not ready: ${JSON.stringify(state)}`,
       );
+    return state;
+  });
+  await closeDialog();
+  const studySeed = await evaluate(
+    `(async () => {
+      const book = (await window.marginDesktop.libraryList())[0];
+      const saved = await window.marginDesktop.workspaceStudySave(book.id, book.name, [
+        { kind: 'concept', front: '冒烟概念卡', back: '概念答案', sourceExcerpt: '第二页', sources: [{ bookId: book.id, bookName: book.name, page: 2, score: 1, excerpt: '定义' }] },
+        { kind: 'formula', front: '冒烟公式卡', back: '$a+b$', sourceExcerpt: '公式' },
+        { kind: 'qa', front: '冒烟问答卡', back: '问答答案', sourceExcerpt: '问答' }
+      ]);
+      const reviewed = await window.marginDesktop.workspaceStudyReview(saved[2].id, 'again');
+      const listed = await window.marginDesktop.workspaceStudyList({ query: '冒烟', limit: 20 });
+      return { saved: saved.length, total: listed.total, lapses: reviewed.lapses, due: listed.due };
+    })()`,
+    true,
+  );
+  if (studySeed.saved !== 3 || studySeed.total !== 3 || studySeed.lapses !== 1)
+    throw new Error(`Study bridge failed: ${JSON.stringify(studySeed)}`);
+  await openDialog('学习卡片', '从当前页面或 AI 回答提炼概念');
+  await retry(async () => {
+    const state = await evaluate(`({
+      text: document.querySelector('.study-dialog')?.textContent || '',
+      cards: document.querySelectorAll('.study-card').length
+    })`);
+    if (!state.text.includes('冒烟概念卡') || state.cards !== 3)
+      throw new Error(`Study UI is not ready: ${JSON.stringify(state)}`);
     return state;
   });
   await closeDialog();
